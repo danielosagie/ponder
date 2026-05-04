@@ -1,0 +1,11 @@
+node_modules/
+dist/
+out/
+.env
+.env.local
+.convex/
+.DS_Store
+*.log
+debug_screenshots/
+.vscode/
+__pycache__/

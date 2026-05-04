@@ -1,0 +1,35 @@
+{
+  "name": "holo3-agent",
+  "version": "0.1.0",
+  "description": "Clicky-style computer-use agent backed by Holo3 on Modal",
+  "private": true,
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy",
+    "modal:deploy": "modal deploy modal_app.py",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.2",
+    "convex": "^1.17.0",
+    "dotenv": "^17.4.2",
+    "node-mac-permissions": "^2.5.0",
+    "ollama": "^0.5.10",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.0",
+    "electron-vite": "^2.3.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

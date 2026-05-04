@@ -1,9 +1,22 @@
 import { createHash } from "node:crypto";
 import { think, needsCoordinates, isDone, parseDragAction } from "./brain";
 import { findCoordinates } from "./eyes";
+import { createOllamaPlanner } from "./planner";
 import type { AgentEvents, ProviderClient } from "./types";
 import * as screen from "../screen";
 
+// Per-subtask cap. With hierarchical planning the inner loop only needs to
+// carry ONE focused phase to completion ("open Chrome", "search Google for
+// X"), so 12 steps is plenty. If a subtask exhausts without DONE we abort
+// the whole run rather than burning the rest of the budget — the planner's
+// decomposition was probably wrong, retry with a clearer prompt.
+const MAX_STEPS_PER_SUBTASK = 12;
+// Hard ceiling across all subtasks combined. Even with a 6-subtask plan we
+// never want more than this total. Roughly 2x the old flat MAX_STEPS — gives
+// hierarchical mode headroom without making cancel-by-budget useless.
+const MAX_STEPS_TOTAL = 60;
+// Legacy cap for non-hierarchical (planner unavailable / single-subtask) runs.
+// Matches the old behavior so flat mode is identical to before.
 const MAX_STEPS = 30;
 // Default inter-step pause. The hosted H Company API has a 10 RPM default-tier
 // limit; with plan + ground per step we issue ~2 reqs/step, so 6.5s keeps us
@@ -51,8 +64,103 @@ function normalizeAction(a: string): string {
     .replace(/\s+/g, " ");
 }
 
-export async function runTask(opts: RunOptions): Promise<"done" | "cancelled" | "exhausted"> {
-  const { task, provider, events } = opts;
+/**
+ * Public entry point. Decomposes the task with the small local planner
+ * (qwen3 via Ollama by default), then runs the existing per-step Holo3 loop
+ * once per subtask, feeding the OVERALL goal back into each subtask's prompt
+ * so the lower-level model stays oriented.
+ *
+ * If the planner is unavailable, returns a single-subtask plan and we run
+ * exactly the old flat behavior — no regression for users who don't have
+ * Ollama installed.
+ */
+export async function runTask(
+  opts: RunOptions,
+): Promise<"done" | "cancelled" | "exhausted"> {
+  const { task, events } = opts;
+  const planner = createOllamaPlanner();
+  const t0 = Date.now();
+  const plan = await planner.plan(task);
+  console.log(
+    `[loop] 📋 plan (${Date.now() - t0}ms): ${plan.note}\n` +
+      plan.subtasks.map((s, i) => `   ${i + 1}. ${s}`).join("\n"),
+  );
+  // Surface the plan to the UI so the user can see what's about to happen.
+  // Status (not error) so it shows as a normal narration line.
+  if (plan.decomposed) {
+    await events.onStatus(
+      `Plan: ${plan.subtasks.map((s, i) => `${i + 1}) ${s}`).join("  ")}`,
+    );
+  }
+
+  let totalSteps = 0;
+  for (let i = 0; i < plan.subtasks.length; i++) {
+    if (opts.shouldCancel?.()) return "cancelled";
+    const subtask = plan.subtasks[i];
+
+    // Compute this subtask's step budget. Flat mode (1 subtask) keeps the
+    // historic 30-step cap. Hierarchical splits MAX_STEPS_TOTAL evenly with
+    // a per-subtask floor/ceiling.
+    const remaining = MAX_STEPS_TOTAL - totalSteps;
+    const subBudget = plan.decomposed
+      ? Math.min(remaining, MAX_STEPS_PER_SUBTASK)
+      : MAX_STEPS;
+    if (subBudget <= 0) {
+      console.warn("[loop] 🛑 step budget exhausted across subtasks");
+      await events.onError("Step budget exhausted before all subtasks finished.");
+      return "exhausted";
+    }
+
+    if (plan.decomposed) {
+      await events.onStatus(`Subtask ${i + 1}/${plan.subtasks.length}: ${subtask}`);
+      console.log(
+        `\n[loop] ── subtask ${i + 1}/${plan.subtasks.length} (budget=${subBudget}) — ${subtask} ──`,
+      );
+    }
+
+    const result = await runOneSubtask({
+      ...opts,
+      task: subtask,
+      overallGoal: plan.decomposed ? task : undefined,
+      maxSteps: subBudget,
+      onStep: () => {
+        totalSteps++;
+      },
+    });
+
+    if (result === "cancelled") return "cancelled";
+    // If a subtask exhausts its budget without emitting DONE, the planner
+    // either decomposed wrong or the lower-level model got stuck. Either
+    // way, continuing into the next subtask is unlikely to help — abort.
+    if (result === "exhausted") {
+      console.warn(
+        `[loop] 🛑 subtask ${i + 1} exhausted — aborting remaining ${plan.subtasks.length - i - 1} subtasks`,
+      );
+      return "exhausted";
+    }
+    // result === "done" → carry on to next subtask
+  }
+  console.log(
+    `[loop] 🏁 all ${plan.subtasks.length} subtask(s) completed (${totalSteps} steps total)`,
+  );
+  return "done";
+}
+
+interface SubtaskOpts extends RunOptions {
+  /** The overall task this subtask is part of, threaded into each plan
+   *  prompt so Holo3 doesn't lose sight of the goal. Undefined in flat mode. */
+  overallGoal?: string;
+  /** Step cap for this subtask only. */
+  maxSteps: number;
+  /** Called every time the inner loop completes a step, so the orchestrator
+   *  can enforce the cross-subtask total budget. */
+  onStep?: () => void;
+}
+
+async function runOneSubtask(
+  opts: SubtaskOpts,
+): Promise<"done" | "cancelled" | "exhausted"> {
+  const { task, provider, events, overallGoal, maxSteps, onStep } = opts;
   const history: string[] = [];
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
@@ -84,16 +192,27 @@ export async function runTask(opts: RunOptions): Promise<"done" | "cancelled" | 
   // and which provider is wired in. The reference demo (PromptEngineer48/holo3-demo
   // main.py) prints similar emoji-prefixed lines for every step.
   console.log(
-    `\n[loop] ▶ task="${task}" provider=${provider.name} maxSteps=${MAX_STEPS} stepPause=${stepPause}ms`,
+    `\n[loop] ▶ task="${task}"${overallGoal ? ` goal="${overallGoal}"` : ""} provider=${provider.name} maxSteps=${maxSteps} stepPause=${stepPause}ms`,
   );
 
-  for (let step = 0; step < MAX_STEPS; step++) {
+  // When we're inside a subtask of a larger plan, append the overall goal to
+  // the per-step task description. Holo3 then sees BOTH the focused subtask
+  // ("search Google for 'X'") AND the original user intent ("find a good
+  // dual-monitor mount for SE2719HR"), which keeps it from chasing related-
+  // but-wrong UI elements. We only do this when overallGoal differs from the
+  // subtask itself — flat mode passes them as the same string.
+  const taskForPlanner =
+    overallGoal && overallGoal !== task
+      ? `${task}\n(this is part of: ${overallGoal})`
+      : task;
+
+  for (let step = 0; step < maxSteps; step++) {
     if (cancelled()) {
       console.log("[loop] ⏹  cancelled by user");
       return "cancelled";
     }
 
-    console.log(`\n[loop] ── step ${step + 1}/${MAX_STEPS} ──`);
+    console.log(`\n[loop] ── step ${step + 1}/${maxSteps} ──`);
 
     const t0 = Date.now();
     // Use the prefetched screenshot if the previous step kicked one off during
@@ -128,7 +247,7 @@ export async function runTask(opts: RunOptions): Promise<"done" | "cancelled" | 
     let action: string;
     try {
       action = await think(provider, {
-        task,
+        task: taskForPlanner,
         history,
         screenshotB64: shot.png.toString("base64"),
         screen: screenSize,
@@ -321,6 +440,7 @@ export async function runTask(opts: RunOptions): Promise<"done" | "cancelled" | 
     }
 
     history.push(action);
+    onStep?.();
     // Record this (text, screen-hash) attempt so guard #2 can spot a future
     // re-attempt from the same state. We record AFTER execute so a failed
     // executor (no match, missing coords) doesn't poison the dedup map.
@@ -354,7 +474,7 @@ export async function runTask(opts: RunOptions): Promise<"done" | "cancelled" | 
       if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
     }
   }
-  console.log("[loop] 🛑 exhausted MAX_STEPS without DONE");
+  console.log(`[loop] 🛑 exhausted ${maxSteps} steps without DONE`);
   return "exhausted";
 }
 

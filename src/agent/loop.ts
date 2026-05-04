@@ -591,9 +591,29 @@ async function executeAction(
     return { type: "scroll", payload: { direction: scrollMatch[1], amount } };
   }
 
-  if (/^double\s+click/i.test(a) && coords) {
+  if (/^double[\s_-]*click/i.test(a) && coords) {
     await screen.click(coords.x, coords.y, { double: true });
     return { type: "double_click", payload: { ...coords } };
+  }
+
+  // Triple click — selects all text in the clicked field. The standard
+  // pattern is `triple click on <field>` followed by `type X` on the next
+  // step, which atomically replaces the field's contents (no cmd+a dance
+  // needed). Useful when re-entering a stale search query or overwriting an
+  // input that already has text.
+  if (/^triple[\s_-]*click/i.test(a) && coords) {
+    await screen.click(coords.x, coords.y, { triple: true });
+    return { type: "triple_click", payload: { ...coords } };
+  }
+
+  // Right click — context menus, copy / paste / inspect element / "open
+  // image in new tab", etc. Without this branch, Holo3 emitting "right click
+  // on <x>" silently fell through to the generic LEFT-click below, doing
+  // the wrong thing entirely. We accept a few spellings the model uses:
+  // "right click", "right-click", "rightclick", "secondary click".
+  if (/^(?:right[\s_-]*click|secondary[\s_-]*click)/i.test(a) && coords) {
+    await screen.click(coords.x, coords.y, { button: "right" });
+    return { type: "right_click", payload: { ...coords } };
   }
 
   if (coords) {

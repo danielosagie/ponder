@@ -224,7 +224,7 @@ function crc32(buf: Buffer): number {
 export async function click(
   x: number,
   y: number,
-  opts: { button?: "left" | "right"; double?: boolean } = {},
+  opts: { button?: "left" | "right"; double?: boolean; triple?: boolean } = {},
 ): Promise<void> {
   const ix = Math.round(x);
   const iy = Math.round(y);
@@ -236,6 +236,15 @@ export async function click(
     //   c:x,y  → left click (no cursor move)
     //   dc:x,y → double click
     //   rc:x,y → right click
+    if (opts.triple) {
+      // No `tc:` shortcut in cliclick — chain three c: commands. macOS
+      // aggregates consecutive same-pixel clicks within ~500ms into a real
+      // multi-click event, so this lands as a triple-click (selects all in a
+      // single-line field, the paragraph in a multi-line text area). Paired
+      // with a follow-up `type X`, the type replaces the field's contents.
+      await cliclickRun(`c:${ix},${iy}`, `c:${ix},${iy}`, `c:${ix},${iy}`);
+      return;
+    }
     const cmd =
       opts.button === "right" ? "rc" : opts.double ? "dc" : "c";
     await cliclickRun(`${cmd}:${ix},${iy}`);
@@ -246,6 +255,17 @@ export async function click(
   // target, hover briefly so the click is obviously visible, then fire.
   await mouse.move(straightTo(new Point(ix, iy)));
   await sleep(POST_MOVE_HOVER_MS);
+  if (opts.triple) {
+    // nut-js has no triple-click API; three quick leftClicks at the same
+    // point produce the same OS-level multi-click event. 40ms gap is well
+    // under macOS's ~500ms multi-click threshold.
+    await mouse.leftClick();
+    await sleep(40);
+    await mouse.leftClick();
+    await sleep(40);
+    await mouse.leftClick();
+    return;
+  }
   const btn = opts.button === "right" ? Button.RIGHT : Button.LEFT;
   if (opts.double) await mouse.doubleClick(btn);
   else await mouse.leftClick();

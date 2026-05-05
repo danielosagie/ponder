@@ -617,11 +617,64 @@ async function executeAction(
   }
 
   if (coords) {
+    // Defensive focus promotion: when the planner emits a generic `click`
+    // on something that looks like a focusable input — search bar, address
+    // bar, text field, textarea, password/email/chat box, etc. — execute a
+    // double-click instead of a single click.
+    //
+    // Why: a missed or under-registered single click leaves focus on the
+    // previous element, and the next-step `type X` writes nowhere visible
+    // (it goes to whatever WAS focused, or is dropped). The Cobb-County and
+    // Chrome-dock failures both started this way.
+    //
+    // Trade-offs:
+    //  • Empty field: double-click is visually identical to single-click.
+    //  • Pre-filled field: double-click selects a word; the follow-up
+    //    `type X` replaces just that word. Better than typing nowhere.
+    //  • Buttons/links/icons: NOT promoted (could double-fire submits) —
+    //    `looksLikeFieldTarget` only matches input-like keywords.
+    //
+    // Disable globally with HOLO3_FIELD_DOUBLE_CLICK=false. If the model
+    // explicitly emits "triple click ...", that branch above wins anyway.
+    const promoteForFocus =
+      process.env.HOLO3_FIELD_DOUBLE_CLICK !== "false" &&
+      looksLikeFieldTarget(a);
+    if (promoteForFocus) {
+      console.log(`[loop] 🎯 promoting click→dbl-click for focus: "${a}"`);
+      await screen.click(coords.x, coords.y, { double: true });
+      return {
+        type: "click",
+        payload: { ...coords, doubleForFocus: true },
+      };
+    }
     await screen.click(coords.x, coords.y);
     return { type: "click", payload: { ...coords } };
   }
 
   return null;
+}
+
+/**
+ * Heuristic: does this action target a focusable input field?
+ *
+ * Conservative — only returns true for explicit input-like keywords. Never
+ * matches buttons, links, or icons (where double-clicking could double-fire
+ * a submit or open something twice).
+ *
+ * The negative list strips window-chrome bars (title bar, tool bar, menu
+ * bar, tab bar, scroll bar, status bar, task bar) which contain the word
+ * "bar" but aren't editable. Without this filter, "click on the title bar"
+ * would mistakenly promote.
+ */
+function looksLikeFieldTarget(action: string): boolean {
+  const a = action.toLowerCase();
+  // Window-chrome "bars" — never focusable, bail before the positive match.
+  if (/\b(?:title|menu|tool|tab|scroll|status|task|side|nav)\s*bar\b/.test(a)) {
+    return false;
+  }
+  return /\b(?:search\s+(?:bar|box|field)|address\s+bar|url\s+bar|location\s+bar|omnibox|textarea|textbox|textfield|text\s+(?:area|box|field)|input\s+(?:field|box)|(?:email|password|username|chat|message|comment|reply)\s+(?:field|input|box)|form\s+(?:field|input)|(?:title|name|first\s+name|last\s+name|subject)\s+(?:field|input))\b/.test(
+    a,
+  );
 }
 
 /**

@@ -346,9 +346,48 @@ export async function pressCombo(combo: string): Promise<void> {
   await keyboard.releaseKey(...parts);
 }
 
-export async function scroll(amount: number): Promise<void> {
+export async function scroll(
+  amount: number,
+  opts: { recenter?: boolean } = {},
+): Promise<void> {
   // amount: positive scrolls up, negative down
   if (amount === 0) return;
+
+  // nut-js's scroll wheel posts events at the OS cursor's current position.
+  // After a click, the cursor is parked over whatever was clicked — often a
+  // sidebar item. Subsequent scrolls then scroll the SIDEBAR instead of the
+  // main content area, and the planner sees no change in the rest of the
+  // screen and either repeats or returns DONE without progress. (This is the
+  // FB Marketplace failure: click "Selling" at (168, 570) → cursor parked
+  // over left sidebar → "scroll down" scrolls the sidebar, not the listings.)
+  //
+  // Default to moving the cursor to the right two-thirds of the screen
+  // (vertically centered) before scrolling so the wheel hits the main
+  // content area. Caller can opt out with { recenter: false } if they
+  // really want to scroll under the current cursor.
+  if (opts.recenter !== false) {
+    try {
+      const { width, height } = await size();
+      const tx = Math.round(width * 0.66);
+      const ty = Math.round(height * 0.5);
+      if (cliclickPath) {
+        // cliclick `m:x,y` moves the visible cursor too — but for scrolls
+        // that's the desired behavior (we have to put the wheel SOMEWHERE,
+        // and "right side of the main content" is the safe default).
+        await cliclickRun(`m:${tx},${ty}`);
+      } else {
+        await mouse.move(straightTo(new Point(tx, ty)));
+      }
+    } catch (e) {
+      // Recenter is best-effort. If it fails (e.g. no display attached, weird
+      // multi-monitor setup) just scroll wherever the cursor is — same
+      // behavior as before this fix.
+      console.warn(
+        `[screen] scroll recenter failed (${e instanceof Error ? e.message : String(e)}) — scrolling at current cursor`,
+      );
+    }
+  }
+
   if (amount > 0) await mouse.scrollUp(amount);
   else await mouse.scrollDown(-amount);
 }

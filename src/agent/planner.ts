@@ -118,7 +118,7 @@ export function createOllamaPlanner(cfg: PlannerConfig = {}): PlannerClient {
     cfg.model ??
     process.env.PLANNER_MODEL ??
     process.env.NARRATOR_MODEL ??
-    "qwen3:0.6b";
+    "qwen3.5:0.8b";
   const timeoutMs = cfg.timeoutMs ?? Number(process.env.PLANNER_TIMEOUT_MS ?? 8000);
 
   return {

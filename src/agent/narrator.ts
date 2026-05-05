@@ -76,7 +76,7 @@ export function createOllamaNarrator(cfg: NarratorConfig = {}): NarratorClient {
   const ollama = new Ollama({
     host: cfg.host ?? process.env.NARRATOR_HOST ?? process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434",
   });
-  const model = cfg.model ?? process.env.NARRATOR_MODEL ?? "qwen3:0.6b";
+  const model = cfg.model ?? process.env.NARRATOR_MODEL ?? "qwen3.5:0.8b";
   const timeoutMs = cfg.timeoutMs ?? 6_000;
 
   async function generate(system: string, user: string): Promise<string> {

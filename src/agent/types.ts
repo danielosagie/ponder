@@ -43,4 +43,12 @@ export interface AgentEvents {
   onScreenshot(pngBuffer: Buffer): Promise<void> | void;
   onError(message: string): Promise<void> | void;
   onStatus(text: string): Promise<void> | void;
+  /**
+   * Emitted once per run when the extractor produces the user-facing
+   * answer. Distinct from onThought (the narrator's friendly fluff) and
+   * onStatus (transient progress lines) — this is the actual deliverable.
+   * Persisted to Convex as `kind: "result"` and rendered as a special
+   * bubble in the UI so it doesn't get lost in the action stream.
+   */
+  onResult?(text: string): Promise<void> | void;
 }

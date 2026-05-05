@@ -29,7 +29,18 @@ const LERP_T = 0.25;
 
 const WELCOME_TEXT = "hey! i'm holo3";
 
-type BubbleKind = "thought" | "action" | "error" | "welcome" | "status";
+type BubbleKind =
+  | "thought"
+  | "action"
+  | "error"
+  | "welcome"
+  | "status"
+  // "answer" is the extractor's end-of-run textual answer to the user's
+  // original question — variable length, the actual deliverable. Renders
+  // similarly to "thought" today (the existing bubble accommodates any
+  // kind), but kept distinct so we can style the answer differently
+  // later (e.g. persistent until clicked, list formatting).
+  | "answer";
 
 export function Buddy() {
   // Cursor state (window-local coords pushed from main at 60Hz).
@@ -92,9 +103,15 @@ export function Buddy() {
       setBubbleText(text);
       setBubbleVisible(true);
       if (fadeRef.current) clearTimeout(fadeRef.current);
+      // The extractor "answer" can be a multi-line list (e.g. 5 FB
+      // Marketplace items with prices) — 6s isn't enough to read.
+      // Errors deserve longer too. Other kinds keep the snappy 6s fade so
+      // the bubble doesn't loiter during a flow of thoughts/actions.
+      const fadeMs =
+        kind === "answer" ? 60_000 : kind === "error" ? 15_000 : 6_000;
       fadeRef.current = window.setTimeout(
         () => setBubbleVisible(false),
-        6_000,
+        fadeMs,
       );
     });
 

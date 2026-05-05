@@ -71,13 +71,21 @@ const buddyApi = {
   },
   onSay: (
     cb: (payload: {
-      kind: "thought" | "action" | "error" | "status";
+      // "answer" is the extractor's end-of-run reply — the variable-length
+      // textual answer to the user's original question (e.g. the list of
+      // FB Marketplace items). Distinct from "thought" (planner reasoning,
+      // narrator fluff) so the renderer can style it as a persistent reply
+      // bubble instead of a transient thought bubble.
+      kind: "thought" | "action" | "error" | "status" | "answer";
       text: string;
     }) => void,
   ): (() => void) => {
     const handler = (
       _e: unknown,
-      p: { kind: "thought" | "action" | "error" | "status"; text: string },
+      p: {
+        kind: "thought" | "action" | "error" | "status" | "answer";
+        text: string;
+      },
     ) => cb(p);
     ipcRenderer.on("buddy:say", handler);
     return () => {

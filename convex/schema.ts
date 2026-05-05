@@ -31,6 +31,11 @@ export default defineSchema({
       v.literal("screenshot"),
       v.literal("error"),
       v.literal("status"),
+      // Final user-facing answer produced by the extractor at end-of-run.
+      // Distinct from "thought" (planner reasoning) and "status" (transient
+      // progress). Persisted so the History view can show what the agent
+      // actually answered the user, not just the action transcript.
+      v.literal("result"),
     ),
     text: v.optional(v.string()),
     coords: v.optional(v.object({ x: v.number(), y: v.number() })),

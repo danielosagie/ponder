@@ -24,7 +24,10 @@ loadDotenv({ path: join(process.cwd(), ".env.local"), override: false });
 import { runTask } from "../src/agent/loop";
 import { BACKGROUND_MODE } from "../src/screen";
 import { createOllamaNarrator } from "../src/agent/narrator";
+import { createExtractor } from "../src/agent/extractor";
 import type { AgentEvents, ProviderClient, ProviderName } from "../src/agent/types";
+import type { BrowserClient, BrowserSnapshot } from "../src/agent/browser/types";
+import { createPlaywriterClient } from "../src/agent/browser/playwriter";
 import { createRemoteProvider } from "../src/agent/providers/remote";
 import { createLocalProvider } from "../src/agent/providers/local";
 import { createHCompanyProvider } from "../src/agent/providers/hcompany";
@@ -99,7 +102,7 @@ function setBuddyMode(mode: "active" | "hidden"): void {
   buddyWin.webContents.send("buddy:mode", mode);
 }
 
-type SayKind = "thought" | "action" | "error" | "status";
+type SayKind = "thought" | "action" | "error" | "status" | "answer";
 
 function buddySay(kind: SayKind, text: string): void {
   if (!buddyWin || buddyWin.isDestroyed()) return;
@@ -216,6 +219,23 @@ function isRemoteConfigured(): boolean {
 // NARRATOR_MODEL / NARRATOR_HOST. Failures fall back to templated lines —
 // the run never blocks on the narrator.
 const narrator = createOllamaNarrator();
+
+// Browser client (Playwriter): hybrid Chrome control. Lazy-bound — the
+// underlying Playwright connection only opens on the first available()
+// probe, and gracefully reports unavailable when the extension isn't
+// active. We instantiate the wrapper unconditionally so the loop has a
+// stable reference; the wrapper itself is cheap (no network, no spawn).
+let browserClient: BrowserClient | null = null;
+void (async () => {
+  try {
+    browserClient = await createPlaywriterClient();
+    console.log("[browser] client instantiated (Playwriter, lazy-connect on first probe)");
+  } catch (e) {
+    console.warn(
+      `[browser] client init failed (${e instanceof Error ? e.message : String(e)}) — vision-only mode`,
+    );
+  }
+})();
 
 let warmup = new WarmupQueue(makeProvider(providerName));
 
@@ -465,24 +485,107 @@ function setupIpc(): void {
       ? await buildEvents(sessionId)
       : await buildEvents("");
 
+    // Per-run state retained for the extractor:
+    //   • runHistory — every action string the planner emitted, in order
+    //   • lastShot — most recent screenshot bytes (used when no Chrome
+    //     snapshot is available)
+    //   • lastSnapshot — most recent Playwriter accessibility tree (used
+    //     in preference to the screenshot when Chrome was active)
+    //
+    // These fill via callbacks from the loop, so we don't have to parse
+    // the events stream a second time after the run completes.
+    const runHistory: string[] = [];
+    let lastShot: Buffer | undefined;
+    let lastSnapshot: BrowserSnapshot | undefined;
+
     try {
       const result = await runTask({
         task: prompt,
         provider: warmup.getProvider(),
         events,
         shouldCancel: () => cancelFlag,
+        browser: browserClient,
+        onBrowserSnapshot: (snap) => {
+          lastSnapshot = snap;
+        },
+        onHistory: (action) => {
+          runHistory.push(action);
+        },
+        onScreenshotBuffer: (png) => {
+          lastShot = png;
+        },
       });
-      // Narrator summary — speak a real sentence about what happened
-      // ("Done — Slack is open"), not just "Done". Falls through to a
-      // templated line if the narrator is unavailable.
+
       const summaryOutcome =
         result === "done"
           ? "done"
           : result === "cancelled"
             ? "cancelled"
             : "exhausted";
+
+      // Extractor — the actual answer. Runs SYNCHRONOUSLY before the
+      // narrator's friendly fluff so the user sees substance first.
+      // Cancellable via cancelFlag → AbortController; if the user pressed
+      // Stop during the run, we skip the extractor entirely (they don't
+      // want to wait for a paragraph about a partial run they aborted).
+      if (result !== "cancelled") {
+        try {
+          buddySay("status", "Reading the result…");
+          // If we have a browser snapshot in memory but the run just
+          // finished and the page may have changed under us, re-snapshot.
+          // Best-effort — if the tab closed or extension disconnected, we
+          // fall through to whatever lastSnapshot already held.
+          if (browserClient && (await browserClient.available().catch(() => false))) {
+            try {
+              lastSnapshot = await browserClient.snapshot();
+            } catch (e) {
+              console.warn(
+                `[extract] re-snapshot failed (${e instanceof Error ? e.message : String(e)}) — using previous`,
+              );
+            }
+          }
+          const extractor = createExtractor(warmup.getProvider());
+          const ctrl = new AbortController();
+          const cancelTick = setInterval(() => {
+            if (cancelFlag) ctrl.abort();
+          }, 100);
+          let answer: string;
+          try {
+            answer = await extractor.extract({
+              task: prompt,
+              history: runHistory,
+              lastScreenshotB64: lastShot?.toString("base64") ?? "",
+              browserSnapshot: lastSnapshot,
+              outcome: summaryOutcome,
+              signal: ctrl.signal,
+            });
+          } finally {
+            clearInterval(cancelTick);
+          }
+          if (answer && answer.trim()) {
+            buddySay("answer", answer);
+            if (sessionId && convex) {
+              await convex.mutation(convexApi.steps.append, {
+                sessionId: sessionId as never,
+                kind: "result",
+                text: answer,
+              });
+            }
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn(`[extract] failed: ${msg}`);
+          // Don't surface the extractor failure as a user-visible error —
+          // the narrator will still speak its fluff line below, and the
+          // user gets *something*. Only log so dev can see what broke.
+        }
+      }
+
+      // Narrator summary — short friendly sentence after the substantive
+      // answer. Non-blocking: if the narrator is slow, the answer is
+      // already on screen.
       narrator
-        .summary({ task: prompt, outcome: summaryOutcome, history: [] })
+        .summary({ task: prompt, outcome: summaryOutcome, history: runHistory })
         .then((line) => buddySay("thought", line))
         .catch(() => buddySay("status", result === "cancelled" ? "Cancelled" : "Done"));
       if (sessionId && convex) {
@@ -502,7 +605,7 @@ function setupIpc(): void {
       // Surface the failure: narrator gives a friendly framing on top of the
       // raw error bubble below.
       narrator
-        .summary({ task: prompt, outcome: "error", history: [], error: message })
+        .summary({ task: prompt, outcome: "error", history: runHistory, error: message })
         .then((line) => buddySay("thought", line))
         .catch(() => {});
       buddySay("error", message);

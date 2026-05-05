@@ -11,6 +11,7 @@ export const append = mutation({
       v.literal("screenshot"),
       v.literal("error"),
       v.literal("status"),
+      v.literal("result"),
     ),
     text: v.optional(v.string()),
     coords: v.optional(v.object({ x: v.number(), y: v.number() })),

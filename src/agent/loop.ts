@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
-import { think, needsCoordinates, isDone, parseDragAction } from "./brain";
+import {
+  think,
+  needsCoordinates,
+  isDone,
+  parseDragAction,
+  parseBrowserAction,
+} from "./brain";
 import { findCoordinates } from "./eyes";
 import { createOllamaPlanner } from "./planner";
 import type { AgentEvents, ProviderClient } from "./types";
+import type { BrowserClient, BrowserSnapshot } from "./browser/types";
 import * as screen from "../screen";
 
 // Per-subtask cap. With hierarchical planning the inner loop only needs to
@@ -36,6 +43,40 @@ export interface RunOptions {
   provider: ProviderClient;
   events: AgentEvents;
   shouldCancel?: () => boolean;
+  /**
+   * Optional Chrome control via Playwriter. When present AND the extension
+   * is connected to an active tab, the loop will:
+   *   1. Pull an accessibility snapshot at the start of each step and
+   *      include it in the planner prompt so the model can pick browser.*
+   *      actions instead of guessing pixel coordinates.
+   *   2. Route browser.click/type/scroll/read through this client instead
+   *      of nut-js cursor automation.
+   * When the client is null, or `available()` returns false (extension
+   * offline / no green tab), the loop runs the legacy vision-only flow
+   * with zero behavioral change.
+   */
+  browser?: BrowserClient | null;
+  /**
+   * Called whenever the loop captures a fresh accessibility snapshot. The
+   * orchestrator (electron/main.ts) latches the most recent value and
+   * passes it to the extractor at end-of-run so the report-back step can
+   * read structured DOM text instead of just the final screenshot pixels.
+   * Optional — null when no caller cares about snapshots.
+   */
+  onBrowserSnapshot?: (snap: BrowserSnapshot) => void;
+  /**
+   * Called every time the loop appends to its action history. Used by the
+   * orchestrator to retain the per-action transcript for the extractor
+   * (the existing `events.onAction` carries the executed shape, not the
+   * raw action string the planner emitted, so we surface that separately).
+   */
+  onHistory?: (action: string) => void;
+  /**
+   * Called whenever a new screenshot is captured. The orchestrator caches
+   * the latest PNG bytes so the extractor has a "final frame" to send to
+   * the model when no Chrome snapshot is available.
+   */
+  onScreenshotBuffer?: (png: Buffer) => void;
 }
 
 /**
@@ -118,6 +159,10 @@ export async function runTask(
       );
     }
 
+    // Spread opts directly so onBrowserSnapshot / onHistory /
+    // onScreenshotBuffer pass straight through to runOneSubtask. We only
+    // override the per-subtask fields (task, overallGoal, maxSteps, onStep)
+    // — the orchestrator's callbacks survive across all subtasks.
     const result = await runOneSubtask({
       ...opts,
       task: subtask,
@@ -155,12 +200,17 @@ interface SubtaskOpts extends RunOptions {
   /** Called every time the inner loop completes a step, so the orchestrator
    *  can enforce the cross-subtask total budget. */
   onStep?: () => void;
+  /** Called whenever a fresh browser snapshot is captured. The orchestrator
+   *  uses this to remember the most recent snapshot across subtasks so the
+   *  end-of-run extractor can use it instead of re-fetching. */
+  onBrowserSnapshot?: (snap: BrowserSnapshot) => void;
 }
 
 async function runOneSubtask(
   opts: SubtaskOpts,
 ): Promise<"done" | "cancelled" | "exhausted"> {
   const { task, provider, events, overallGoal, maxSteps, onStep } = opts;
+  const browser = opts.browser ?? null;
   const history: string[] = [];
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
@@ -240,8 +290,36 @@ async function runOneSubtask(
       `[loop] 📸 screenshot ${shot.width}x${shot.height} (${shot.png.length} bytes, ${Date.now() - t0}ms${prefetchUsed ? " prefetched" : ""}) hash=${screenHash}`,
     );
     await events.onScreenshot(shot.png);
+    // Cache the latest frame for the extractor at end-of-run. The events
+    // path uploads to Convex / pings the buddy; this side-channel keeps a
+    // local Buffer reference so we never have to re-fetch from storage.
+    opts.onScreenshotBuffer?.(shot.png);
     if (cancelled()) return "cancelled";
     const screenSize: [number, number] = [shot.width, shot.height];
+
+    // Best-effort browser snapshot. Done in parallel with… nothing: it's
+    // ~50-150ms when the extension is connected, runs sequentially before
+    // plan(). When the extension is offline or no tab is green, available()
+    // returns false within ~1.5s and we fall through to vision-only. The
+    // snapshot flows out through opts.onBrowserSnapshot so the orchestrator
+    // can latch the most recent value for the extractor at end-of-run.
+    let browserSnapshot: BrowserSnapshot | undefined;
+    if (browser) {
+      try {
+        if (await browser.available()) {
+          const tSnap = Date.now();
+          browserSnapshot = await browser.snapshot();
+          console.log(
+            `[loop] 🌐 snapshot (${Date.now() - tSnap}ms): ${browserSnapshot.url} (${browserSnapshot.ax.length}b)`,
+          );
+          opts.onBrowserSnapshot?.(browserSnapshot);
+        }
+      } catch (e) {
+        console.warn(
+          `[loop] snapshot failed (${e instanceof Error ? e.message : String(e)}) — vision-only this step`,
+        );
+      }
+    }
 
     const tPlan = Date.now();
     let action: string;
@@ -252,6 +330,7 @@ async function runOneSubtask(
         screenshotB64: shot.png.toString("base64"),
         screen: screenSize,
         signal: ctrl.signal,
+        browserSnapshot,
       });
     } catch (e: unknown) {
       if (cancelled()) return "cancelled";
@@ -426,7 +505,7 @@ async function runOneSubtask(
     }
 
     const tExec = Date.now();
-    const executed = await executeAction(action, coords, dragTo);
+    const executed = await executeAction(action, coords, dragTo, browser);
     if (executed) {
       console.log(
         `[loop] ⚡ exec (${Date.now() - tExec}ms): ${executed.type} ${JSON.stringify(executed.payload)}`,
@@ -440,6 +519,7 @@ async function runOneSubtask(
     }
 
     history.push(action);
+    opts.onHistory?.(action);
     onStep?.();
     // Record this (text, screen-hash) attempt so guard #2 can spot a future
     // re-attempt from the same state. We record AFTER execute so a failed
@@ -503,8 +583,54 @@ async function executeAction(
   action: string,
   coords: { x: number; y: number } | null,
   dragTo: { x: number; y: number } | null = null,
+  browser: BrowserClient | null = null,
 ): Promise<{ type: string; payload: Record<string, unknown> } | null> {
   const a = action.trim();
+
+  // browser.* — handled BEFORE everything else so a Chrome-aware action
+  // can't fall through to nut-js cursor automation. Each browser.* verb
+  // dispatches via the BrowserClient (Playwright locator), which means the
+  // user's OS cursor stays put AND the action targets the actual page
+  // viewport / element regardless of what's under the cursor. If the
+  // browser client is null (Chrome inactive) we surface as "no executor
+  // matched" so the user sees the planner emitted a verb we can't fulfill.
+  if (/^browser\./i.test(a)) {
+    if (!browser) return null;
+    const parsed = parseBrowserAction(a);
+    if (!parsed) return null;
+    switch (parsed.kind) {
+      case "click":
+        await browser.click(parsed.ref);
+        return { type: "browser_click", payload: { ref: parsed.ref } };
+      case "type":
+        await browser.type(parsed.ref, parsed.text, { submit: parsed.submit });
+        return {
+          type: "browser_type",
+          payload: parsed.submit
+            ? { ref: parsed.ref, text: parsed.text, submit: true }
+            : { ref: parsed.ref, text: parsed.text },
+        };
+      case "scroll_page":
+        await browser.scrollPage(parsed.dir, parsed.amount);
+        return {
+          type: "browser_scroll_page",
+          payload: { dir: parsed.dir, amount: parsed.amount ?? 800 },
+        };
+      case "scroll_element":
+        await browser.scrollElement(parsed.ref, parsed.dir, parsed.amount);
+        return {
+          type: "browser_scroll_element",
+          payload: { ref: parsed.ref, dir: parsed.dir, amount: parsed.amount ?? 600 },
+        };
+      case "read": {
+        const text = await browser.readText(parsed.ref);
+        return {
+          type: "browser_read",
+          payload: parsed.ref ? { ref: parsed.ref, text } : { text },
+        };
+      }
+    }
+  }
 
   // drag <source> to <target> — handled BEFORE any other matcher so a
   // malformed drag ("drag the file" with no target) can't leak into the
@@ -584,9 +710,29 @@ async function executeAction(
   const SCROLL_FLOOR = 50;
   const scrollMatch = a.match(/^scroll\s+(up|down)(?:\s+(\d+))?/i);
   if (scrollMatch) {
-    const dir = scrollMatch[1].toLowerCase() === "up" ? 1 : -1;
+    const dirWord = scrollMatch[1].toLowerCase() as "up" | "down";
+    const dir = dirWord === "up" ? 1 : -1;
     const requested = scrollMatch[2] ? parseInt(scrollMatch[2], 10) : SCROLL_FLOOR;
     const amount = requested === 0 ? 0 : Math.max(SCROLL_FLOOR, requested);
+    // When Chrome is the active surface (browser snapshot was reachable
+    // this step), prefer browser.scrollPage over the OS-level wheel scroll.
+    // window.scrollBy targets the document viewport unconditionally —
+    // sidesteps the entire "cursor parked over sidebar" class of bugs that
+    // nut-js scroll suffers from. Falls through to nut-js for non-Chrome
+    // contexts.
+    if (browser && (await browser.available().catch(() => false))) {
+      try {
+        await browser.scrollPage(dirWord);
+        return {
+          type: "browser_scroll_page",
+          payload: { dir: dirWord, amount: 800, via: "scroll" },
+        };
+      } catch (e) {
+        console.warn(
+          `[loop] browser.scrollPage failed (${e instanceof Error ? e.message : String(e)}) — falling back to nut-js`,
+        );
+      }
+    }
     await screen.scroll(dir * amount);
     return { type: "scroll", payload: { direction: scrollMatch[1], amount } };
   }

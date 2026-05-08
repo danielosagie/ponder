@@ -3,28 +3,34 @@ import {
   think,
   needsCoordinates,
   isDone,
+  isValidAction,
   parseDragAction,
   parseBrowserAction,
 } from "./brain";
 import { findCoordinates } from "./eyes";
 import { createOllamaPlanner } from "./planner";
+import { canonicalizeUrl, type RouterClient } from "./router";
 import type { AgentEvents, ProviderClient } from "./types";
 import type { BrowserClient, BrowserSnapshot } from "./browser/types";
 import * as screen from "../screen";
 
 // Per-subtask cap. With hierarchical planning the inner loop only needs to
 // carry ONE focused phase to completion ("open Chrome", "search Google for
-// X"), so 12 steps is plenty. If a subtask exhausts without DONE we abort
-// the whole run rather than burning the rest of the budget — the planner's
-// decomposition was probably wrong, retry with a clearer prompt.
-const MAX_STEPS_PER_SUBTASK = 12;
+// X"), so ~20 steps is plenty for a normal sub-goal — long enough to handle
+// autocomplete dropdowns, retry a click that needed a prerequisite, etc.
+// Override with HOLO3_MAX_STEPS_SUBTASK.
+const MAX_STEPS_PER_SUBTASK = Number(
+  process.env.HOLO3_MAX_STEPS_SUBTASK ?? 20,
+);
 // Hard ceiling across all subtasks combined. Even with a 6-subtask plan we
-// never want more than this total. Roughly 2x the old flat MAX_STEPS — gives
-// hierarchical mode headroom without making cancel-by-budget useless.
-const MAX_STEPS_TOTAL = 60;
-// Legacy cap for non-hierarchical (planner unavailable / single-subtask) runs.
-// Matches the old behavior so flat mode is identical to before.
-const MAX_STEPS = 30;
+// never want more than this total. Override with HOLO3_MAX_STEPS_TOTAL.
+const MAX_STEPS_TOTAL = Number(process.env.HOLO3_MAX_STEPS_TOTAL ?? 90);
+// Cap for non-hierarchical (planner unavailable / single-subtask) runs —
+// the most common path right now. Bumped from 30 → 50 because Marketplace
+// flows easily need 20+ steps just for the location-pick dance, and 30 was
+// running out before reaching the third listing on multi-result tasks.
+// Override with HOLO3_MAX_STEPS.
+const MAX_STEPS = Number(process.env.HOLO3_MAX_STEPS ?? 50);
 // Default inter-step pause. The hosted H Company API has a 10 RPM default-tier
 // limit; with plan + ground per step we issue ~2 reqs/step, so 6.5s keeps us
 // safely under (≈9 RPM steady-state). Modal/local don't rate-limit so we use
@@ -37,6 +43,15 @@ const STEP_PAUSE_MS_HCOMPANY = 6500;
 // shrink the parallel-with-pause window. 250ms matches POST_MOVE_HOVER_MS+
 // nut-js autoDelayMs in screen.ts and is enough for menu pops / focus rings.
 const PREFETCH_SETTLE_MS = 250;
+// Extra settle for actions that fire async UI: typing into a search /
+// combobox / location field triggers an autocomplete dropdown that arrives
+// from the network ~600–1200ms later (Facebook Marketplace location filter,
+// Google search-as-you-type, Amazon search). Without this, the next
+// snapshot is taken while the dropdown is still empty, the planner clicks
+// the disabled Apply button, and Playwright burns 5s on the locator
+// timeout. We pay the wait once on the typing step and recoup it many
+// times over by avoiding a wrong-action retry loop.
+const POST_TYPE_SETTLE_MS = 1400;
 
 export interface RunOptions {
   task: string;
@@ -44,18 +59,29 @@ export interface RunOptions {
   events: AgentEvents;
   shouldCancel?: () => boolean;
   /**
-   * Optional Chrome control via Playwriter. When present AND the extension
-   * is connected to an active tab, the loop will:
+   * Optional Chrome control via an agent-managed Chrome instance launched
+   * automatically by playwright-core. When present AND `available()`
+   * returns true (Chrome was launchable), the loop will:
    *   1. Pull an accessibility snapshot at the start of each step and
    *      include it in the planner prompt so the model can pick browser.*
    *      actions instead of guessing pixel coordinates.
    *   2. Route browser.click/type/scroll/read through this client instead
    *      of nut-js cursor automation.
-   * When the client is null, or `available()` returns false (extension
-   * offline / no green tab), the loop runs the legacy vision-only flow
-   * with zero behavioral change.
+   * When the client is null or unavailable (Chrome not installed, launch
+   * failed, etc.), the loop runs the legacy vision-only flow with zero
+   * behavioral change.
    */
   browser?: BrowserClient | null;
+  /**
+   * Optional CLI fast-path. When provided AND a browser snapshot is
+   * captured this step, the router runs FIRST — a small local Ollama
+   * model that picks browser.* actions directly from the snapshot in
+   * ~500ms. If it succeeds, we execute and skip plan/ground entirely
+   * (saving ~10s on hcompany). If the router escalates, the loop falls
+   * through to Holo3 with the router's reason spliced into the prompt.
+   * Null → vision path runs every step, identical to pre-router behavior.
+   */
+  router?: RouterClient | null;
   /**
    * Called whenever the loop captures a fresh accessibility snapshot. The
    * orchestrator (electron/main.ts) latches the most recent value and
@@ -77,6 +103,38 @@ export interface RunOptions {
    * the model when no Chrome snapshot is available.
    */
   onScreenshotBuffer?: (png: Buffer) => void;
+  /**
+   * Skip hierarchical planning entirely. agent_do passes this because its
+   * contract is "ONE atomic OS-level mouse step" — running the Ollama
+   * planner on a one-step task produces wrong subtasks ("Open Chrome"
+   * when Chrome is already open, "Navigate to file picker" when the
+   * picker is already visible) that the brain can't reconcile with the
+   * actual screen, leading to dock-icon spin loops until anti-loop guard
+   * #1 bails. With flat=true we bypass planner.plan() entirely and run
+   * the original task verbatim against runOneSubtask. The plannerContext
+   * URL hint is also moot in this path because agent_do is vision-only
+   * (browser=null).
+   */
+  flat?: boolean;
+  /**
+   * Higher-level goal this run is part of. Threaded into the brain's
+   * per-step prompt so the model stays oriented when the immediate task
+   * is just the next mechanical step. Previously hardcoded to undefined
+   * in flat mode — agent_do tasks therefore lost framing context the
+   * moment the loop started, which made it harder for the inner brain
+   * to recognize completion mid-flight (e.g., file picker closes →
+   * brain doesn't know it was a file-upload run → keeps emitting dock
+   * clicks until anti-loop fires).
+   */
+  overallGoal?: string;
+  /**
+   * Per-call cap on inner steps. Defaults to MAX_STEPS (50) for
+   * Electron-app runs. agent_do passes a much smaller cap (8) because
+   * its contract is "ONE atomic OS-level step" — if it can't finish in
+   * a handful of steps the orchestrator should re-plan with fresh state
+   * rather than burn 50 retries on a stuck inner loop.
+   */
+  maxSteps?: number;
 }
 
 /**
@@ -119,9 +177,67 @@ export async function runTask(
   opts: RunOptions,
 ): Promise<"done" | "cancelled" | "exhausted"> {
   const { task, events } = opts;
+
+  // Flat mode (agent_do) — skip the hierarchical planner entirely.
+  //
+  // agent_do is contractually "ONE atomic OS-level mouse step", but the
+  // Ollama planner doesn't know that and routinely over-decomposes one-
+  // step inputs into 3-6 subtasks. Examples seen in the wild:
+  //   • "Select the most recent screenshot in the file picker" →
+  //     [Open Chrome, Navigate to file picker, ..., Click Open]
+  //   • "Open Marketplace and search for bulbasaur" → the planner's own
+  //     few-shot example about Marietta GA $3000 verbatim.
+  // The brain then runs against a misframed first subtask ("Open Chrome"
+  // while Chrome is already in front), can't recognize completion, and
+  // falls back to its most-recently-successful action — which is what
+  // produced the dock-icon spin until anti-loop guard #1 fired.
+  //
+  // In flat mode we hand the original task straight to runOneSubtask
+  // with the standard MAX_STEPS budget. No subtask banner, no plan
+  // context probe (agent_do is vision-only — browser is always null
+  // here so the probe would no-op anyway).
+  if (opts.flat) {
+    // Forward overallGoal so the brain has framing context, and let the
+    // caller cap maxSteps short (agent_do passes 8 — atomic steps don't
+    // need 50 retries; the orchestrator re-plans with fresh state if 8
+    // wasn't enough). Falls back to MAX_STEPS for legacy callers that
+    // don't supply a cap.
+    const flatBudget = opts.maxSteps ?? MAX_STEPS;
+    console.log(
+      `[loop] 📋 flat mode (agent_do): skipping planner (maxSteps=${flatBudget}` +
+        (opts.overallGoal ? `, goal="${opts.overallGoal.slice(0, 60)}"` : "") +
+        `)`,
+    );
+    const result = await runOneSubtask({
+      ...opts,
+      task,
+      overallGoal: opts.overallGoal,
+      maxSteps: flatBudget,
+      onStep: () => {},
+    });
+    return result === "cancelled" || result === "exhausted" ? result : "done";
+  }
+
   const planner = createOllamaPlanner();
   const t0 = Date.now();
-  const plan = await planner.plan(task);
+
+  // Best-effort grab of the current Chrome URL/title so the planner can
+  // skip already-completed setup subtasks (don't decompose "Open Chrome"
+  // when Chrome is already on the right URL). Falls through silently
+  // when no browser is wired or it's unavailable.
+  let plannerContext: { browserUrl?: string; browserTitle?: string } = {};
+  if (opts.browser) {
+    try {
+      if (await opts.browser.available().catch(() => false)) {
+        const snap = await opts.browser.snapshot();
+        plannerContext = { browserUrl: snap.url, browserTitle: snap.title };
+      }
+    } catch {
+      // Don't block planning on a flaky browser probe.
+    }
+  }
+
+  const plan = await planner.plan(task, plannerContext);
   console.log(
     `[loop] 📋 plan (${Date.now() - t0}ms): ${plan.note}\n` +
       plan.subtasks.map((s, i) => `   ${i + 1}. ${s}`).join("\n"),
@@ -211,7 +327,36 @@ async function runOneSubtask(
 ): Promise<"done" | "cancelled" | "exhausted"> {
   const { task, provider, events, overallGoal, maxSteps, onStep } = opts;
   const browser = opts.browser ?? null;
+  const router = opts.router ?? null;
+  // Hash of the previous step's snapshot AX text. Used to tell the router
+  // "your last action didn't change the page" — a strong signal to either
+  // DONE or escalate. Resets to undefined when a step had no snapshot.
+  let prevSnapshotHash: string | undefined;
+  // Hash of the previous step's SCREENSHOT pixels. Combined with the
+  // browser snapshot hash to detect "an OS-level overlay opened" (file
+  // picker, system dialog, native menu) — when the browser snapshot is
+  // byte-equal but the screenshot pixels changed, Chrome's DOM didn't
+  // move but something visually did. The router would otherwise re-emit
+  // the same browser action (since IT only sees the unchanged snapshot)
+  // and burn 4 steps until anti-loop kills the run. Detecting it here
+  // lets us skip the router for ONE step and force vision, so Holo3 can
+  // see the file picker and switch to mouse-grounded actions.
+  let prevScreenHash: string | undefined;
+  // The router's reason from the immediately-prior CLI escalation. Spliced
+  // into the next think() call so Holo3 inherits context. Cleared after
+  // each vision step lands.
+  let pendingRouterHint: string | undefined;
   const history: string[] = [];
+  // Parallel array to history: the screen hash AT THE MOMENT each action
+  // was emitted. Used by the screen-aware anti-loop check — if the same
+  // action repeats 3/4 times AND the screen was identical on each repeat,
+  // we're truly stuck. If the screen WAS changing across repeats, the
+  // agent is making progress (file picker is selecting items, list is
+  // filtering, dropdown is updating) and the action-repeat is a false
+  // positive. The Bulbasaur upload trace had this shape: three "click
+  // on the Screenshot…PM.png file" emissions while the file was actually
+  // being selected — the legacy guard killed a working flow.
+  const actionScreenHashes: string[] = [];
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
   // from a screen we've already typed it on is the search-engine loop pattern
@@ -219,6 +364,20 @@ async function runOneSubtask(
   // re-emits "type the query" because it doesn't realize results are already
   // showing). Catching this saves ~10 wasted steps per failure.
   const typedTextScreens = new Map<string, Set<string>>();
+  // Anti-loop guard #0: counts how many times we've rejected a click on a
+  // (disabled) ref this run, keyed by ref. Two strikes and we bail — the
+  // model is structurally confused about prerequisites and re-snapshotting
+  // hasn't unstuck it. Reset implicitly per subtask (whole map is fresh).
+  const disabledRejectCount = new Map<string, number>();
+  // Anti-loop guard #0c: canonical URLs the agent navigated to that the
+  // site rewrote to a different URL. Re-navigating to any of these is
+  // guaranteed to redirect again — kills runs in 3 steps via guard #1
+  // (saw this on /marketplace/marietta/search → /marketplace/category/
+  // search loops). Detected on the next-step snapshot by comparing the
+  // requested URL to the actual URL; persisted across the whole subtask
+  // so an alternating "marietta → category → marietta" pattern still
+  // gets caught even when the IMMEDIATE last action looks fine.
+  const rejectedNavigateUrls = new Set<string>();
   // Prefetched next screenshot. We kick this off ~250ms after each action so
   // it overlaps with the inter-step pause; by the time the next iteration
   // starts, the bytes are already in memory and we skip a 50-200ms grab+encode.
@@ -321,24 +480,155 @@ async function runOneSubtask(
       }
     }
 
-    const tPlan = Date.now();
-    let action: string;
-    try {
-      action = await think(provider, {
-        task: taskForPlanner,
-        history,
-        screenshotB64: shot.png.toString("base64"),
-        screen: screenSize,
-        signal: ctrl.signal,
-        browserSnapshot,
-      });
-    } catch (e: unknown) {
-      if (cancelled()) return "cancelled";
-      throw e;
+    // ── Post-navigate redirect detection ─────────────────────────────────
+    //
+    // If the IMMEDIATELY-PREVIOUS action was browser.navigate <X> AND the
+    // snapshot we just captured shows we're at <Y> ≠ <X>, the site rewrote
+    // our URL. Two things happen:
+    //   1. canonical(X) joins `rejectedNavigateUrls` so guard #0c (below,
+    //      after the action is generated) can refuse a future attempt to
+    //      re-navigate to it.
+    //   2. The previous history entry is rewritten to
+    //      `browser.navigate <X>  → redirected to <Y>` so the brain/router
+    //      sees the redirect on EVERY subsequent step, not only when the
+    //      most recent action was the navigate. Without this annotation
+    //      the agent alternated marietta/search ⇄ category/search until
+    //      guard #1 killed the run after 3 attempts.
+    //
+    // Only fires when we have a browserSnapshot this step — pure vision
+    // steps don't carry a URL to compare against.
+    if (browserSnapshot && history.length > 0) {
+      const prev = history[history.length - 1]!;
+      const m = prev.match(/^browser\.navigate\s+(\S+)/i);
+      if (m && !/→ redirected to/.test(prev)) {
+        const requested = canonicalizeUrl(m[1]!);
+        const actual = canonicalizeUrl(browserSnapshot.url);
+        if (requested && actual && requested !== actual) {
+          rejectedNavigateUrls.add(requested);
+          const annotated = `${prev}  → redirected to ${browserSnapshot.url}`;
+          history[history.length - 1] = annotated;
+          console.warn(
+            `[loop] 🔁 navigate redirected: ${m[1]} → ${browserSnapshot.url} (added to rejected set)`,
+          );
+        }
+      }
     }
-    console.log(`[loop] 🧠 plan (${Date.now() - tPlan}ms): ${action}`);
-    await events.onThought(action);
-    if (cancelled()) return "cancelled";
+
+    // ── ROUTER (CLI fast path) ───────────────────────────────────────────
+    // When Chrome is active AND a router is wired, ask it FIRST — typically
+    // 500–1000ms via local Ollama vs ~10s for the hcompany plan + ground
+    // round trip. The router emits one of:
+    //   • action      → exec directly, skip plan/ground
+    //   • done        → end the subtask
+    //   • vision_needed → fall through to Holo3 with the reason as a hint
+    //   • skip        → fall through silently (router unavailable / errored)
+    //
+    // BROWSER-STALL ESCALATION: when the previous browser action didn't
+    // change the DOM (snapshotUnchanged) BUT the screen pixels DID change
+    // (different screenHash), an OS-level overlay just appeared on top
+    // of Chrome — typically a file picker, system dialog, or native
+    // menu triggered by a click. The router would just see the
+    // unchanged snapshot and re-emit the same browser action (clicking
+    // BEHIND the dialog, no effect). We pre-empt: skip the router this
+    // step entirely, force vision (Holo3 looks at the screenshot,
+    // sees the file picker, switches to mouse-grounded actions). This
+    // is the file-picker-stuck case in user logs:
+    //   step N: browser.click e15 (Add photo) → file picker opens
+    //   step N+1: snapshot byte-equal to step N, screenHash differs
+    //             → router would re-emit "browser.click e15"
+    //   step N+1 (with this guard): force vision, Holo3 picks up the
+    //             file picker UI and emits a mouse click on a file.
+    let routerAction: string | undefined;
+    let usedRouter = false;
+    const snapHash = browserSnapshot
+      ? hashScreen(Buffer.from(browserSnapshot.ax))
+      : undefined;
+    const snapshotUnchanged =
+      prevSnapshotHash !== undefined && snapHash === prevSnapshotHash;
+    const screenChanged =
+      prevScreenHash !== undefined && prevScreenHash !== screenHash;
+    const browserStalled = snapshotUnchanged && screenChanged;
+    if (browserStalled) {
+      console.log(
+        "[loop] 🪟 browser-stall: DOM unchanged but screen pixels moved — OS overlay likely (file picker / native dialog). Skipping router this step, going vision.",
+      );
+      pendingRouterHint =
+        "Previous click opened a NATIVE OS dialog on top of Chrome (likely a file picker / save dialog / system prompt). The Chrome accessibility tree is stale — IGNORE browser.* refs this step. Look at the screenshot and emit a vision-grounded mouse action ('click on the file …', 'click the Open button', etc.) to drive the dialog.";
+    }
+    if (router && browserSnapshot && !browserStalled) {
+      const tRouter = Date.now();
+      try {
+        const decision = await router.decide({
+          task: taskForPlanner,
+          history,
+          snapshot: browserSnapshot,
+          snapshotUnchanged,
+          signal: ctrl.signal,
+        });
+        const dt = Date.now() - tRouter;
+        switch (decision.kind) {
+          case "action":
+            console.log(`[router] (${dt}ms) → ${decision.action}`);
+            routerAction = decision.action;
+            usedRouter = true;
+            break;
+          case "done":
+            console.log(`[router] (${dt}ms) → DONE`);
+            await events.onThought("DONE (router)");
+            return "done";
+          case "vision_needed":
+            console.log(`[router] (${dt}ms) → VISION_NEEDED: ${decision.reason}`);
+            pendingRouterHint = decision.reason;
+            break;
+          case "skip":
+            console.log(`[router] (${dt}ms) → skip: ${decision.reason}`);
+            // No hint — the reason is internal (timeout, model not pulled),
+            // not useful for Holo3.
+            break;
+        }
+      } catch (e) {
+        console.warn(
+          `[loop] router error (${e instanceof Error ? e.message : String(e)}) — falling through to vision`,
+        );
+      }
+    }
+    // Update the per-step hashes for the NEXT iteration's stall check.
+    // Always update both: even if a snapshot wasn't captured this step,
+    // the screenshot still moves the screen-hash forward.
+    prevSnapshotHash = snapHash;
+    prevScreenHash = screenHash;
+
+    let action: string;
+    if (routerAction) {
+      // Fast path: the router gave us a usable action. Skip plan + ground.
+      action = routerAction;
+      await events.onThought(`(router) ${action}`);
+      if (cancelled()) return "cancelled";
+    } else {
+      // Vision path: full Holo3 plan, optionally with the router's
+      // escalation reason as context.
+      const tPlan = Date.now();
+      try {
+        action = await think(provider, {
+          task: taskForPlanner,
+          history,
+          screenshotB64: shot.png.toString("base64"),
+          screen: screenSize,
+          signal: ctrl.signal,
+          browserSnapshot,
+          routerHint: pendingRouterHint,
+        });
+      } catch (e: unknown) {
+        if (cancelled()) return "cancelled";
+        throw e;
+      }
+      // Hint consumed — clear so it doesn't leak into the next step if the
+      // router has nothing further to say.
+      pendingRouterHint = undefined;
+      console.log(`[loop] 🧠 plan (${Date.now() - tPlan}ms): ${action}`);
+      await events.onThought(action);
+      if (cancelled()) return "cancelled";
+    }
 
     if (isDone(action)) {
       console.log("[loop] ✅ DONE");
@@ -356,10 +646,14 @@ async function runOneSubtask(
             ? "The model may have been mid-reasoning when truncated; check chat_template_kwargs.enable_thinking and max_tokens."
             : "Check the provider response."),
       );
-      history.push("(empty)");
+      history.push("[note: empty action emitted]");
+      actionScreenHashes.push(screenHash);
       // Two empty plans in a row = the model is stuck. Bail rather than
       // burn through 30 steps doing nothing.
-      if (history.length >= 2 && history.at(-2) === "(empty)") {
+      if (
+        history.length >= 2 &&
+        history.at(-2) === "[note: empty action emitted]"
+      ) {
         console.warn("[loop] 🛑 two consecutive empty plans — stopping");
         await events.onError("Model returned empty actions twice in a row — stopping.");
         return "exhausted";
@@ -368,23 +662,219 @@ async function runOneSubtask(
       continue;
     }
 
+    // Brain-output validator. The Holo3 brain occasionally regurgitates
+    // prompt boilerplate as if it were an action ("The last step was
+    // incorrect. The current step is:" — observed in the Bulbasaur
+    // trace). Without a validator, the loop tries to vision-ground that
+    // prose, burning ~1s on a wrong ground and emitting a click at a
+    // random coordinate. The allow-list (click / type / press / hotkey
+    // / drag / scroll / wait / done / browser.*) is the same set the
+    // executor knows how to dispatch; if the brain emits anything else
+    // we record a [note: …] and re-prompt rather than execute.
+    if (!isValidAction(action)) {
+      console.warn(
+        `[loop] ⚠ invalid brain output: ${action.slice(0, 100)}`,
+      );
+      await events.onError(
+        `Brain emitted unparseable action: "${action.slice(0, 100)}". ` +
+          "Treating as no-op and re-prompting.",
+      );
+      const note = `[note: brain emitted unparseable action — ${action.slice(0, 80)}]`;
+      history.push(note);
+      actionScreenHashes.push(screenHash);
+      opts.onHistory?.(note);
+      // Two consecutive invalid outputs = the model is structurally
+      // confused (likely stuck mid-reasoning, or system prompt drift).
+      // Bail cleanly rather than spin.
+      const prev = history.at(-2);
+      if (prev?.startsWith("[note: brain emitted unparseable action")) {
+        console.warn(
+          "[loop] 🛑 two consecutive invalid brain outputs — stopping",
+        );
+        await events.onError(
+          "Brain returned unparseable output twice in a row — stopping.",
+        );
+        return "exhausted";
+      }
+      if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
+      continue;
+    }
+
+    // Anti-loop guard #0: disabled-ref rejection.
+    //
+    // Catches the most expensive class of agent loop: the planner emits
+    // browser.click on a ref that the snapshot just flagged as "(disabled)"
+    // (Facebook Marketplace's Apply button while no location suggestion is
+    // picked, etc.). Without this guard, Playwright's locator.click waits
+    // 5s for the element to become enabled, times out, and the planner
+    // re-emits the same disabled click on the next step — burning ~15s
+    // before guard #1's 3-of-4-repeats threshold catches it.
+    //
+    // We catch it on attempt 1 (~0ms cost) by parsing the action and
+    // searching the latest snapshot's AX text for "[ref] ... (disabled)".
+    // On a hit:
+    //   • First strike: log, surface a recovery message, push a synthetic
+    //     history line ("(rejected: ...)" — shaped to NOT normalize-equal
+    //     the original action, so guard #1 still detects genuine repeats),
+    //     brief sleep so the dropdown can finish rendering, continue.
+    //   • Second strike on the SAME ref: the model is structurally confused
+    //     about prerequisites and re-snapshotting hasn't unstuck it. Bail
+    //     with onError before we waste more cycles.
+    const browserAct = parseBrowserAction(action);
+
+    // Auto-DONE: navigate-to-current-URL.
+    //
+    // If the brain emits browser.navigate <Y> and the snapshot URL
+    // already canonical-matches Y, the subtask "navigate to X" is
+    // functionally complete. Re-issuing the navigate either no-ops
+    // (wasted Playwright reload) or fires the same redirect again —
+    // either way, no progress, and after 3 same-actions guard #1 kills
+    // the run, which aborts the remaining subtasks. That's exactly
+    // what kept happening on "Open Chrome and navigate to
+    // facebook.com/marketplace": step 2 navigated successfully, but
+    // the small model didn't recognize completion, re-emitted the
+    // navigate twice more, and the WHOLE plan died after subtask 1.
+    //
+    // Returning "done" here advances to the next subtask. Safer than
+    // it sounds: the brain explicitly emitted "navigate to Y" — its
+    // intent is "be at Y" — and we ARE at Y. The only edge case
+    // (hard refresh) is uncommon and recoverable via hotkey cmd+r;
+    // nobody uses browser.navigate to refresh.
+    if (browserAct?.kind === "navigate" && browserSnapshot) {
+      const target = canonicalizeUrl(browserAct.url);
+      const current = canonicalizeUrl(browserSnapshot.url);
+      if (target && current && target === current) {
+        console.log(
+          `[loop] ✅ already at ${browserAct.url} — auto-DONE for subtask`,
+        );
+        await events.onStatus(`Already at ${browserAct.url}.`);
+        return "done";
+      }
+    }
+
+    // Anti-loop guard #0c: rejected-navigate-URL guard.
+    //
+    // If the action is browser.navigate <Y> and canonical(Y) is in
+    // rejectedNavigateUrls (we've already navigated to it once and the
+    // site redirected us elsewhere), don't fire it. Re-emitting would
+    // either redirect again (wasted step + Playwright load time) or
+    // succeed harmlessly (we're already at the redirected destination)
+    // — either way, no progress. Annotate history with a rejection note
+    // and continue so the brain re-plans from the current page.
+    //
+    // We DON'T cap strikes here the way disabled-ref does — repeated
+    // navigates aren't dangerous, just wasteful. If the brain keeps
+    // emitting them, guard #1's 3-of-4 normalized-action check
+    // eventually kills the run anyway.
+    if (browserAct?.kind === "navigate") {
+      const target = canonicalizeUrl(browserAct.url);
+      if (target && rejectedNavigateUrls.has(target)) {
+        console.warn(
+          `[loop] 🚫 navigate rejected: ${browserAct.url} was redirected on a previous attempt`,
+        );
+        await events.onError(
+          `Skipping navigate to ${browserAct.url} — the site redirected this URL once already. ` +
+            `Working from the current page instead.`,
+        );
+        // [note: …] shape (was "(rejected: …)"). The brain previously
+        // sometimes echoed parenthetical history entries verbatim into
+        // its next plan output (the "The last step was incorrect…" loop
+        // observed in the Bulbasaur trace). The bracket-prefixed shape
+        // makes it unambiguous to the prompt that this is a system
+        // observation, not a prior action.
+        const synthetic = `[note: skipped re-navigate to ${browserAct.url} — site redirected this URL on a prior attempt]`;
+        history.push(synthetic);
+        actionScreenHashes.push(screenHash);
+        opts.onHistory?.(synthetic);
+        onStep?.();
+        await screen.sleep(400);
+        if (cancelled()) return "cancelled";
+        continue;
+      }
+    }
+
+    if (browserAct?.kind === "click" && browserSnapshot) {
+      const ref = browserAct.ref;
+      // Anchor to start of line so we don't false-match on a line that
+      // happens to mention "(disabled)" in its name. The flag suffix is
+      // emitted by playwriter.ts/SNAPSHOT_SCRIPT and only appears in that
+      // role-flag position, so the line-shape is unambiguous.
+      const disabledRe = new RegExp(
+        `^\\[${ref}\\][^\\n]*\\(disabled\\)\\s*$`,
+        "m",
+      );
+      if (disabledRe.test(browserSnapshot.ax)) {
+        const strike = (disabledRejectCount.get(ref) ?? 0) + 1;
+        disabledRejectCount.set(ref, strike);
+        console.warn(
+          `[loop] 🚫 disabled-ref rejected: ${ref} (strike ${strike}/2)`,
+        );
+        if (strike >= 2) {
+          await events.onError(
+            `Tried to click disabled ${ref} twice. A prerequisite step ` +
+              `(likely picking an autocomplete suggestion from the dropdown) ` +
+              `was missed. Stopping.`,
+          );
+          return "exhausted";
+        }
+        await events.onError(
+          `Skipping click on disabled ${ref}. Pick a suggestion from the ` +
+            `dropdown first — the Apply/Submit button un-disables once a ` +
+            `valid option is selected.`,
+        );
+        const synthetic = `[note: skipped click on disabled ${ref} — pick a suggestion ref first]`;
+        history.push(synthetic);
+        actionScreenHashes.push(screenHash);
+        opts.onHistory?.(synthetic);
+        onStep?.();
+        // Brief OS settle so any late-arriving dropdown render lands
+        // before the next snapshot. Don't pay the full stepPause here —
+        // we want recovery to feel snappy (the user just saw an error
+        // message; another 6.5s of silence makes it look frozen).
+        await screen.sleep(800);
+        if (cancelled()) return "cancelled";
+        continue;
+      }
+    }
+
     // Anti-loop guard #1: if the SAME normalized action was emitted three
-    // times in the last four steps and we haven't hit DONE, the agent is
-    // stuck (clicking the same icon over and over because nothing's changing
-    // on screen). Normalization makes this resilient to trivial drift like
-    // "click the search bar" vs "click the search bar." (trailing period).
+    // times in the last four steps AND the screen pixels weren't changing
+    // across those repeats, the agent is genuinely stuck (clicking the
+    // same icon over and over because nothing's changing on screen).
+    // Normalization makes this resilient to trivial drift like "click
+    // the search bar" vs "click the search bar." (trailing period).
+    //
+    // Screen-aware: previously we bailed on action-repeat alone, which
+    // killed working flows where the screen WAS changing under the
+    // surface (file picker selecting rows, autocomplete filtering, list
+    // updating). The Bulbasaur upload trace was the canonical example —
+    // three identical "click on the Screenshot…PM.png file" emissions
+    // while the file was actually being selected; legacy guard fired
+    // and reported a stuck loop on a flow that was making progress.
+    // Now we also require that the last 3 emissions all happened from
+    // the SAME screen hash (no pixel change). If the screen's moving,
+    // we let it ride.
     const normNow = normalizeAction(action);
     const last4 = history.slice(-3).map(normalizeAction).concat(normNow);
     const same = last4.filter((h) => h === normNow).length;
     if (last4.length === 4 && same >= 3) {
-      console.warn(
-        `[loop] 🛑 anti-loop: action "${action}" repeated ${same}/4 times — stopping`,
+      const recentHashes = actionScreenHashes.slice(-3);
+      const screensIdentical =
+        recentHashes.length === 3 &&
+        recentHashes.every((h) => h === screenHash);
+      if (screensIdentical) {
+        console.warn(
+          `[loop] 🛑 anti-loop: action "${action}" repeated ${same}/4 times AND screen unchanged — stopping`,
+        );
+        await events.onError(
+          `Stuck in a loop: "${action}" was emitted ${same} of the last 4 steps with no screen change. ` +
+            "The screen isn't updating, or the target isn't reachable from this state.",
+        );
+        return "exhausted";
+      }
+      console.log(
+        `[loop] ⚠ action "${action}" repeated ${same}/4 times but screen IS changing — not bailing (progress likely happening)`,
       );
-      await events.onError(
-        `Stuck in a loop: "${action}" was emitted ${same} of the last 4 steps. ` +
-          "The screen may not be updating, or the target isn't reachable from this state.",
-      );
-      return "exhausted";
     }
 
     // Anti-loop guard #2: type-dedup. The planner wants to type text T —
@@ -402,18 +892,28 @@ async function runOneSubtask(
     // loop has gap≥3 (type → enter → re-click search bar → re-type). 3 is
     // the smallest threshold that separates them. The trace from the cobb-
     // county failure had gap=3 precisely.
+    //
+    // CRITICAL: handles BOTH OS-level `type "X"` AND structured
+    // `browser.type <ref> "X"`. Previously only OS-level was caught, so a
+    // browser.type loop would burn 3 attempts before guard #1's 3-of-4
+    // threshold killed the run (~30s wasted on the recent
+    // "browser.type e17 \"2007 Honda Civic\"" loop). The unified extractor
+    // returns the text regardless of which verb form the model emitted.
     const TYPE_REPEAT_GAP = 3;
-    const typed = parseTypeAction(action);
+    const typedText = extractTypedText(action);
     let typeBailReason: string | null = null;
-    if (typed) {
-      const norm = typed.text.trim().toLowerCase();
+    if (typedText) {
+      const norm = typedText.trim().toLowerCase();
       const seen = typedTextScreens.get(norm);
       if (seen?.has(screenHash)) {
         typeBailReason = `screen hash matches a prior attempt (${screenHash})`;
       } else if (seen && seen.size > 0) {
-        // Find earliest step where this text was typed.
+        // Find earliest step where this text was typed (in EITHER verb form).
         const firstSeenAt = history.findIndex(
-          (h) => parseTypeAction(h)?.text.trim().toLowerCase() === norm,
+          (h) => {
+            const t = extractTypedText(h);
+            return t && t.trim().toLowerCase() === norm;
+          },
         );
         if (firstSeenAt !== -1 && history.length - firstSeenAt >= TYPE_REPEAT_GAP) {
           typeBailReason = `same text typed ${history.length - firstSeenAt} steps ago and we're back to retry`;
@@ -421,11 +921,13 @@ async function runOneSubtask(
       }
       if (typeBailReason) {
         console.warn(
-          `[loop] 🛑 type-loop: "${typed.text}" — ${typeBailReason}`,
+          `[loop] 🛑 type-loop: "${typedText}" — ${typeBailReason}`,
         );
         await events.onError(
-          `Already attempted "${typed.text}" earlier — ${typeBailReason}. ` +
-            "Try a more specific prompt, or check that the right field is focused.",
+          `Already attempted "${typedText}" earlier — ${typeBailReason}. ` +
+            "The field may not be accepting input — try clicking a different " +
+            "field first, or use 'click on the X' (vision) instead of " +
+            "browser.type if the ref keeps failing.",
         );
         return "exhausted";
       }
@@ -504,13 +1006,51 @@ async function runOneSubtask(
       if (cancelled()) return "cancelled";
     }
 
+    // Multi-monitor offset translation. Holo3's grounder returns coords
+    // in SCREENSHOT space (0..shot.width, 0..shot.height). cliclick / nut-js
+    // expect coords in SCREEN space (the macOS virtual desktop union of all
+    // displays). When the screenshot was captured from the primary display
+    // both offsets are 0 and this is a no-op; when the user has Chrome on
+    // a secondary display the screenshot was captured via desktopCapturer
+    // for that display and we add the display's bounds.x/.y so the click
+    // lands on the right monitor. Done HERE (after events.onGround so the
+    // UI overlay still shows screenshot-space coords for its own preview).
+    if ((shot.offsetX || shot.offsetY) && coords) {
+      coords = { x: coords.x + shot.offsetX, y: coords.y + shot.offsetY };
+    }
+    if ((shot.offsetX || shot.offsetY) && dragTo) {
+      dragTo = { x: dragTo.x + shot.offsetX, y: dragTo.y + shot.offsetY };
+    }
+
     const tExec = Date.now();
-    const executed = await executeAction(action, coords, dragTo, browser);
+    // Wrap the executor in try/catch so a single click failure (Playwright
+    // timeout because the ref is gone, an overlay intercepts pointer
+    // events, the page navigated mid-click, etc.) doesn't tear down the
+    // entire run. Without this, `browser.click(ref)` throwing here
+    // bubbles all the way out of runOneSubtask and the user sees an
+    // unhandled exception in the renderer instead of a graceful retry.
+    let executed: Awaited<ReturnType<typeof executeAction>> = null;
+    let execError: string | null = null;
+    try {
+      executed = await executeAction(action, coords, dragTo, browser);
+    } catch (e) {
+      // Keep the message compact — Playwright's full call log is dozens
+      // of lines, but the brain only needs the headline ("Timeout 2000ms
+      // exceeded" / "subtree intercepts pointer events" / etc.) to
+      // course-correct on the next step.
+      const raw = e instanceof Error ? e.message : String(e);
+      execError = raw.split("\n")[0]!.slice(0, 160);
+    }
     if (executed) {
       console.log(
         `[loop] ⚡ exec (${Date.now() - tExec}ms): ${executed.type} ${JSON.stringify(executed.payload)}`,
       );
       await events.onAction(executed);
+    } else if (execError) {
+      console.warn(
+        `[loop] ⚠ exec failed (${Date.now() - tExec}ms): ${execError}`,
+      );
+      await events.onError(`Action failed: ${action} — ${execError}`);
     } else {
       console.warn(
         `[loop] ⚠ no executor matched action="${action}" coords=${coords ? `(${coords.x},${coords.y})` : "null"}`,
@@ -518,14 +1058,28 @@ async function runOneSubtask(
       await events.onStatus(`Skipped (no executor): ${action}`);
     }
 
-    history.push(action);
-    opts.onHistory?.(action);
+    // Annotate the history entry with failure context so the next plan
+    // call sees what went wrong and can switch strategy. Without this,
+    // the brain sees its previous action in history as if it succeeded
+    // and re-emits a near-identical follow-up — exact loop pattern from
+    // the e91 "covered by overlay" trace. Annotation uses the [note: …]
+    // shape so the brain treats it as a system observation rather than
+    // a verb to imitate.
+    const historyEntry = execError
+      ? `${action}  [note: failed — ${execError}]`
+      : action;
+    history.push(historyEntry);
+    actionScreenHashes.push(screenHash);
+    opts.onHistory?.(historyEntry);
     onStep?.();
     // Record this (text, screen-hash) attempt so guard #2 can spot a future
     // re-attempt from the same state. We record AFTER execute so a failed
     // executor (no match, missing coords) doesn't poison the dedup map.
-    if (typed && executed) {
-      const norm = typed.text.trim().toLowerCase();
+    // Uses the unified extractor so both `type "X"` and `browser.type ref "X"`
+    // get tracked under the same normalized key — re-typing the same query
+    // via either verb form trips guard #2 on the next attempt.
+    if (typedText && executed) {
+      const norm = typedText.trim().toLowerCase();
       const set = typedTextScreens.get(norm) ?? new Set<string>();
       set.add(screenHash);
       typedTextScreens.set(norm, set);
@@ -540,18 +1094,41 @@ async function runOneSubtask(
     // If the pause is very short (default mode = 1200ms) the prefetch may not
     // finish in time; that's fine, the next iteration just awaits whatever's
     // left. We never throw from here — failures fall back to fresh capture.
+    //
+    // Router fast-path: when this step ran via the local router, we never
+    // touched the rate-limited hcompany API. Cap the pause at
+    // PREFETCH_SETTLE_MS (250ms) regardless of provider — that's the 5x+
+    // speedup the team-of-two architecture buys us. The next step might
+    // still go to vision and pay the full 6500ms, but step-by-step routing
+    // means we only pay it when we have to.
+    // Was this step a typing action? If so, async UI (autocompletes,
+    // search-as-you-type results) needs ~1s longer to render before the
+    // next snapshot. We bake that wait into the settle period — both the
+    // OS-level `type` action and the structured `browser.type` qualify.
+    const wasType =
+      executed?.type === "type" || executed?.type === "browser_type";
+    const settleMs = wasType ? POST_TYPE_SETTLE_MS : PREFETCH_SETTLE_MS;
+
+    const effectivePause = usedRouter ? settleMs : Math.max(stepPause, settleMs);
     if (cancelled()) return "cancelled";
-    if (stepPause > PREFETCH_SETTLE_MS) {
-      await screen.sleep(PREFETCH_SETTLE_MS);
+    if (effectivePause > settleMs) {
+      await screen.sleep(settleMs);
       if (cancelled()) return "cancelled";
       prefetched = screen.screenshot();
       // Swallow rejections so an unhandled rejection here can't kill the run;
       // the await-site has its own try/catch that retries with a fresh grab.
       prefetched.catch(() => {});
-      const remaining = stepPause - PREFETCH_SETTLE_MS;
+      const remaining = effectivePause - settleMs;
       if (await interruptiblePause(remaining, cancelled)) return "cancelled";
     } else {
-      if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
+      // Even on the fast path, settle briefly (or longer after a type) so
+      // the next snapshot reflects the action's effect (DOM mutations,
+      // focus changes, animations, autocomplete dropdowns). Then prefetch
+      // the screenshot in parallel with the (zero-or-tiny) remaining pause.
+      await screen.sleep(settleMs);
+      if (cancelled()) return "cancelled";
+      prefetched = screen.screenshot();
+      prefetched.catch(() => {});
     }
   }
   console.log(`[loop] 🛑 exhausted ${maxSteps} steps without DONE`);
@@ -599,6 +1176,14 @@ async function executeAction(
     const parsed = parseBrowserAction(a);
     if (!parsed) return null;
     switch (parsed.kind) {
+      case "navigate":
+        // Used as the agent's "launchpad" move when the active tab is
+        // chrome-extension://…/welcome.html (PLAYWRITER_AUTO_ENABLE creates
+        // this on first connect and there's nothing else for the agent to
+        // do until it leaves). Drives Playwright's page.goto() so the next
+        // step's snapshot reflects the new URL.
+        await browser.navigate(parsed.url);
+        return { type: "browser_navigate", payload: { url: parsed.url } };
       case "click":
         await browser.click(parsed.ref);
         return { type: "browser_click", payload: { ref: parsed.ref } };
@@ -876,5 +1461,23 @@ function parseTypeAction(
     return { text, thenPress: bare.groups.key };
   }
 
+  return null;
+}
+
+/**
+ * Unified extractor: returns the typed text from EITHER an OS-level
+ * `type "X"` action OR a structured `browser.type <ref> "X"` action.
+ *
+ * Used by anti-loop guard #2 (type-dedup) so a model stuck on
+ * `browser.type e17 "2007 Honda Civic"` gets caught on attempt 2 instead
+ * of riding all the way to guard #1's 3-of-4 threshold (~30s wasted).
+ * Returns null for non-type actions and for the synthetic
+ * `(failed: ...)` / `(rejected: ...)` history annotations.
+ */
+function extractTypedText(action: string): string | null {
+  const t = parseTypeAction(action);
+  if (t) return t.text;
+  const b = parseBrowserAction(action);
+  if (b?.kind === "type") return b.text;
   return null;
 }

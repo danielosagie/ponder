@@ -225,20 +225,145 @@ export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
         "  - wait Ns                  (when waiting for an app to load)\n" +
         "  - DONE                     (when the user's goal is visibly achieved)\n" +
         "\n" +
-        "PREFER KEYBOARD WHEN IT IS FASTER OR MORE RELIABLE — clicks fight other\n" +
-        "windows, keyboard shortcuts always work on the foreground app:\n" +
-        "  • hotkey cmd+tab           → cycle apps (much faster than dock)\n" +
-        "  • hotkey cmd+space         → Spotlight; type the app name to launch\n" +
-        "  • hotkey cmd+`             → cycle WINDOWS within the current app\n" +
-        "  • hotkey cmd+w / cmd+q     → close window / quit app\n" +
-        "  • hotkey cmd+t / cmd+l     → new tab / focus address bar (browsers)\n" +
-        "  • hotkey cmd+f             → in-page find\n" +
-        "  • press tab / shift+tab    → next/previous form field\n" +
-        "  • press enter              → submit the focused field\n" +
-        "  • press esc                → close popovers, cancel modals\n" +
-        "If you need to switch to an already-open app, prefer hotkey cmd+tab over\n" +
-        "hunting for the dock icon. If the app isn't running yet, hotkey cmd+space\n" +
-        "+ type the name + press enter is faster than navigating Finder.\n" +
+        "TOOL CHOICE — DEFAULT to keyboard / CLI-style verbs (~70% of actions);\n" +
+        "use mouse / browser.click for the ~30% of steps where it's strictly\n" +
+        "necessary. CLI-style verbs are: hotkey, press, type, browser.navigate,\n" +
+        "browser.type. Mouse verbs are: click, double click, browser.click.\n" +
+        "If the user's task names a different ratio (e.g. 'use cli 90% of the\n" +
+        "time'), HONOR THAT — they know their workflow. Do not override the\n" +
+        "user's stated preference with a mouse click when a keyboard path\n" +
+        "exists.\n" +
+        "\n" +
+        "KEYBOARD / CLI wins for (the 70%):\n" +
+        "  • App switching: hotkey cmd+tab (cycle), hotkey cmd+`  (windows)\n" +
+        "  • App launching: hotkey cmd+space → type name → press enter\n" +
+        "  • Window/tab management: hotkey cmd+w, cmd+q, cmd+t\n" +
+        "  • Browser address bar focus: hotkey cmd+l → type URL → press enter\n" +
+        "    (or just emit browser.navigate <url> directly — even more CLI-ish)\n" +
+        "  • In-page find: hotkey cmd+f → type query → press enter\n" +
+        "  • Field navigation: press tab / shift+tab between inputs\n" +
+        "  • Dismissing popovers / modals: press esc\n" +
+        "  • Filling text fields: type or browser.type — never click-then-click\n" +
+        "    when the field is already focused.\n" +
+        "  • Submitting a form THAT IS keyboard-bindable (one focused field,\n" +
+        "    standard 'Enter to submit' pattern). NOT for forms gated on a\n" +
+        "    suggestion pick — see SEARCH/LOCATION FORM below.\n" +
+        "\n" +
+        "MOUSE / browser.click wins for (the 30%):\n" +
+        "  • Picking a SPECIFIC item from a list (search-result card, dropdown\n" +
+        "    suggestion, listing tile, sidebar entry) — these need an exact\n" +
+        "    target, not a key.\n" +
+        "  • Toggling a custom button, link, switch, or non-keyboard-bindable\n" +
+        "    control where 'press enter' would be ambiguous.\n" +
+        "  • Anywhere multiple fields could compete for keyboard focus and\n" +
+        "    typing into the wrong one would be silent.\n" +
+        "  • The third leg of TYPE → CLICK SUGGESTION → CLICK APPLY (see below).\n" +
+        "\n" +
+        "When in doubt: pick the KEYBOARD/CLI option. The keyboard path is\n" +
+        "faster, doesn't fight the OS cursor, and reads like a CLI command —\n" +
+        "which matches how the user thinks about most tasks.\n" +
+        "\n" +
+        "BROWSER TOOLS — when a Chrome page snapshot is attached to the user\n" +
+        "message, you have a SECOND set of verbs targeting page elements by\n" +
+        "accessibility ref. Use these for IN-PAGE web actions; use the OS-level\n" +
+        "hotkey/press only for OS switching (Spotlight, cmd+tab, cmd+space).\n" +
+        "  - browser.navigate <url>      open a URL in the active tab\n" +
+        "  - browser.click <eN>          click an element by ref (e.g. browser.click e12)\n" +
+        '  - browser.type <eN> "text"    type into a field by ref\n' +
+        "  - browser.scroll page down    scroll the viewport (use this, not OS scroll)\n" +
+        "  - browser.read [<eN>]         read page or element text\n" +
+        "PREFER browser.* over click/type when a snapshot is available — refs are\n" +
+        "exact (no grounding error) and disabled refs are flagged in the snapshot.\n" +
+        "\n" +
+        "SEARCH SCOPES — there are THREE different 'search' surfaces and they\n" +
+        "serve DIFFERENT purposes. Picking the wrong one is a common failure\n" +
+        "(typing 'facebook marketplace toyota camry' into Spotlight just opens\n" +
+        "a local file search). Always identify the scope FIRST.\n" +
+        "\n" +
+        "1. OS / SYSTEM SEARCH — the OS-level launcher.\n" +
+        "   • macOS: Spotlight (top of screen). Trigger: hotkey cmd+space.\n" +
+        "   • Windows: Start search (bottom). Trigger: press win.\n" +
+        "   • USE FOR: launching an app that isn't running ('open Chrome',\n" +
+        "     'open Calculator'), or finding a local file by name.\n" +
+        "   • DO NOT USE FOR: web search or in-site search.\n" +
+        "\n" +
+        "2. BROWSER ADDRESS BAR — the URL field at the top of the active tab.\n" +
+        "   • Trigger: hotkey cmd+l → type URL → press enter,\n" +
+        "     OR: browser.navigate <url> when a snapshot is attached.\n" +
+        "   • USE FOR: jumping to a known URL (facebook.com/marketplace,\n" +
+        "     amazon.com), or a generic Google search via the omnibox when no\n" +
+        "     specific site applies.\n" +
+        "   • DO NOT USE FOR: searching INSIDE a site that has its own search\n" +
+        "     UI — you'd get Google results, not Marketplace listings.\n" +
+        "\n" +
+        "3. PAGE / SITE SEARCH — a search bar/box rendered by the website.\n" +
+        "   • Trigger: browser.click <search-input-ref> → browser.type → pick a\n" +
+        "     suggestion ref → click submit/apply (see SEARCH/LOCATION FORM).\n" +
+        "   • USE FOR: searching Facebook Marketplace listings, Amazon products,\n" +
+        "     YouTube videos, Gmail messages — anywhere the site has its own\n" +
+        "     search UI with site-specific filters and results.\n" +
+        "   • The page may have MULTIPLE site-search bars (top header search,\n" +
+        "     left-rail filter search, modal search). Pick the one whose name\n" +
+        "     matches the goal: 'Search Marketplace' for Marketplace, not the\n" +
+        "     generic top-of-page Facebook search.\n" +
+        "\n" +
+        "TYPICAL FLOW for 'find X on site Y':\n" +
+        "  a. Foreground Chrome — hotkey cmd+tab if it's already running, else\n" +
+        "     hotkey cmd+space → 'chrome' → press enter.\n" +
+        "  b. Land on site Y — browser.navigate https://y.com OR hotkey cmd+l\n" +
+        "     → type URL → press enter.\n" +
+        "  c. Use Y's OWN search bar — browser.click on the page search input,\n" +
+        "     browser.type the query, pick a suggestion, then submit/apply.\n" +
+        "\n" +
+        "SEARCH / LOCATION FORM — TYPE → CLICK SUGGESTION → CLICK APPLY.\n" +
+        'A "(disabled)" ref is UNCLICKABLE — clicking wastes 5s on a Playwright timeout.\n' +
+        "When you typed into a search/location/combobox field and the submit button\n" +
+        "(Apply / Search / Confirm) is disabled, your NEXT action MUST be\n" +
+        'browser.click on a "(suggestion)" ref (or any role: option / menuitem /\n' +
+        "listitem / link in the dropdown), NOT the disabled button, NOT pressing enter.\n" +
+        "\n" +
+        "  Snapshot:\n" +
+        '    [e86] textbox "Location"\n' +
+        '    [e91] option "Marietta, GA, United States" (suggestion)\n' +
+        '    [e90] button "Apply" (disabled)\n' +
+        '  Last action: browser.type e86 "Marietta, GA"\n' +
+        "    Wrong: browser.click e90       ← it's disabled, this hangs for 5s\n" +
+        "    Wrong: press enter             ← submit is via the button, not enter\n" +
+        "    Right: browser.click e91       ← Apply un-disables on the next snapshot\n" +
+        "\n" +
+        "LIST TASKS — when the user asked for N items ('find 3 listings', 'list\n" +
+        "the top 5 products', 'show me 4 jobs'), do NOT stop at the search-results\n" +
+        "page. The search-results page only shows TITLES + PRICES; the user wants\n" +
+        "DETAILS (description, location, posting date, seller, full price). For\n" +
+        "each of the N items:\n" +
+        "  1. browser.click the listing card to open its detail page.\n" +
+        "  2. browser.read once the detail page loads — this captures the full\n" +
+        "     copy that the closer will use to summarize.\n" +
+        "  3. Either press the browser back button or click the next listing in\n" +
+        "     the results — keep going until you've opened all N.\n" +
+        "Only emit DONE after the Nth detail page has been read. Stopping at the\n" +
+        "search-results page is a partial-credit failure — the closer will say\n" +
+        "'I found N listings but couldn't open them' and the user has to redo it.\n" +
+        "\n" +
+        "STUCK RECOVERY — when an action keeps failing, SWITCH MODES instead of\n" +
+        "retrying the same verb. Look at the most recent history line: if it\n" +
+        "ends with `(failed: ...)` or `(rejected: ...)`, your last attempt did\n" +
+        "not work and re-emitting the same verb won't either.\n" +
+        "  • browser.click <ref> failed twice in a row (overlay intercepts,\n" +
+        "    locator timeout, ref vanished) → switch to vision: emit\n" +
+        "    'click on the <description>' so the grounder picks pixel coords\n" +
+        "    from the screenshot. The mouse path uses cliclick / nut-js and\n" +
+        "    bypasses the overlay/ref problem entirely.\n" +
+        "  • browser.navigate <url> redirected → DO NOT re-emit the same URL\n" +
+        "    (the runtime guard rejects it anyway). Either accept the redirected\n" +
+        "    URL and use the page's on-page filters, or VISION_NEEDED.\n" +
+        "  • browser.type into a focused field did nothing → the field may not\n" +
+        "    actually be focused. Try `click on the <field name>` first, then\n" +
+        "    type on the next step.\n" +
+        "  • Same action repeated 2+ times in history → STOP and try a DIFFERENT\n" +
+        "    verb (mouse instead of keyboard, vision instead of refs, scroll\n" +
+        "    instead of click). The 70/30 keyboard/mouse default is a default,\n" +
+        "    NOT a constraint when stuck.\n" +
         "\n" +
         "DRAG AND DROP — use when an element needs to MOVE, not be clicked:\n" +
         "  drag the file icon to the trash\n" +
@@ -255,13 +380,36 @@ export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
         "  • Do NOT wrap actions in JSON, code blocks, or function-call syntax.\n" +
         "  • One short imperative sentence. No prose, no quotes around the\n" +
         "    whole sentence, no markdown.\n" +
+        "  • Your output MUST start with one of the allowed verbs above (click,\n" +
+        "    double click, type, press, hotkey, drag, scroll, wait, DONE, or a\n" +
+        "    browser.* verb). Anything else — explanation, meta-reasoning,\n" +
+        "    repetition of the prompt, 'The last step was incorrect…' — is\n" +
+        "    invalid and the runtime will reject the step.\n" +
+        "\n" +
+        "HISTORY NOTATION — lines in Action history that start with `[note: …]`\n" +
+        "are SYSTEM OBSERVATIONS about your prior steps (rejected clicks,\n" +
+        "redirects, invalid output, failed executions). They are NOT prior\n" +
+        "actions you emitted; do not quote them and do not echo them as your\n" +
+        "next action. Read them as feedback, then emit a fresh action verb.\n" +
         "\n" +
         "STOP CRITERIA — return DONE when ANY of these are true:\n" +
         "  • The user's goal is already visible on screen.\n" +
         "  • The requested app/window is now in the foreground.\n" +
         "  • Further actions would not bring you closer to the goal.\n" +
+        "  • The CURRENT subtask is 'navigate to X' / 'open X' / 'go to X' AND\n" +
+        "    the page on screen IS X (its URL canonical-matches). The previous\n" +
+        "    navigate succeeded; emit DONE so the next subtask can run.\n" +
+        "  • The CURRENT subtask is 'click X' / 'open X' / 'focus X' and X is\n" +
+        "    now focused/open in the snapshot. Don't re-click what you already\n" +
+        "    clicked.\n" +
         "If you are unsure whether the task is complete, prefer DONE over " +
         "guessing more actions.\n" +
+        "\n" +
+        "DO NOT REPEAT YOUR LAST ACTION when the page reflects that it already\n" +
+        "succeeded. If you just emitted browser.navigate URL_X and the snapshot\n" +
+        "now shows you're AT URL_X, the next action MUST be DONE (not the same\n" +
+        "navigate again). The runtime will short-circuit a no-op navigate as\n" +
+        "DONE anyway, so saving you the round-trip if you recognize it first.\n" +
         "\n" +
         "Examples (good):\n" +
         "  hotkey cmd+tab\n" +
@@ -279,11 +427,12 @@ export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
       const userText =
         `USER GOAL: ${args.task}\n` +
         `Step ${stepNum} of up to 30. Screen: ${args.screen[0]}x${args.screen[1]}\n` +
-        `Action history (most recent last):\n${historyBlock}${dupWarning}\n\n` +
-        "Compare the screenshot to the goal:\n" +
-        "  • If the goal is already visible / achieved → reply DONE.\n" +
+        `Action history (most recent last; \`[note: …]\` lines are system observations, not your prior actions):\n${historyBlock}${dupWarning}\n\n` +
+        "Compare the screenshot to the goal, then emit ONE action verb:\n" +
+        "  • If the goal is already visible / achieved → emit DONE on its own.\n" +
         "  • If your last action did not change the screen → switch strategy or DONE.\n" +
-        "  • Otherwise output the SINGLE next action that moves toward the goal.";
+        "  • Otherwise emit the SINGLE next action verb that moves toward the goal.\n" +
+        "Your reply must START with one of: click | double click | type | press | hotkey | drag | scroll | wait | DONE | browser.* — nothing else.";
 
       const out = await chatCompletion(
         {

@@ -24,10 +24,15 @@ export async function think(
     screenshotB64: string;
     screen: [number, number];
     signal?: AbortSignal;
-    /** When the active tab in Chrome is reachable via Playwriter, this
-     *  carries the accessibility tree so the planner can choose
+    /** When the agent-managed Chrome instance is reachable, this carries
+     *  the accessibility tree so the planner can choose
      *  browser.click/browser.scroll/browser.type. Absent → vision-only. */
     browserSnapshot?: BrowserSnapshot;
+    /** When the local CLI router escalated to vision for this step, its
+     *  one-sentence reason ("no listings element in snapshot, page may
+     *  still be loading"). Spliced into the user message so Holo3 isn't
+     *  starting cold — it knows what the team's other half tried. */
+    routerHint?: string;
   },
 ): Promise<string> {
   let task = args.task;
@@ -47,6 +52,7 @@ export async function think(
       `Interactive elements (refs in [eN]):\n${trimmed}\n` +
       `[end snapshot]\n\n` +
       `Available browser.* verbs (PREFERRED for web tasks):\n` +
+      `  browser.navigate <url>         (open a URL — use this when the current tab is the Playwriter welcome page or any page that doesn't expose what you need)\n` +
       `  browser.click <ref>            (e.g. browser.click e12)\n` +
       `  browser.type <ref> "text"      (optionally "and press enter")\n` +
       `  browser.scroll page down       (use for full-page scrolls — sidesteps cursor bugs)\n` +
@@ -54,12 +60,64 @@ export async function think(
       `  browser.scroll <ref> down      (scroll a specific element/sidebar)\n` +
       `  browser.read [<ref>]           (read element or whole page text)\n` +
       `Use browser.scroll page down for any page scroll on a web page —\n` +
-      `it scrolls the actual viewport instead of whatever's under the cursor.`;
+      `it scrolls the actual viewport instead of whatever's under the cursor.\n` +
+      `If the snapshot URL is chrome-extension://…/welcome.html, your FIRST step\n` +
+      `should be browser.navigate <url> — the welcome tab is just a launchpad.\n` +
+      `\n` +
+      `CLI BIAS — default to keyboard/CLI verbs (~70% of actions):\n` +
+      `browser.navigate, browser.type, hotkey, press. Reserve browser.click for\n` +
+      `the ~30% of steps where you must pick a SPECIFIC item from a list (a\n` +
+      `search-result card, a dropdown suggestion, a listing tile). If the\n` +
+      `user's task specifies a different ratio (e.g. "use cli 90% of the time"),\n` +
+      `HONOR THAT verbatim — they know their workflow.\n` +
+      `\n` +
+      `SCOPE CHECK — when typing a search query, identify which textbox first:\n` +
+      `  • Address bar (browser-level): named "Address and search bar" /\n` +
+      `    "Search Google or type a URL", or pre-filled with the page URL.\n` +
+      `    USE THIS only to navigate to a different site — and prefer\n` +
+      `    browser.navigate <url> directly when the destination is known.\n` +
+      `  • Page search (site-level): named "Search Marketplace", "Search\n` +
+      `    products", "Search YouTube", "Search messages", etc. USE THIS to\n` +
+      `    search INSIDE the current site (this is what you usually want).\n` +
+      `A page may have multiple search bars; pick the one whose name matches\n` +
+      `the goal. For Marketplace listings, use "Search Marketplace", not the\n` +
+      `generic top-of-page Facebook search.\n` +
+      `\n` +
+      `SEARCH / LOCATION FORM — TYPE → CLICK SUGGESTION → CLICK APPLY.\n` +
+      `A "(disabled)" ref is UNCLICKABLE — clicking wastes 5s on a Playwright timeout.\n` +
+      `When you typed into a search/location/combobox field and the submit button\n` +
+      `(Apply / Search / Confirm) is disabled, your NEXT action MUST be\n` +
+      `browser.click on a "(suggestion)" ref (or any role: option / menuitem /\n` +
+      `listitem / link in the dropdown), NOT the disabled button, NOT pressing enter.\n` +
+      `\n` +
+      `  Snapshot:\n` +
+      `    [e86] textbox "Location"\n` +
+      `    [e91] option "Marietta, GA, United States" (suggestion)\n` +
+      `    [e90] button "Apply" (disabled)\n` +
+      `  Last action: browser.type e86 "Marietta, GA"\n` +
+      `    Wrong: browser.click e90       ← it's disabled, this hangs for 5s\n` +
+      `    Wrong: press enter             ← submit is via the button, not enter\n` +
+      `    Right: browser.click e91       ← Apply un-disables on the next snapshot\n` +
+      `\n` +
+      `When the goal mentions a location/search/category filter, expect this\n` +
+      `TYPE → CLICK SUGGESTION → CLICK APPLY three-step pattern.`;
+  }
+
+  if (args.routerHint) {
+    // The CLI router tried first and gave up. We tell Holo3 exactly why so
+    // it doesn't waste a step trying the same thing the router already
+    // failed at. Position this AFTER the snapshot so it reads as recent
+    // context.
+    task +=
+      `\n\n[CLI ROUTER ESCALATED — reason: ${args.routerHint}]\n` +
+      `The fast local agent could not proceed from the snapshot alone. ` +
+      `Use the screenshot to find what the router missed.`;
   }
 
   console.log(
     `[brain] → ${provider.name}.plan history=${args.history.length} screen=${args.screen[0]}x${args.screen[1]}` +
-      (args.browserSnapshot ? ` snapshot=${args.browserSnapshot.ax.length}b` : ""),
+      (args.browserSnapshot ? ` snapshot=${args.browserSnapshot.ax.length}b` : "") +
+      (args.routerHint ? ` routerHint="${args.routerHint.slice(0, 60)}"` : ""),
   );
   const { action, usage } = await provider.plan({
     task,
@@ -84,8 +142,34 @@ export function needsCoordinates(action: string): boolean {
   return !KEYBOARD_ONLY.test(action.trim());
 }
 
+// Allow-list of action verbs the executor knows how to dispatch. Used to
+// validate the brain's output BEFORE we burn a grounding round-trip on
+// it — without this, the loop tries to vision-ground arbitrary prose
+// like "The last step was incorrect. The current step is:" (seen in the
+// Bulbasaur trace, where the brain echoed prompt boilerplate as if it
+// were an action) and either wastes 5–10s on a nonsense ground or
+// resolves it to a random click coordinate.
+//
+// `^…\b` so partial matches at the START of the line count, regardless
+// of trailing modifiers ("type \"foo\"", "press enter", "click on the
+// search bar", etc.). Anything that doesn't lead with one of these is
+// treated as invalid — the loop pushes a `[note: …]` to history and
+// re-prompts, bailing after two consecutive invalids.
+const VALID_ACTION_VERB =
+  /^(?:click\b|double\s+click\b|triple\s+click\b|right\s+click\b|type\b|press\b|hotkey\b|drag\b|scroll\b|wait\b|done\b|browser\.)/i;
+
+export function isValidAction(action: string): boolean {
+  return VALID_ACTION_VERB.test(action.trim());
+}
+
+// DONE detection is line-anchored on the trimmed action so phrases like
+// "I'm DONE looking" or "Browser DONE loading" don't slip through. The
+// brain's system prompt tells it to emit DONE alone — we honor that
+// contract here. Trailing punctuation / explanatory comment after DONE
+// is allowed ("DONE", "DONE.", "DONE — uploaded the file") but DONE
+// must be the first token.
 export function isDone(action: string): boolean {
-  return /\bDONE\b/i.test(action);
+  return /^DONE\b/i.test(action.trim());
 }
 
 /**
@@ -135,13 +219,28 @@ export type BrowserAction =
   | { kind: "type"; ref: string; text: string; submit?: boolean }
   | { kind: "scroll_page"; dir: "up" | "down"; amount?: number }
   | { kind: "scroll_element"; ref: string; dir: "up" | "down"; amount?: number }
-  | { kind: "read"; ref?: string };
+  | { kind: "read"; ref?: string }
+  | { kind: "navigate"; url: string };
 
 export function parseBrowserAction(action: string): BrowserAction | null {
   const a = action.trim();
   if (!/^browser\./i.test(a)) return null;
 
   let m: RegExpMatchArray | null;
+
+  // browser.navigate <url>
+  // Models sometimes wrap the URL in quotes or angle brackets — strip those
+  // so we accept the natural shapes. Also prepend https:// when the model
+  // emits a bare host like `facebook.com/marketplace`; goto() requires a
+  // protocol and treats schema-less strings as relative paths.
+  m = a.match(/^browser\.navigate\s+(.+)$/i);
+  if (m) {
+    let url = m[1]!.trim().replace(/^[<"'`]+|[>"'`.,;]+$/g, "");
+    if (!/^[a-z]+:\/\//i.test(url) && !url.startsWith("about:")) {
+      url = `https://${url}`;
+    }
+    return { kind: "navigate", url };
+  }
 
   // browser.click <ref>
   m = a.match(/^browser\.click\s+(\S+)/i);

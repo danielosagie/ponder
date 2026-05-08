@@ -486,19 +486,25 @@ export function registerTools(server: McpServer): void {
       title: `${MCP_BRAND}: Do ONE atomic OS-level mouse step`,
       description:
         "Run ONE atomic OS-level mouse-aimed step that you can't do with browser_* / " +
-        "screen_type / screen_hotkey alone. Examples of GOOD inputs: 'select the most " +
-        "recent screenshot in this Desktop file picker and click Open', 'click the green " +
-        "Playwriter extension icon in Chrome's toolbar', 'drag the README.md icon to the " +
-        "trash in the dock'. " +
-        "DO NOT pass multi-step goals — those produce wrong inner-planner decompositions " +
-        "and almost always exhaust. Anti-patterns: 'open Marketplace, find the Bulbasaur " +
-        "listing, click Add, select my screenshot, upload it' (that's 5+ tool calls — YOU " +
-        "drive that loop). 'post a Marketplace listing for X' (10+ tool calls — YOU drive). " +
-        "Rule: if your task contains more than one verb chained with 'and' / 'then', it " +
-        "should probably be that many separate tool calls instead. " +
-        "For in-Chrome work prefer browser_* tools directly. agent_do auto-forwards to the " +
-        "Electron Holo3 app's bridge when running so your tray-menu provider + perms are " +
-        "in effect. Returns a transcript + outcome (done | exhausted | cancelled)." +
+        "screen_type / screen_hotkey alone. The orchestrator declares the SURFACE " +
+        "explicitly (file-picker, finder, spotlight, dock, menu-bar, native-dialog, " +
+        "drag-drop, other) so we don't have to infer it from the task text — that " +
+        "inference produced false positives in the past (rejecting valid Finder " +
+        "tasks because they didn't say 'finder', accepting compound tasks that " +
+        "happened to have few commas). " +
+        "Examples of GOOD inputs (with surface): " +
+        "{task: 'select the most recent screenshot and click Open', surface: " +
+        "'file-picker'}; {task: 'click the green Playwriter extension icon', " +
+        "surface: 'menu-bar'}; {task: 'drag the README.md icon to the trash', " +
+        "surface: 'drag-drop'}. " +
+        "Anti-pattern: passing surface='other' for an in-Chrome click — for " +
+        "anything with a [eN] ref in browser_snapshot use browser_click instead, " +
+        "regardless of surface. " +
+        "Capped at 8 inner steps by default — atomic means atomic; if the brain " +
+        "can't finish in ~8 steps the orchestrator should re-plan with fresh state " +
+        "via browser_snapshot / screen_screenshot. Auto-forwards to the Electron " +
+        "Holo3 app's bridge when running so your tray-menu provider + perms are in " +
+        "effect. Returns a transcript + outcome (done | exhausted | cancelled)." +
         BRAND_TAG_SUFFIX,
       inputSchema: {
         task: z
@@ -506,90 +512,85 @@ export function registerTools(server: McpServer): void {
           .min(1)
           .describe(
             "Natural-language description of ONE atomic mouse-aimed step. Should fit " +
-              "in one sentence. If you find yourself writing 'and then... and then...', " +
-              "you have a multi-step plan — break it into multiple tool calls and observe " +
-              "state (browser_snapshot / screen_screenshot) between them. The inner " +
-              "agent's planner is small and unreliable for compound goals.",
+              "in one sentence. The inner brain is small — keep tasks tight (one verb, " +
+              "one target). For multi-step goals, decompose into multiple tool calls " +
+              "and observe state (browser_snapshot / screen_screenshot) between them.",
+          ),
+        surface: z
+          .enum([
+            "file-picker",
+            "finder",
+            "spotlight",
+            "dock",
+            "menu-bar",
+            "native-dialog",
+            "drag-drop",
+            "other",
+          ])
+          .describe(
+            "REQUIRED. Where the action lands. " +
+              "'file-picker' = Open/Save dialog (typically opened by a Chrome upload " +
+              "button — but PREFER browser_set_input_files when you can; it skips the " +
+              "dialog entirely). " +
+              "'finder' = a Finder window. " +
+              "'spotlight' = the Spotlight overlay. " +
+              "'dock' / 'menu-bar' = those macOS chrome surfaces. " +
+              "'native-dialog' = any other system prompt (permission, alert, system " +
+              "settings). " +
+              "'drag-drop' = OS-level drag where source or target is outside Chrome. " +
+              "'other' = anything that doesn't fit. " +
+              "If the action is in a Chrome page, do NOT use agent_do — use " +
+              "browser_click / browser_type / browser_set_input_files with a [eN] " +
+              "ref instead.",
+          ),
+        context: z
+          .string()
+          .optional()
+          .describe(
+            "Optional one-sentence framing for the inner brain. e.g. \"we're " +
+              'uploading a screenshot to a Marketplace listing". Helps the brain ' +
+              "disambiguate weird intermediate states. Keep it short — gets prepended " +
+              "to the brain's per-step prompt.",
+          ),
+        goal: z
+          .string()
+          .optional()
+          .describe(
+            "Optional higher-level goal this atomic step contributes to. Threaded " +
+              "into the brain's prompt as `(this is part of: …)` so it stays oriented " +
+              "when the immediate task is just the next mechanical step.",
           ),
       },
     },
-    async ({ task }, extra) => {
+    async ({ task, surface, context, goal }, extra) => {
       return chainAgentDo(async () => {
         const t0 = Date.now();
 
-        // Compound-task guard. If the orchestrator passes a clearly
-        // multi-step goal ("open Marketplace, find listing, click Add,
-        // select photo, upload"), the inner planner over-decomposes,
-        // gets stuck, and exhausts 90s for nothing. Refuse upfront and
-        // tell the orchestrator to drive the loop itself.
-        //
-        // Heuristic: count major clause separators (commas, " and ",
-        // " then ", semicolons). 2+ separators = likely compound. Tuned
-        // to accept tight single-step descriptions like "select X and
-        // click Open" (one separator) while catching multi-goal prompts
-        // like "open X, find Y, and upload Z" (two separators).
-        const separators =
-          (task.match(/,/g) ?? []).length +
-          (task.match(/;/g) ?? []).length +
-          (task.toLowerCase().match(/\sand\s/g) ?? []).length +
-          (task.toLowerCase().match(/\sthen\s/g) ?? []).length;
-        const isCompound = separators >= 2;
-        if (isCompound) {
+        // Belt-and-suspenders: the schema enforces `surface`, but we
+        // surface a clearer error when the orchestrator picks 'other'
+        // without any context — that's the only legitimate use case
+        // where the surface isn't self-describing, and a missing
+        // context strongly suggests an in-Chrome click was meant. The
+        // text-heuristic guards (compound-task, in-Chrome click) that
+        // used to live here are intentionally GONE — they generated
+        // too many false positives by inferring intent from
+        // punctuation and verb shape. The orchestrator now declares
+        // surface explicitly; that's the contract.
+        if (surface === "other" && !context) {
           return fail(
-            "agent_do received a multi-step task. Break it into separate tool calls and " +
-              "observe state between them — YOU are the planner, agent_do is for ONE atomic " +
-              "OS-level mouse step (when browser_* won't reach it). Pattern:\n" +
-              "  1. browser_snapshot or screen_screenshot   (observe current state)\n" +
-              "  2. ONE next-step tool call                 (browser_click, browser_navigate, " +
-              "browser_type, agent_do for ONE mouse step, screen_hotkey, etc.)\n" +
-              "  3. observe again, decide next step, repeat\n\n" +
-              `Rejected task (${task.length} chars, ${separators} clause separators): ` +
-              `"${task.length > 200 ? task.slice(0, 197) + "..." : task}"\n\n` +
-              "Re-call with just the FIRST step. After it lands, observe the new state " +
-              "and call back with the next step.",
+            "agent_do called with surface='other' and no context. The 'other' " +
+              "surface is for genuinely unusual cases (a third-party native window, " +
+              "a custom OS overlay) — supply a context string explaining what's on " +
+              "screen so the inner brain has framing. If this is actually an " +
+              "in-Chrome click, switch to browser_click(ref) — agent_do does not " +
+              "see Chrome's accessibility tree and will vision-ground from pixels.",
           );
         }
-
-        // In-Chrome click guard. The orchestrator keeps misusing agent_do
-        // for clicks that have a [eN] ref in the latest browser_snapshot
-        // — e.g. "click the Add photo button". Those should be
-        // browser_click(ref) so the click happens via Playwright (fast,
-        // reliable) rather than vision-grounded agent_do (slow, can
-        // pick the wrong element). The trigger: short task starting
-        // with "click X" / "tap X" / "press X" with no OS-surface
-        // locator keyword. False positives can re-call with explicit
-        // OS surface ("click Open in the file picker") to confirm.
-        const trimmedLower = task.toLowerCase().trim();
-        const startsWithClickVerb =
-          /^(?:click|tap)\s+[^\s]/.test(trimmedLower) ||
-          // "press <button name>" but NOT "press enter / esc / a key"
-          (/^press\s+[^\s]/.test(trimmedLower) &&
-            !/^press\s+(?:enter|return|esc(?:ape)?|tab|space|delete|backspace|key|any\s+key|the\s+\w+\s+key)\b/.test(
-              trimmedLower,
-            ));
-        const hasOsLocator =
-          /\b(?:file picker|file dialog|save dialog|open dialog|finder|finder window|dock|menu bar|spotlight|system (?:settings|prompt|dialog)|native (?:app|dialog|popup)|os[ -]level|drag\s|drop\s|on\s+the\s+(?:dock|menu bar))\b/.test(
-            trimmedLower,
-          ) ||
-          // App names that imply OS-level surface
-          /\b(?:in|on|inside|via)\s+(?:calculator|finder|slack|notes|mail|terminal|spotlight|launchpad|preview|messages|safari|firefox)\b/.test(
-            trimmedLower,
-          );
-        const isLikelyInChromeClick =
-          startsWithClickVerb && task.length < 200 && !hasOsLocator;
-        if (isLikelyInChromeClick) {
-          return fail(
-            "agent_do is for OS-level mouse work (file pickers, native apps, drag-and-drop). " +
-              `Your task "${task}" looks like an in-Chrome click — call browser_snapshot to ` +
-              "find the [eN] ref, then browser_click(ref). browser_click is faster and more " +
-              "reliable than vision-grounded agent_do for elements that exist in the Chrome " +
-              "accessibility tree.\n\n" +
-              "If the target is genuinely OS-level (in a native dialog / Finder / app window), " +
-              'mention the surface explicitly so this guard doesn\'t fire: e.g. ' +
-              '"click Open in the file picker", "click the New Folder button in Finder", ' +
-              '"click the Send button in Slack".',
-          );
-        }
+        // Build the inner-brain task: prepend context (if given) so the
+        // brain has framing, and let runTask thread `goal` as overallGoal.
+        const augmentedTask = context
+          ? `${task}\n[Context: ${context}; surface: ${surface}]`
+          : `${task}\n[Surface: ${surface}]`;
 
         // Progress notifications keep the MCP client's per-request
         // timeout from firing on long tasks. Each notification resets
@@ -631,7 +632,12 @@ export function registerTools(server: McpServer): void {
         //
         // Probe is short (1.5s timeout) so a missing bridge falls
         // through to the local path quickly.
-        const bridgeResult = await tryForwardToBridge(task, sendProgress);
+        // Forward the augmented task (with surface + context baked in)
+        // so the bridge-side runTask sees the same framing the local
+        // path would. The bridge protocol is task-only today; threading
+        // surface/goal as separate fields is a follow-up that requires
+        // an Electron-side bump.
+        const bridgeResult = await tryForwardToBridge(augmentedTask, sendProgress);
         if (bridgeResult !== null) {
           stderrLog(
             `[mcp] agent_do forwarded to bridge: outcome=${bridgeResult.isError ? "error" : "ok"}`,
@@ -691,10 +697,11 @@ export function registerTools(server: McpServer): void {
         const browser = null;
         const router = null;
         await sendProgress(
-          `Started agent_do (provider=${provider.name}, vision-only)`,
+          `Started agent_do (provider=${provider.name}, vision-only, surface=${surface})`,
         );
         stderrLog(
-          `[mcp] agent_do start: ${task.length > 80 ? task.slice(0, 77) + "..." : task}`,
+          `[mcp] agent_do start: surface=${surface} task="${task.length > 80 ? task.slice(0, 77) + "..." : task}"` +
+            (goal ? ` goal="${goal.slice(0, 60)}"` : ""),
         );
 
         // Convex persistence — when VITE_CONVEX_URL is set, mirror
@@ -833,7 +840,7 @@ export function registerTools(server: McpServer): void {
 
         try {
           outcome = await runTask({
-            task,
+            task: augmentedTask,
             provider,
             events,
             browser,
@@ -844,6 +851,16 @@ export function registerTools(server: McpServer): void {
             // is already open) that the brain can't recognize as DONE.
             // See loop.ts RunOptions.flat for the rationale.
             flat: true,
+            // Cap inner steps tight. Atomic means atomic — if 8 steps
+            // can't get there, the orchestrator should re-plan with
+            // fresh state via browser_snapshot / screen_screenshot
+            // instead of letting the brain spin for 50 retries. Override
+            // via PONDER_AGENT_DO_MAX_STEPS for legacy callers.
+            maxSteps: Number(process.env.PONDER_AGENT_DO_MAX_STEPS ?? 8),
+            // Thread the orchestrator's optional higher-level goal so
+            // the brain stays oriented if the immediate task is just a
+            // mechanical step.
+            overallGoal: goal,
             shouldCancel: cancelled,
             onBrowserSnapshot: (snap) => {
               lastSnapshot = snap;

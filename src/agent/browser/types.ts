@@ -1,20 +1,22 @@
 /**
- * BrowserClient — structured-DOM control of the user's actual Chrome session
- * via Playwriter's CDP relay. Parallel to ProviderClient (which handles
- * vision/grounding) and screen.ts (which does OS-level mouse/keyboard).
+ * BrowserClient — structured-DOM control of an agent-managed Chrome
+ * instance, currently implemented via playwright-core's persistent
+ * context. Parallel to ProviderClient (which handles vision/grounding)
+ * and screen.ts (which does OS-level mouse/keyboard).
  *
- * The point of this abstraction is hybrid control: when the user has
- * Playwriter's Chrome extension active on a tab, we can read an accessibility
- * snapshot (5–20KB structured text) instead of guessing pixel coordinates,
- * scroll the actual page viewport (sidestepping the cursor-position scroll bug
- * in nut-js), and click locators by aria-ref instead of approximate (x, y).
+ * The point of this abstraction is hybrid control: when Chrome is the
+ * active surface, we can read an accessibility snapshot (5–20KB
+ * structured text) instead of guessing pixel coordinates, scroll the
+ * actual page viewport (sidestepping the cursor-position scroll bug in
+ * nut-js), and click locators by aria-ref instead of approximate (x, y).
  *
  * Vision stays primary. BrowserClient is opt-in per step — the loop only
  * surfaces browser.* verbs to the planner when `available()` returns true,
  * and falls back to the existing screenshot-grounded flow otherwise.
  *
- * No-op when the extension isn't connected: `available()` returns false
- * within a short probe window so we never block the loop on Chrome state.
+ * No-op when Chrome can't be launched (not installed, profile locked,
+ * etc.): `available()` returns false so we never block the loop on
+ * browser state.
  */
 
 export interface BrowserSnapshot {
@@ -53,6 +55,22 @@ export interface BrowserClient {
    * after typing — useful for search boxes and forms.
    */
   type(ref: string, text: string, opts?: { submit?: boolean }): Promise<void>;
+
+  /**
+   * Programmatically attach files to a `<input type="file">` element by
+   * its aria-ref locator. BYPASSES the native OS file picker entirely —
+   * the input's `change` event fires as if the user selected the files
+   * in a Finder/Explorer dialog. Use this for ANY "upload a file from
+   * disk" intent on the web (profile photos, listing photos, document
+   * attachments, etc.). Faster, deterministic, and avoids the slow /
+   * brittle vision-grounded path through a native file dialog.
+   *
+   * The ref must come from a recent `snapshot()` and resolve to either
+   * the `<input type="file">` itself or a wrapper that hosts it (a
+   * `<label for=…>` or styled button — Playwright auto-resolves both).
+   * Paths must be absolute on the host filesystem.
+   */
+  setInputFiles(ref: string, paths: string[]): Promise<void>;
 
   /**
    * Scroll a specific element by its ref. Use for sidebars, modals, lists

@@ -1,36 +1,133 @@
 /**
- * Playwriter-backed implementation of BrowserClient.
+ * Playwriter-backed BrowserClient — controls the user's main Chrome via
+ * the Playwriter Chrome extension + local CDP relay (localhost:19988).
  *
- * Architecture: Playwriter ships a CDP relay that bridges a local WebSocket
- * (default localhost:19988) to the user's Chrome instance via the official
- * `chrome.debugger` API exposed by the Playwriter Chrome extension. Once
- * Connected, we drive the active tab with stock playwright-core APIs.
+ * Why Playwriter (vs spawning our own Chrome):
+ *   • Uses the user's REAL Chrome with their tabs, logins, cookies,
+ *     extensions, work in progress. No second Chrome window. No
+ *     "log in to FB again." No profile copy.
+ *   • The relay binds only to localhost with origin validation, so it's
+ *     a low-friction security model.
  *
- * We embed the relay rather than spawning the CLI/MCP because this is already
- * a Node/Electron process — same heap, same lifecycle, no IPC overhead. Two
- * function calls (`startPlayWriterCDPRelayServer`, `getCdpUrl`) replace what
- * would otherwise be a subprocess + a custom MCP client.
+ * Architecture: we EMBED the relay rather than spawn `playwriter` as a
+ * subprocess or wire up an MCP client. `startPlayWriterCDPRelayServer()`
+ * boots the WebSocket bridge in-process; `getCdpUrl()` returns the URL
+ * playwright-core can `connectOverCDP()` to. From there we drive the
+ * active page with stock Playwright APIs.
  *
- * Failure model: every call goes through `withSafeBrowser()` which catches
- * connection errors and forces `available()` back to false. The loop never
- * blocks on Chrome state — if the extension isn't green, we transparently
- * fall back to vision-only.
+ * The one user step that Chrome's security model demands:
+ *   • Install the Playwriter extension once (Chrome Web Store).
+ *   • Click the extension icon on the tab to attach the debugger
+ *     (chrome.debugger.attach() requires a user gesture — there is no
+ *     way around this in Chrome's design).
+ *
+ * Everything else is automatic: the relay starts when our app starts;
+ * we connect on the first browser-needing step; we surface clear status
+ * messages when the user needs to click the extension. The router and
+ * loop only see the BrowserClient interface, so the rest of the agent
+ * doesn't care whether Chrome is reachable on a given step or not.
  */
 
 import type { BrowserClient, BrowserSnapshot } from "./types";
 
+// PLAYWRITER_AUTO_ENABLE: documented in Playwriter's MCP.md as
+//   "Auto-create a tab when Playwright connects (no manual extension click needed)."
+// Set at module load — BEFORE the dynamic require() in tryLoadModules
+// reads playwriter — so the flag is in process.env when the relay reads
+// its own config. Without this, the user would have to click the green
+// extension icon on a tab themselves before our connect() found anything.
+if (!process.env.PLAYWRITER_AUTO_ENABLE) {
+  process.env.PLAYWRITER_AUTO_ENABLE = "1";
+}
+
 // ---------------------------------------------------------------------------
-// Dynamic imports.
+// Loose Playwright/Playwriter typings.
 //
-// We require playwriter / playwright-core lazily so that the app boots even
-// when those packages aren't installed yet (the user might not have run
-// `npm i` after this change lands). `createPlaywriterClient()` returns a
-// no-op client if the imports fail; logs once so the user sees what's up.
+// Both packages ship full TypeScript types but importing them statically
+// would force the bundler to resolve them at build time, which we don't
+// want for optional runtime deps. Instead we shape-type the few methods
+// we touch and load via dynamic require so the app boots even when the
+// modules aren't installed yet.
 // ---------------------------------------------------------------------------
 
 interface PlaywriterModule {
   startPlayWriterCDPRelayServer?: () => Promise<unknown>;
-  getCdpUrl?: () => string;
+  // The real signature is `(opts?: { port?, host?, token?, extensionId? }) => string`.
+  // We model it as `(opts?) => string` so we can pass an extensionId when the
+  // user has multiple Playwriter extensions installed (production + dev) and
+  // the relay would otherwise reject the WS handshake with
+  // "Multiple extensions connected. Specify extensionId."
+  getCdpUrl?: (opts?: { extensionId?: string }) => string;
+}
+
+/** Shape returned by GET /extensions/status on the Playwriter relay. */
+interface RelayExtensionStatus {
+  extensionId: string;
+  stableKey?: string | null;
+  browser?: string | null;
+  profile?: { email?: string; id?: string } | null;
+  activeTargets: number;
+  playwriterVersion?: string | null;
+}
+
+/**
+ * Ask the relay which extension *connections* are live. The "extensionId"
+ * field returned here is actually the relay's per-connection ID (a random
+ * `${time}_${rand}` string), not the Chrome extension's static ID — the
+ * relay keys its internal Map by connection, so two Chrome profiles each
+ * running the same Web Store extension show up as TWO entries with the same
+ * stableKey-prefix `profile:` but different connectionIds.
+ *
+ * We use this to disambiguate when the relay's auto-fallback can't:
+ * `getExtensionConnection(null, {allowFallback:true})` only auto-picks if
+ * exactly one extension OR exactly one extension with active targets exists.
+ * With AUTO_ENABLE creating a welcome tab on every connection, two profiles
+ * each have an active target and the fallback bails — the WS handshake
+ * closes with code 4003 "Multiple extensions connected. Specify extensionId."
+ *
+ * Returns null when the relay isn't responding (we then fall through to the
+ * no-extensionId path; works fine in the genuine single-extension case).
+ */
+async function fetchRelayExtensions(): Promise<RelayExtensionStatus[] | null> {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    try {
+      const res = await fetch("http://127.0.0.1:19988/extensions/status", {
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return null;
+      const body = (await res.json()) as { extensions?: RelayExtensionStatus[] };
+      return Array.isArray(body.extensions) ? body.extensions : null;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pick which connection to bind to when several are live. The relay doesn't
+ * expose the underlying Chrome extension ID (it only ships connectionId,
+ * stableKey, profile.{id,email}, browser, activeTargets), so we can't
+ * literally prefer "production over dev" — we just pick the most useful
+ * connection by activity:
+ *
+ *   1. Connections that already have active targets (tabs we can drive).
+ *   2. Failing that, the first connection — they're functionally equivalent.
+ *
+ * Returning the first one is fine: with PLAYWRITER_AUTO_ENABLE, the relay
+ * will auto-create a tab on whichever connection we bind to, so the agent
+ * can always make progress.
+ */
+function pickBestExtension(
+  exts: RelayExtensionStatus[],
+): RelayExtensionStatus | null {
+  if (exts.length === 0) return null;
+  const withTargets = exts.filter((e) => (e.activeTargets ?? 0) > 0);
+  const pool = withTargets.length > 0 ? withTargets : exts;
+  return pool[0] ?? null;
 }
 
 interface PlaywrightCoreModule {
@@ -40,8 +137,6 @@ interface PlaywrightCoreModule {
 }
 
 interface PWPage {
-  // Subset of the playwright Page surface we touch. Typed loosely so we
-  // don't need a full @types/playwright dependency.
   url(): string;
   title(): Promise<string>;
   goto(url: string): Promise<unknown>;
@@ -51,186 +146,472 @@ interface PWPage {
     fill(text: string): Promise<void>;
     press(key: string): Promise<void>;
     innerText(): Promise<string>;
-    scrollIntoViewIfNeeded(): Promise<void>;
+    // Playwright accepts a single path or an array. We always pass an
+    // array so the call site doesn't have to special-case the singular.
+    setInputFiles(paths: string | string[]): Promise<void>;
   };
-  keyboard: {
-    press(key: string): Promise<void>;
-  };
-  accessibility: {
-    snapshot(opts?: { interestingOnly?: boolean }): Promise<unknown>;
-  };
+  bringToFront(): Promise<void>;
+  isClosed(): boolean;
 }
 
 interface PWBrowser {
-  contexts(): Array<{ pages(): PWPage[] }>;
+  contexts(): Array<{ pages(): PWPage[]; newPage(): Promise<PWPage> }>;
   close(): Promise<void>;
 }
 
-async function tryLoadPlaywriter(): Promise<{
+async function tryLoadModules(): Promise<{
   pw: PlaywriterModule;
   core: PlaywrightCoreModule;
 } | null> {
   try {
-    // Use eval'd require so electron-vite / esbuild don't try to bundle these
-    // at build time — they're optional runtime deps. If either is missing the
-    // whole client degrades to "not available" and the loop runs vision-only.
-    const _require =
-      typeof require === "function"
-        ? require
-        : // eslint-disable-next-line @typescript-eslint/no-implied-eval
-          new Function("m", "return require(m)");
-    const pw = _require("playwriter") as PlaywriterModule;
-    const core = _require("playwright-core") as PlaywrightCoreModule;
+    // Playwriter ships as ESM-only. Electron's main process is bundled as
+    // CommonJS, so `require("playwriter")` throws "ERR_REQUIRE_ESM" at
+    // runtime. Dynamic import() works in both CJS and ESM contexts.
+    //
+    // The Function constructor wraps `import()` so electron-vite's
+    // bundler doesn't statically analyze it (otherwise it'd inline the
+    // module into our CJS bundle and we'd be back where we started).
+    // Vite sees `new Function(...)`, can't follow the runtime string,
+    // leaves playwriter in node_modules, and Node loads it at runtime as
+    // proper ESM.
+    const dynamicImport = new Function("m", "return import(m)") as (
+      m: string,
+    ) => Promise<Record<string, unknown>>;
+
+    const pwMod = await dynamicImport("playwriter");
+    const coreMod = await dynamicImport("playwright-core");
+
+    // ESM module namespaces sometimes wrap exports under `.default` for
+    // packages that also have a CJS-style default export. Probe both.
+    const pwBag = (pwMod.default ?? pwMod) as Record<string, unknown>;
+    const coreBag = (coreMod.default ?? coreMod) as Record<string, unknown>;
+
+    const pw: PlaywriterModule = {
+      startPlayWriterCDPRelayServer:
+        (pwBag.startPlayWriterCDPRelayServer as PlaywriterModule["startPlayWriterCDPRelayServer"]) ??
+        (pwMod.startPlayWriterCDPRelayServer as PlaywriterModule["startPlayWriterCDPRelayServer"]),
+      getCdpUrl:
+        (pwBag.getCdpUrl as PlaywriterModule["getCdpUrl"]) ??
+        (pwMod.getCdpUrl as PlaywriterModule["getCdpUrl"]),
+    };
+    const core: PlaywrightCoreModule = {
+      chromium:
+        ((coreBag.chromium ?? coreMod.chromium) as PlaywrightCoreModule["chromium"]),
+    };
+
     if (
       typeof pw.startPlayWriterCDPRelayServer !== "function" ||
       typeof pw.getCdpUrl !== "function" ||
       !core?.chromium?.connectOverCDP
     ) {
       console.warn(
-        "[browser] playwriter / playwright-core loaded but missing expected exports — disabling.",
+        "[browser] modules loaded but missing expected exports — disabling",
       );
       return null;
     }
     return { pw, core };
   } catch (e) {
     console.log(
-      `[browser] playwriter not available (${e instanceof Error ? e.message : String(e)}) — vision-only.`,
+      `[browser] modules not loadable (${e instanceof Error ? e.message : String(e)}) — vision-only`,
     );
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot helper.
+// Snapshot via DOM walker (page.evaluate).
 //
-// Playwriter advertises a `snapshot({ page })` helper that returns an
-// accessibility tree with aria-ref=eN locators. We can't import that helper
-// reliably without knowing the exact module shape, so we build a comparable
-// representation ourselves from `page.accessibility.snapshot()` and assign
-// stable e-refs. This keeps the planner-facing format consistent regardless
-// of what the helper would have produced.
+// Why not page.accessibility.snapshot(): when connecting through Playwriter's
+// CDP relay, the Page proxy that comes back doesn't expose `accessibility`
+// — calls fail with "Cannot read properties of undefined (reading
+// 'snapshot')". Empirically confirmed in user logs.
+//
+// Approach: run a small JS function in the page that walks the DOM, tags
+// each interactive element with `data-holo-ref="eN"`, and returns a
+// flattened indented-tree representation. The planner/router reads this
+// text. Subsequent click/type actions resolve refs back to elements via
+// the `[data-holo-ref="eN"]` CSS selector — Playwright handles that
+// natively and reliably across all page types (canvas excepted, but
+// canvases don't expose interactive a11y elements anyway).
+//
+// The walker IS executed in the page context, so we serialize it as a
+// function. JS injected into the page; no Node deps.
 // ---------------------------------------------------------------------------
 
-interface AxNode {
-  role?: string;
-  name?: string;
-  value?: string;
-  description?: string;
-  children?: AxNode[];
-  // Set during traversal — element ref the planner uses.
-  ref?: string;
-  // Pixel-position fields exposed by some flags; ignored here.
-}
+const SNAPSHOT_SCRIPT = (() => {
+  // Defining as a string avoids weird TS-to-page-context closure issues.
+  // page.evaluate accepts a string and runs it as the body of an IIFE.
+  return `(() => {
+    const interactiveSel = [
+      'a[href]', 'button', 'input:not([type=hidden])', 'select', 'textarea',
+      '[role="button"]', '[role="link"]', '[role="textbox"]',
+      '[role="searchbox"]', '[role="checkbox"]', '[role="radio"]',
+      '[role="menuitem"]', '[role="tab"]', '[role="combobox"]',
+      '[role="option"]', '[role="switch"]', '[contenteditable="true"]',
+    ].join(',');
 
-function flattenAxTree(root: AxNode | null): {
-  text: string;
-  refMap: Map<string, AxNode>;
-} {
-  const refMap = new Map<string, AxNode>();
-  if (!root) return { text: "(empty snapshot)", refMap };
-
-  const lines: string[] = [];
-  let counter = 1;
-
-  function isInteractive(node: AxNode): boolean {
-    const r = node.role ?? "";
-    return /button|link|textbox|searchbox|checkbox|menuitem|tab|combobox|option|radio|switch|slider|listitem/i.test(
-      r,
-    );
-  }
-
-  function visit(node: AxNode, depth: number): void {
-    const indent = "  ".repeat(Math.min(depth, 6));
-    const role = node.role ?? "node";
-    const name =
-      (node.name ?? "").trim() || (node.value ?? "").trim();
-    let prefix = "";
-    if (isInteractive(node)) {
-      const ref = `e${counter++}`;
-      node.ref = ref;
-      refMap.set(ref, node);
-      prefix = `[${ref}] `;
+    function nameOf(el) {
+      const aria = el.getAttribute('aria-label');
+      if (aria) return aria;
+      const labelledBy = el.getAttribute('aria-labelledby');
+      if (labelledBy) {
+        const lbl = document.getElementById(labelledBy);
+        if (lbl && lbl.textContent) return lbl.textContent;
+      }
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+        return el.placeholder || el.value || el.name || el.type || '';
+      }
+      const t = (el.innerText || el.textContent || '').trim();
+      return t.slice(0, 80);
     }
-    if (name || isInteractive(node)) {
-      const label = name ? ` "${name.slice(0, 80)}"` : "";
-      lines.push(`${indent}${prefix}${role}${label}`);
+    function roleOf(el) {
+      const explicit = el.getAttribute('role');
+      if (explicit) return explicit;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'a') return 'link';
+      if (tag === 'button') return 'button';
+      if (tag === 'input') {
+        const t = (el.type || 'text').toLowerCase();
+        // file-input gets its own role so it stands out in the snapshot
+        // and the orchestrator knows to use browser_set_input_files
+        // instead of trying to click it (the native file picker is the
+        // wrong tool for an upload-from-disk).
+        if (t === 'file') return 'file-input';
+        if (t === 'submit' || t === 'button') return 'button';
+        if (t === 'checkbox') return 'checkbox';
+        if (t === 'radio') return 'radio';
+        return 'textbox';
+      }
+      if (tag === 'select') return 'combobox';
+      if (tag === 'textarea') return 'textbox';
+      return tag;
     }
-    for (const c of node.children ?? []) visit(c, depth + 1);
-  }
+    function isFileInput(el) {
+      return el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file';
+    }
+    function visible(el) {
+      // File inputs are commonly hidden via CSS while a styled label /
+      // button forwards user clicks (Facebook, Twitter, Instagram all
+      // do this). The element is fully functional even when invisible
+      // — Playwright's setInputFiles writes straight to the input — so
+      // we surface it in the snapshot anyway. Without this, the
+      // orchestrator can't see the [eN] ref to target.
+      if (isFileInput(el)) return true;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return false;
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    }
+    // Disabled detection: native disabled attr, aria-disabled, or
+    // pointer-events:none. Marking these in the AX text is critical —
+    // without it the planner sees a perfectly-named "Apply" button and
+    // tries to click it, then Playwright sits on the locator for 5s
+    // waiting for it to become enabled and times out (Facebook's
+    // Marketplace location filter does this: Apply stays aria-disabled
+    // until you pick a suggestion from the autocomplete dropdown).
+    function disabled(el) {
+      if (el.disabled) return true;
+      const aria = el.getAttribute('aria-disabled');
+      if (aria === 'true') return true;
+      const cs = getComputedStyle(el);
+      if (cs.pointerEvents === 'none') return true;
+      return false;
+    }
+    // Suggestion detection: an option/menuitem/listitem inside a listbox/
+    // menu/combobox container is an autocomplete dropdown entry. Mirroring
+    // the (disabled) flag with a (suggestion) flag gives the planner a
+    // stable keyword to anchor on regardless of how clean the accessible-
+    // name extraction is. Critical for the SEARCH/LOCATION FORM pattern
+    // where the planner needs to pick an option to un-disable Apply.
+    function suggestion(el, role) {
+      if (role !== 'option' && role !== 'menuitem' && role !== 'listitem') {
+        return false;
+      }
+      let p = el.parentElement;
+      // Walk up a bounded number of ancestors — autocomplete containers
+      // are typically 1-3 levels above the option. Don't traverse the
+      // whole tree (every page has a body element).
+      for (let i = 0; i < 6 && p; i++) {
+        const r = p.getAttribute('role');
+        if (r === 'listbox' || r === 'menu' || r === 'combobox') return true;
+        p = p.parentElement;
+      }
+      return false;
+    }
 
-  visit(root, 0);
-  return { text: lines.join("\n"), refMap };
-}
+    // Reset previous refs so we don't accumulate stale tags across snapshots.
+    document.querySelectorAll('[data-holo-ref]').forEach(e => e.removeAttribute('data-holo-ref'));
+
+    const elements = Array.from(document.querySelectorAll(interactiveSel))
+      .filter(visible);
+
+    let counter = 1;
+    const lines = [];
+    for (const el of elements) {
+      const ref = 'e' + counter;
+      el.setAttribute('data-holo-ref', ref);
+      const role = roleOf(el);
+      const name = nameOf(el).trim().replace(/\\s+/g, ' ').slice(0, 80);
+      const isDisabled = disabled(el);
+      let flags = '';
+      if (isDisabled) {
+        flags = ' (disabled)';
+      } else if (suggestion(el, role)) {
+        flags = ' (suggestion)';
+      } else if (role === 'file-input') {
+        // Discoverability cue: tells the orchestrator to use
+        // browser_set_input_files for this ref, NOT browser_click
+        // (which would open the native picker we're trying to skip)
+        // and NOT agent_do (vision-grounded file dialogs are the
+        // single biggest source of upload failures). Surface accept=
+        // and the multi-file flag so the orchestrator knows what
+        // file(s) to pass.
+        const accept = el.getAttribute('accept') || '';
+        const multi = el.multiple ? ' multi-file' : '';
+        flags = ' (use browser_set_input_files' +
+          (accept ? ', accepts=' + accept : '') +
+          multi + ')';
+      }
+      lines.push('[' + ref + '] ' + role + (name ? ' "' + name + '"' : '') + flags);
+      counter++;
+    }
+    return {
+      url: location.href,
+      title: document.title || '',
+      ax: lines.join('\\n') || '(no interactive elements visible)',
+    };
+  })()`;
+})();
 
 // ---------------------------------------------------------------------------
-// Singleton state.
+// Singleton relay + Playwright connection.
 //
-// One relay + one playwright Browser per process. `available()` is the only
-// path that lazily boots them; other methods assume the boot already
-// happened (and surface a clear error if not — but the loop never calls them
-// without first checking `available()`).
+// Lifecycle:
+//   • App boot calls createPlaywriterClient() once. Cheap — no I/O yet.
+//   • First `available()` probe lazily starts the relay (fast — ~50ms)
+//     and tries to connect over CDP.
+//   • If no tab is "green" (extension not clicked on any tab), the
+//     connect succeeds at the relay level but yields zero contexts/pages.
+//     We surface that as not-available + a status message so the user
+//     knows to click the extension. Subsequent probes retry the connect
+//     so they "just work" the moment the extension goes green.
 // ---------------------------------------------------------------------------
 
 interface State {
   modules: { pw: PlaywriterModule; core: PlaywrightCoreModule } | null;
+  relayStarted: boolean;
   browser: PWBrowser | null;
-  // Last-snapshot ref map so click(ref)/scrollElement(ref)/etc. can resolve
-  // refs the planner emitted from the immediately-prior snapshot.
-  refMap: Map<string, AxNode>;
+  page: PWPage | null;
+  /** Refs from the most recent snapshot. We don't actually store anything
+   *  per-ref — the data attribute on the live DOM IS the ref store. We
+   *  only track the set so we can validate "is e12 a real ref" before
+   *  trying to click it. */
+  refSet: Set<string>;
+  lastStatusKey: string;
   bootPromise: Promise<boolean> | null;
-  loggedConnected: boolean;
 }
 
-const AVAILABILITY_TIMEOUT_MS = 1500;
+const PROBE_TIMEOUT_MS = 1500;
 
-export async function createPlaywriterClient(): Promise<BrowserClient> {
+export interface PlaywriterClientConfig {
+  /** Surface relay/extension status to the buddy bubble. Optional —
+   *  callers without UI can omit. We dedupe identical status messages
+   *  internally so a polling caller doesn't spam the bubble. */
+  onStatus?: (text: string) => void;
+}
+
+export async function createPlaywriterClient(
+  cfg: PlaywriterClientConfig = {},
+): Promise<BrowserClient> {
   const state: State = {
     modules: null,
+    relayStarted: false,
     browser: null,
-    refMap: new Map(),
+    page: null,
+    refSet: new Set(),
+    lastStatusKey: "",
     bootPromise: null,
-    loggedConnected: false,
   };
 
-  async function activePage(): Promise<PWPage | null> {
-    if (!state.browser) return null;
-    const ctx = state.browser.contexts()[0];
-    if (!ctx) return null;
-    const pages = ctx.pages();
-    if (!pages.length) return null;
-    return pages[0]!;
+  function emitStatus(key: string, text: string): void {
+    if (state.lastStatusKey === key) return;
+    state.lastStatusKey = key;
+    cfg.onStatus?.(text);
+    console.log(`[browser] ${text}`);
   }
 
-  async function boot(): Promise<boolean> {
-    if (state.modules && state.browser) return true;
-    if (!state.modules) state.modules = await tryLoadPlaywriter();
-    if (!state.modules) return false;
+  async function startRelay(): Promise<boolean> {
+    if (!state.modules) state.modules = await tryLoadModules();
+    if (!state.modules) {
+      emitStatus(
+        "no-modules",
+        "Browser control unavailable — playwriter / playwright-core not installed.",
+      );
+      return false;
+    }
+    if (state.relayStarted) return true;
+
+    // Pre-flight: is :19988 already serving a Playwriter relay? This
+    // happens when the user has the Holo3 Electron app running AND the
+    // MCP server in Claude Code at the same time — both try to bind
+    // the same port. Calling startPlayWriterCDPRelayServer() in that
+    // case can hang while the library waits for the port. Probe first
+    // and skip the start step if a relay is already up — Playwriter
+    // supports multiple Playwright clients sharing one relay.
+    const existing = await fetchRelayExtensions();
+    if (existing !== null) {
+      state.relayStarted = true;
+      console.log(
+        "[browser] reusing existing Playwriter relay on :19988 " +
+          `(${existing.length} extension connection${existing.length === 1 ? "" : "s"})`,
+      );
+      return true;
+    }
 
     try {
-      // Start the relay singleton. Playwriter's API: idempotent; calling it
-      // twice returns the same server. If it throws (port taken by another
-      // instance, etc.) we surface as not-available.
-      await state.modules.pw.startPlayWriterCDPRelayServer!();
-      const cdpUrl = state.modules.pw.getCdpUrl!();
-      const browser = (await state.modules.core.chromium.connectOverCDP(
-        cdpUrl,
-      )) as PWBrowser;
-      state.browser = browser;
-      if (!state.loggedConnected) {
-        console.log(`[browser] connected via Playwriter relay → ${cdpUrl}`);
-        state.loggedConnected = true;
+      // PLAYWRITER_AUTO_ENABLE: "Auto-create a tab when Playwright connects
+      // (no manual extension click needed)." Confirmed in MCP.md. Without
+      // this, the user has to click the green Playwriter icon in their
+      // toolbar before our connect() call sees any tabs. With it, we just
+      // connect and Playwriter spins up a fresh attached tab on its own.
+      // Set BEFORE startPlayWriterCDPRelayServer so the relay reads it.
+      if (!process.env.PLAYWRITER_AUTO_ENABLE) {
+        process.env.PLAYWRITER_AUTO_ENABLE = "1";
       }
-      return true;
-    } catch (e) {
-      console.warn(
-        `[browser] connect failed (${e instanceof Error ? e.message : String(e)}) — extension may not be active.`,
+      // Race the start against a 3s deadline. If the library hangs
+      // (port collision the probe didn't catch, etc.), we treat it as
+      // failed and fall back to "browser unavailable" rather than
+      // hanging the whole MCP request indefinitely.
+      const started = await Promise.race([
+        state.modules.pw
+          .startPlayWriterCDPRelayServer!()
+          .then(() => true as const)
+          .catch(() => "error" as const),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), 3000),
+        ),
+      ]);
+      if (started === true) {
+        state.relayStarted = true;
+        console.log(
+          `[browser] Playwriter relay started (PLAYWRITER_AUTO_ENABLE=${process.env.PLAYWRITER_AUTO_ENABLE})`,
+        );
+        return true;
+      }
+      emitStatus(
+        "relay-failed",
+        started === "timeout"
+          ? "Browser relay failed to start (timed out after 3s — is :19988 owned by another process?)"
+          : "Browser relay failed to start.",
       );
-      state.browser = null;
+      return false;
+    } catch (e) {
+      emitStatus(
+        "relay-failed",
+        `Browser relay failed to start: ${e instanceof Error ? e.message : String(e)}`,
+      );
       return false;
     }
   }
 
-  async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  async function connectIfPossible(): Promise<boolean> {
+    if (!state.modules) return false;
+    if (state.browser && state.page && !state.page.isClosed()) {
+      return true;
+    }
+    try {
+      // When the user has multiple Playwriter extensions installed (very
+      // common on dev machines: Web Store production + the unpacked dev
+      // extension), the relay's auto-fallback only kicks in if EXACTLY one
+      // extension has active targets. With two installed and PLAYWRITER_AUTO_
+      // ENABLE creating a welcome tab on the production one, BOTH end up
+      // "active" and the WS handshake is closed with code 4003
+      // ("Multiple extensions connected. Specify extensionId."). We probe
+      // /extensions/status, pick the best candidate (prefer production +
+      // active tabs), and pass extensionId on the URL so the relay knows
+      // which one we mean. Single-extension installs hit the same code path
+      // harmlessly: pickBestExtension() returns the only one and the URL
+      // gets a redundant-but-correct extensionId query.
+      const extensions = await fetchRelayExtensions();
+      const chosen = extensions ? pickBestExtension(extensions) : null;
+      if (extensions && extensions.length === 0) {
+        // Relay is up, no extension has connected at all.
+        emitStatus(
+          "no-extension",
+          "Open Chrome and install the Playwriter extension, then click its icon on the tab you want me to control.",
+        );
+        return false;
+      }
+      const cdpUrl = chosen
+        ? state.modules.pw.getCdpUrl!({ extensionId: chosen.extensionId })
+        : state.modules.pw.getCdpUrl!();
+      const browser = (await state.modules.core.chromium.connectOverCDP(
+        cdpUrl,
+      )) as PWBrowser;
+
+      const ctx = browser.contexts()[0];
+      if (!ctx) {
+        // Relay alive but no extension-attached tabs. User hasn't clicked
+        // the green icon yet (or all attached tabs were closed).
+        await browser.close().catch(() => {});
+        emitStatus(
+          "no-tab",
+          "Click the Playwriter extension icon on the Chrome tab you want me to control (it turns green).",
+        );
+        return false;
+      }
+      // Pick the most useful page. PLAYWRITER_AUTO_ENABLE=1 spawns a fresh
+      // chrome-extension://<id>/src/welcome.html tab whenever the relay has
+      // no other targets — the snapshot is empty (~48b) which previously
+      // sent the agent into a `browser.click e1` loop. The welcome page is
+      // perfectly drivable though: it just needs a navigate. We prefer a
+      // real user tab when one exists (user clicked the extension icon on
+      // their own tab), but otherwise we keep the welcome tab AND the agent
+      // can use `browser.navigate <url>` to jump to where the task lives.
+      // No scary status — silent zero-click experience.
+      const pages = ctx.pages();
+      const isWelcome = (p: PWPage): boolean =>
+        /^chrome-extension:\/\/[a-z]+\/src\/welcome\.html(?:[?#]|$)/i.test(
+          p.url(),
+        );
+      const realPages = pages.filter((p) => !isWelcome(p) && !p.isClosed());
+      let page: PWPage;
+      if (realPages.length > 0) {
+        page = realPages[0]!;
+      } else if (pages.length > 0) {
+        page = pages[0]!;
+      } else {
+        page = await ctx.newPage();
+      }
+      state.browser = browser;
+      state.page = page;
+      emitStatus(
+        "connected",
+        `Connected to Chrome — ${page.url() || "ready"}.`,
+      );
+      return true;
+    } catch (e) {
+      emitStatus(
+        "connect-failed",
+        `Connecting to Chrome failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      // Drop refs so we retry from scratch next probe.
+      state.browser = null;
+      state.page = null;
+      return false;
+    }
+  }
+
+  async function ensureChrome(): Promise<boolean> {
+    if (!(await startRelay())) return false;
+    return await connectIfPossible();
+  }
+
+  async function withTimeout<T>(
+    p: Promise<T>,
+    ms: number,
+    fallback: T,
+  ): Promise<T> {
     return await Promise.race([
       p,
       new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
@@ -238,79 +619,104 @@ export async function createPlaywriterClient(): Promise<BrowserClient> {
   }
 
   function refToSelector(ref: string): string {
-    // Playwright accepts CSS selectors and a few text engines. We don't have
-    // a native aria-ref engine here, so we translate using the last snapshot:
-    // the AX node carries `name` which we use as an accessible-name selector
-    // via Playwright's `[aria-label="..."]` or `text=` fallback.
-    const node = state.refMap.get(ref);
-    if (!node) {
-      // Last-resort: assume the planner already meant a CSS selector.
-      return ref;
-    }
-    const name = (node.name ?? "").trim();
-    const role = (node.role ?? "").trim().toLowerCase();
-    if (name && role) {
-      // Playwright supports role+name via `getByRole`, but locator() also
-      // accepts `role=button[name="X"]`.
-      const escaped = name.replace(/"/g, '\\"');
-      return `role=${role}[name="${escaped}"]`;
-    }
-    if (name) {
-      return `text=${name.slice(0, 60)}`;
-    }
-    return `role=${role || "generic"}`;
+    // Refs are tagged onto live DOM elements as data-holo-ref="eN" by the
+    // snapshot script. Resolving back is just a CSS attribute selector —
+    // works for ANY element regardless of role/name, sidesteps brittle
+    // text-matching, and Playwright's auto-waiting handles transient
+    // layout shifts.
+    return `[data-holo-ref="${ref}"]`;
+  }
+
+  async function activePage(): Promise<PWPage | null> {
+    if (!(await ensureChrome())) return null;
+    return state.page;
   }
 
   return {
     async available(): Promise<boolean> {
-      // Cache the boot promise so concurrent callers don't double-init. The
-      // boot itself races against AVAILABILITY_TIMEOUT_MS — if the extension
-      // is offline, we want to know within a step's budget, not 30s later.
       if (!state.bootPromise) {
-        state.bootPromise = withTimeout(boot(), AVAILABILITY_TIMEOUT_MS, false);
+        state.bootPromise = withTimeout(ensureChrome(), PROBE_TIMEOUT_MS, false);
       }
       const ok = await state.bootPromise;
-      if (!ok) {
-        // Reset so a future probe can retry (user may have just clicked the
-        // extension icon green).
-        state.bootPromise = null;
-        return false;
-      }
-      // Verify a tab exists. If the relay is up but no tab is attached yet,
-      // we still report unavailable so the planner doesn't see browser.*
-      // verbs it can't possibly succeed at.
-      const page = await activePage();
-      return page !== null;
+      // Always reset so the next probe re-attempts (the user may have
+      // just clicked the extension, the page may have closed, etc.).
+      state.bootPromise = null;
+      return ok;
     },
 
     async snapshot(): Promise<BrowserSnapshot> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
-      const ax = (await page.accessibility.snapshot({
-        interestingOnly: true,
-      })) as AxNode | null;
-      const { text, refMap } = flattenAxTree(ax);
-      state.refMap = refMap;
-      const url = page.url();
-      const title = await page.title().catch(() => "");
-      return { url, title, ax: text };
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      try {
+        await page.bringToFront();
+      } catch {
+        // best-effort
+      }
+      // Run the DOM walker IN-PAGE. Returns { url, title, ax } directly so
+      // we don't have to call page.url()/title() afterward.
+      const result = (await page.evaluate<unknown>(SNAPSHOT_SCRIPT)) as {
+        url: string;
+        title: string;
+        ax: string;
+      };
+      // Repopulate refSet from the lines we just emitted. Each line starts
+      // with "[eN]" so we extract them.
+      state.refSet.clear();
+      for (const m of result.ax.matchAll(/^\[(e\d+)\]/gm)) {
+        state.refSet.add(m[1]!);
+      }
+      return result;
     },
 
     async click(ref: string): Promise<void> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
-      const sel = refToSelector(ref);
-      await page.locator(sel).click({ timeout: 5000 });
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      // 2000ms timeout (was 5000ms): the most common reason a click hangs is
+      // that the page repainted between snapshot capture and click execution
+      // and the ref is gone from the DOM (Facebook Marketplace's price-range
+      // form auto-applies on input change → Apply button vanishes; some
+      // dropdowns close on outside-click; etc.). Waiting 5s for an element
+      // that isn't coming back is wasted budget. The (disabled) anti-loop
+      // guard in loop.ts already short-circuits the other 5s case (clicking
+      // an aria-disabled button that's waiting on a prerequisite), so we
+      // don't need the long Playwright fallback for that either. 2s still
+      // covers the "page is mid-animation, element is briefly detached"
+      // case but bails 3s sooner on truly-gone refs.
+      await page.locator(refToSelector(ref)).click({ timeout: 2000 });
     },
 
-    async type(ref: string, text: string, opts?: { submit?: boolean }): Promise<void> {
+    async type(
+      ref: string,
+      text: string,
+      opts?: { submit?: boolean },
+    ): Promise<void> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
-      const sel = refToSelector(ref);
-      const loc = page.locator(sel);
-      await loc.click({ timeout: 5000 });
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      const loc = page.locator(refToSelector(ref));
+      await loc.click({ timeout: 2000 });
       await loc.fill(text);
       if (opts?.submit) await loc.press("Enter");
+    },
+
+    async setInputFiles(ref: string, paths: string[]): Promise<void> {
+      const page = await activePage();
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      // Playwright's setInputFiles writes to the underlying <input
+      // type="file"> element AND fires the synthetic `change` event
+      // the page is listening for, so the styled UI (preview thumbnail,
+      // upload progress, etc.) reacts exactly as if the user picked
+      // the files in a Finder dialog. Works against:
+      //   • the input itself (typical when the orchestrator targets a
+      //     ref flagged "file-input" in the snapshot)
+      //   • a <label for="…"> that hosts the input (Playwright walks
+      //     the for/id link)
+      //   • some styled wrapper buttons that delegate to a hidden
+      //     input via JS (works when Playwright resolves the input
+      //     under the wrapper)
+      // The locator can target a hidden / display:none input — that's
+      // why the snapshot now surfaces hidden file inputs and tags them
+      // with (use browser_set_input_files).
+      await page.locator(refToSelector(ref)).setInputFiles(paths);
     },
 
     async scrollElement(
@@ -319,18 +725,18 @@ export async function createPlaywriterClient(): Promise<BrowserClient> {
       amount?: number,
     ): Promise<void> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
+      if (!page) throw new Error("[browser] no active Chrome tab");
       const sel = refToSelector(ref);
       const px = (amount ?? 600) * (dir === "down" ? 1 : -1);
-      // Use evaluate against the matched element. We pass the selector and
-      // do the lookup inside the page so we don't have to serialize a
-      // locator handle across the CDP boundary.
       await page.evaluate<unknown>(
         (args: unknown) => {
           const a = args as { sel: string; px: number };
           const el = document.querySelector(a.sel);
-          if (el && "scrollBy" in el) (el as Element & { scrollBy: (x: number, y: number) => void }).scrollBy(0, a.px);
-          else if (el) (el as HTMLElement).scrollTop += a.px;
+          if (el && "scrollBy" in el) {
+            (el as Element & { scrollBy: (x: number, y: number) => void }).scrollBy(0, a.px);
+          } else if (el) {
+            (el as HTMLElement).scrollTop += a.px;
+          }
         },
         { sel, px },
       );
@@ -338,35 +744,107 @@ export async function createPlaywriterClient(): Promise<BrowserClient> {
 
     async scrollPage(dir: "up" | "down", amount?: number): Promise<void> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
+      if (!page) throw new Error("[browser] no active Chrome tab");
       const px = (amount ?? 800) * (dir === "down" ? 1 : -1);
-      // window.scrollBy targets the document viewport unconditionally,
-      // sidestepping the cursor-position dependency that plagues nut-js
-      // mouse-wheel scrolls.
-      await page.evaluate<unknown>((arg: unknown) => {
-        const a = arg as { px: number };
-        window.scrollBy({ top: a.px, behavior: "instant" as ScrollBehavior });
-      }, { px });
+      await page.evaluate<unknown>(
+        (arg: unknown) => {
+          const a = arg as { px: number };
+          window.scrollBy({ top: a.px, behavior: "instant" as ScrollBehavior });
+        },
+        { px },
+      );
     },
 
     async readText(ref?: string): Promise<string> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
-      if (ref) {
-        const sel = refToSelector(ref);
-        return await page.locator(sel).innerText();
-      }
-      // Whole-document text. Trimmed in the caller; we cap here too as a
-      // safety net for absurdly long pages.
-      const text = await page.evaluate<string>(
-        () => document.body?.innerText ?? "",
-      );
-      return text.length > 50_000 ? text.slice(0, 50_000) + "\n…(truncated)" : text;
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      if (ref) return await page.locator(refToSelector(ref)).innerText();
+      // Firecrawl-style cleaner. Three things on top of plain
+      // document.body.innerText:
+      //   1. SKIP nav / header / footer / aside / dialogs / scripts /
+      //      svg / iframes / aria-hidden / role=navigation|banner|
+      //      contentinfo|complementary|search. These are the bulk of a
+      //      Marketplace page that ISN'T listings — without stripping
+      //      them, half the closer's budget is "About · Privacy · Terms
+      //      · Cookies …" and "Inbox / Notifications / Messenger".
+      //   2. PREFER the main content container if one exists (`<main>`,
+      //      [role=main], [role=feed]). Falls back to <body>.
+      //   3. ANNOTATE links: every <a> gets " (href)" appended after its
+      //      text so listing titles connect to their URLs in the text
+      //      dump. The closer can then return real clickable URLs, not
+      //      just titles ("$2,800 1997 Toyota Camry (https://www.facebook.com/marketplace/item/12345)").
+      // We walk the LIVE DOM (not a clone) to keep innerText layout-
+      // correct, but emit no mutations — just collect text into an
+      // array and join. Pure read-only.
+      const text = await page.evaluate<string>(`
+        (() => {
+          const SKIP_SEL =
+            'nav,header,footer,aside,' +
+            '[role="navigation"],[role="banner"],[role="contentinfo"],' +
+            '[role="complementary"],[role="search"],[role="dialog"],' +
+            '[aria-hidden="true"],' +
+            'script,style,noscript,svg,iframe,template,link[rel],meta';
+          const BLOCK = new Set([
+            'DIV','P','SECTION','ARTICLE','LI','TR','TD','TH','BR','HR',
+            'H1','H2','H3','H4','H5','H6','UL','OL','BLOCKQUOTE','PRE',
+            'MAIN','FIGURE','FORM','LABEL','FIELDSET',
+          ]);
+          const out = [];
+          function walk(node) {
+            if (!node) return;
+            if (node.nodeType === 3) {
+              const v = node.nodeValue;
+              if (v && v.trim()) out.push(v);
+              return;
+            }
+            if (node.nodeType !== 1) return;
+            // Skip chrome (nav/header/footer/etc.) AND visibility-hidden
+            // (CSS display:none / visibility:hidden) elements that the
+            // user can't see but innerText would still miss anyway.
+            if (node.matches && node.matches(SKIP_SEL)) return;
+            // We don't call getComputedStyle (would be 1000s of calls
+            // on a long page); rely on the SKIP_SEL list to catch the
+            // big offenders.
+            const tag = node.tagName;
+            const isBlock = BLOCK.has(tag);
+            if (isBlock) out.push('\\n');
+            for (const child of node.childNodes) walk(child);
+            // Annotate links inline: "Title (https://...)".
+            if (tag === 'A') {
+              const href = node.getAttribute('href');
+              if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+                let abs = href;
+                try { abs = new URL(href, location.href).href; } catch (_) {}
+                out.push(' (' + abs + ')');
+              }
+            }
+            if (isBlock) out.push('\\n');
+          }
+          const root =
+            document.querySelector('main') ||
+            document.querySelector('[role="main"]') ||
+            document.querySelector('[role="feed"]') ||
+            document.body;
+          if (!root) return '';
+          walk(root);
+          // Collapse runs of whitespace/newlines so we don't burn LLM
+          // tokens on the formatting. Keep paragraph breaks.
+          return out
+            .join('')
+            .replace(/[ \\t]+/g, ' ')
+            .replace(/ *\\n */g, '\\n')
+            .replace(/\\n{3,}/g, '\\n\\n')
+            .trim();
+        })()
+      `);
+      return text.length > 50_000
+        ? text.slice(0, 50_000) + "\n…(truncated)"
+        : text;
     },
 
     async navigate(url: string): Promise<void> {
       const page = await activePage();
-      if (!page) throw new Error("[browser] no active tab");
+      if (!page) throw new Error("[browser] no active Chrome tab");
       await page.goto(url);
     },
 
@@ -375,12 +853,15 @@ export async function createPlaywriterClient(): Promise<BrowserClient> {
         try {
           await state.browser.close();
         } catch {
-          // Best-effort — relay teardown is fire-and-forget on shutdown.
+          /* relay teardown is best-effort */
         }
-        state.browser = null;
       }
+      state.browser = null;
+      state.page = null;
       state.bootPromise = null;
-      state.refMap = new Map();
+      state.refSet.clear();
+      // Don't tear down the relay — it's idempotent in case a future
+      // available() call wants to retry attaching.
     },
   };
 }

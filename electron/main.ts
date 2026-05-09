@@ -10,6 +10,7 @@ import {
   nativeImage,
   Notification,
 } from "electron";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { ConvexHttpClient } from "convex/browser";
@@ -22,15 +23,29 @@ loadDotenv({ path: join(process.cwd(), ".env") });
 loadDotenv({ path: join(process.cwd(), ".env.local"), override: false });
 
 import { runTask } from "../src/agent/loop";
-import { BACKGROUND_MODE } from "../src/screen";
+import {
+  BACKGROUND_MODE,
+  screenshot as captureScreenshot,
+  typeText as screenTypeText,
+  pressCombo as screenPressCombo,
+  scroll as screenScroll,
+  click as screenClick,
+  drag as screenDrag,
+} from "../src/screen";
 import { createOllamaNarrator } from "../src/agent/narrator";
 import { createExtractor } from "../src/agent/extractor";
-import type { AgentEvents, ProviderClient, ProviderName } from "../src/agent/types";
+import type { RouterClient } from "../src/agent/router";
+import type { AgentEvents, ProviderName } from "../src/agent/types";
 import type { BrowserClient, BrowserSnapshot } from "../src/agent/browser/types";
 import { createPlaywriterClient } from "../src/agent/browser/playwriter";
-import { createRemoteProvider } from "../src/agent/providers/remote";
-import { createLocalProvider } from "../src/agent/providers/local";
-import { createHCompanyProvider } from "../src/agent/providers/hcompany";
+import {
+  computeDefaultProvider,
+  isProviderConfigured,
+  makeProvider,
+  makeRouter,
+  humanProviderLabel,
+} from "../src/agent/factory";
+import { setProviderPreference } from "../src/agent/preferences";
 import { WarmupQueue } from "../src/agent/warmup";
 import {
   probe as probePerms,
@@ -53,12 +68,6 @@ let buddyWin: BrowserWindow | null = null;
 let providerName: ProviderName = computeDefaultProvider();
 let cancelFlag = false;
 let activeSessionId: string | null = null;
-
-function computeDefaultProvider(): ProviderName {
-  if (process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY) return "hcompany";
-  if (process.env.MODAL_BASE_URL && process.env.MODAL_BEARER_TOKEN) return "remote";
-  return "local";
-}
 
 /**
  * Boot the Buddy overlay once at app start. The window stays alive for the
@@ -177,37 +186,6 @@ function dismissInputPill(): void {
 const convexUrl = process.env.VITE_CONVEX_URL ?? process.env.CONVEX_URL;
 const convex = convexUrl ? new ConvexHttpClient(convexUrl) : null;
 
-function makeProvider(name: ProviderName): ProviderClient {
-  if (name === "local") return createLocalProvider();
-
-  if (name === "hcompany") {
-    const apiKey =
-      process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY ?? "";
-    return createHCompanyProvider({
-      apiKey,
-      model: process.env.HCOMPANY_MODEL ?? "holo3-35b-a3b",
-    });
-  }
-
-  const baseUrl = process.env.MODAL_BASE_URL;
-  const token = process.env.MODAL_BEARER_TOKEN;
-  if (!baseUrl || !token) {
-    return createRemoteProvider({
-      baseUrl: "http://invalid",
-      token: "missing",
-    });
-  }
-  return createRemoteProvider({ baseUrl, token });
-}
-
-function isProviderConfigured(name: ProviderName): boolean {
-  if (name === "local") return true;
-  if (name === "hcompany") {
-    return !!(process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY);
-  }
-  return !!(process.env.MODAL_BASE_URL && process.env.MODAL_BEARER_TOKEN);
-}
-
 // Back-compat alias used elsewhere in this file.
 function isRemoteConfigured(): boolean {
   return isProviderConfigured("remote");
@@ -220,22 +198,66 @@ function isRemoteConfigured(): boolean {
 // the run never blocks on the narrator.
 const narrator = createOllamaNarrator();
 
-// Browser client (Playwriter): hybrid Chrome control. Lazy-bound — the
-// underlying Playwright connection only opens on the first available()
-// probe, and gracefully reports unavailable when the extension isn't
-// active. We instantiate the wrapper unconditionally so the loop has a
-// stable reference; the wrapper itself is cheap (no network, no spawn).
+// Browser client: Playwriter-backed CDP relay to the user's MAIN Chrome.
+// We embed Playwriter's relay (no external `playwriter mcp` daemon) so
+// the WebSocket bridge starts when our app starts. Connection to a tab
+// happens once the user clicks the green Playwriter extension icon on
+// whichever tab they want controlled — Chrome's chrome.debugger API
+// requires that user gesture; we can't bypass it.
+//
+// The browserClient itself is cheap to construct (no network, no spawn).
+// The relay starts on the first available() call. When no tab is green
+// yet, available() returns false and surfaces a status to the buddy
+// bubble telling the user what to click. Once they click, the next probe
+// connects automatically.
 let browserClient: BrowserClient | null = null;
 void (async () => {
   try {
-    browserClient = await createPlaywriterClient();
-    console.log("[browser] client instantiated (Playwriter, lazy-connect on first probe)");
+    browserClient = await createPlaywriterClient({
+      onStatus: (text) => {
+        // Surface relay/extension status to the buddy bubble so the user
+        // sees "click the Playwriter extension" prompts inline with the
+        // agent's narration instead of buried in console logs.
+        buddySay("status", text);
+      },
+    });
+    console.log("[browser] client instantiated (Playwriter relay)");
   } catch (e) {
     console.warn(
       `[browser] client init failed (${e instanceof Error ? e.message : String(e)}) — vision-only mode`,
     );
   }
 })();
+
+// Best-effort relay teardown on quit. Playwriter's relay is in-process
+// so it dies with us, but explicitly closing the playwright Browser
+// avoids dangling CDP connections.
+app.on("before-quit", () => {
+  if (browserClient) {
+    void browserClient.close().catch(() => {});
+  }
+});
+
+// CLI router: small local Qwen3 model that picks browser.* actions
+// directly from the snapshot, ~500ms per step. When it can do the work,
+// we skip Holo3's plan + ground entirely (saving ~10s/step on hcompany).
+// When it can't, it escalates to the vision agent with a one-sentence
+// reason. The two agents work as a team, swapping step-by-step.
+//
+// HOLO3_ROUTER=off disables the fast path globally — the loop runs
+// vision-only just like before. Useful for A/B comparisons.
+const router: RouterClient | null = makeRouter();
+if (router) {
+  void (async () => {
+    const ok = await router.available();
+    console.log(
+      `[router] ${ok ? "ready" : "not ready"} (model=${process.env.ROUTER_MODEL ?? "qwen3.5:0.8b"}). ` +
+        `${ok ? "" : "Pull the model with: ollama pull " + (process.env.ROUTER_MODEL ?? "qwen3.5:0.8b")}`,
+    );
+  })();
+} else {
+  console.log("[router] disabled (HOLO3_ROUTER=off)");
+}
 
 let warmup = new WarmupQueue(makeProvider(providerName));
 
@@ -397,6 +419,634 @@ async function checkActionPermissions(): Promise<{
   };
 }
 
+// ── MCP bridge — lightweight task execution for forwarded agent_do ───
+//
+// The MCP server runs in a separate Node process spawned by Claude Code,
+// where macOS Privacy & Security perms (Screen Recording, Accessibility)
+// are NOT granted by default. Calling `screen.screenshot()` from there
+// fails with "Failed to capture screen" and agent_do dies on step 0.
+//
+// This Electron app, however, HAS perms granted (the user added it to
+// the Privacy panel during setup). When MCP receives an agent_do call
+// it can forward the task here over a tiny localhost HTTP bridge — the
+// task then runs in the Electron process where screen capture works,
+// the user's tray-menu provider choice is active, the Buddy bubble
+// shows progress, and Convex history persistence happens automatically
+// via buildEvents.
+//
+// Lighter-weight than the full agent:run IPC handler (no narrator
+// intro, no extractor at the end) because the MCP orchestrator
+// generates its own answer text from the transcript we return.
+
+interface BridgeResult {
+  outcome: "done" | "cancelled" | "exhausted" | "error";
+  sessionId: string | null;
+  steps: number;
+  finalUrl?: string;
+  errorMessage?: string;
+  transcript: string[];
+  /** Base64 PNG of the final frame the inner loop captured. Lets the MCP
+   *  attach it as an image content part to the agent_do tool reply so
+   *  the orchestrator gets visual ground truth in the same call. */
+  finalScreenshotBase64?: string;
+}
+
+let _bridgeChain: Promise<unknown> = Promise.resolve();
+function chainBridge<T>(fn: () => Promise<T>): Promise<T> {
+  // Serialize bridge calls so two concurrent agent_do requests don't
+  // stomp on the shared Chrome tab / cursor.
+  const next = _bridgeChain.catch(() => null).then(fn);
+  _bridgeChain = next;
+  return next;
+}
+
+async function runAgentTaskForBridge(prompt: string): Promise<BridgeResult> {
+  // Mirror the perms gate from the IPC handler — better to fail fast
+  // with an actionable message than 50 silent no-op steps.
+  const permsCheck = await checkActionPermissions();
+  if (!permsCheck.ok) {
+    return {
+      outcome: "error",
+      sessionId: null,
+      steps: 0,
+      errorMessage: permsCheck.message ?? "Missing permissions",
+      transcript: [],
+    };
+  }
+
+  cancelFlag = false;
+  dismissInputPill();
+  setBuddyMode("active");
+  buddySay("status", "Got it (via MCP)…");
+
+  let sessionId: string | null = null;
+  if (convex) {
+    try {
+      sessionId = (await convex.mutation(convexApi.sessions.create, {
+        prompt,
+        provider: providerName,
+      })) as unknown as string;
+      activeSessionId = sessionId;
+      broadcastState();
+    } catch (e) {
+      console.warn(
+        `[bridge] convex session create failed (${e instanceof Error ? e.message : String(e)})`,
+      );
+    }
+  }
+
+  void warmup.warmInBackground();
+  if (warmup.getState() !== "ready") {
+    buddySay("status", `Warming up ${humanProviderLabel(providerName)}…`);
+    try {
+      await warmup.waitReady();
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      buddySay("error", `Warmup failed: ${message}`);
+      if (sessionId && convex) {
+        await convex.mutation(convexApi.sessions.setStatus, {
+          sessionId: sessionId as never,
+          status: "error",
+          error: message,
+        });
+      }
+      activeSessionId = null;
+      broadcastState();
+      setBuddyMode("hidden");
+      return {
+        outcome: "error",
+        sessionId,
+        steps: 0,
+        errorMessage: message,
+        transcript: [],
+      };
+    }
+  }
+
+  if (sessionId && convex) {
+    await convex.mutation(convexApi.sessions.setStatus, {
+      sessionId: sessionId as never,
+      status: "running",
+    });
+  }
+
+  // Build event handlers that mirror to Buddy + Convex AND collect a
+  // transcript for the MCP response.
+  const t0 = Date.now();
+  const elapsed = (): string =>
+    `[t=${((Date.now() - t0) / 1000).toFixed(1)}s]`;
+  const transcript: string[] = [];
+  let stepCount = 0;
+  let lastSnapshot: BrowserSnapshot | undefined;
+  // Latch the most recent screenshot PNG so we can ship it back to the
+  // MCP in the BridgeResult and the orchestrator gets visual ground
+  // truth in the agent_do reply (instead of having to chain a
+  // screen_screenshot, which the small Holo3 model often skips).
+  let lastPng: Buffer | undefined;
+
+  const baseEvents = await (sessionId
+    ? buildEvents(sessionId)
+    : buildEvents(""));
+  const events: AgentEvents = {
+    onStatus: async (text) => {
+      transcript.push(`${elapsed()} status: ${text}`);
+      await baseEvents.onStatus(text);
+    },
+    onThought: async (text) => {
+      transcript.push(`${elapsed()} thought: ${text}`);
+      await baseEvents.onThought(text);
+    },
+    onGround: async (coords) => {
+      await baseEvents.onGround(coords);
+    },
+    onAction: async (action) => {
+      stepCount += 1;
+      const payload =
+        action.payload && Object.keys(action.payload).length > 0
+          ? ` ${JSON.stringify(action.payload).slice(0, 120)}`
+          : "";
+      transcript.push(`${elapsed()} action: ${action.type}${payload}`);
+      await baseEvents.onAction(action);
+    },
+    onScreenshot: async (png) => {
+      lastPng = png;
+      await baseEvents.onScreenshot(png);
+    },
+    onError: async (message) => {
+      transcript.push(`${elapsed()} error: ${message}`);
+      await baseEvents.onError(message);
+    },
+    // onResult is optional on AgentEvents; baseEvents doesn't define
+    // one, so we just collect into the transcript.
+    onResult: async (text) => {
+      transcript.push(`${elapsed()} result: ${text}`);
+    },
+  };
+
+  let outcome: "done" | "cancelled" | "exhausted" = "exhausted";
+  let errorMessage: string | undefined;
+  try {
+    outcome = await runTask({
+      task: prompt,
+      provider: warmup.getProvider(),
+      events,
+      shouldCancel: () => cancelFlag,
+      // VISION-ONLY for MCP-forwarded calls: the orchestrator handles
+      // browser_* directly, and the inner loop's router would otherwise
+      // bias the agent toward Chrome navigation when the actual task
+      // (file picker, native dialog) is OS-level.
+      browser: null,
+      router: null,
+      // FLAT: agent_do is "ONE atomic OS-level mouse step" by contract.
+      // The Ollama hierarchical planner over-decomposes one-step inputs
+      // into wrong subtasks ("Open Chrome" when Chrome is already open,
+      // "Marietta GA $3000" verbatim from its own few-shot example),
+      // which produced the dock-icon spin loops in the wild. Skip the
+      // planner entirely. See loop.ts RunOptions.flat.
+      flat: true,
+      onBrowserSnapshot: (snap) => {
+        lastSnapshot = snap;
+      },
+    });
+  } catch (e: unknown) {
+    errorMessage = e instanceof Error ? e.message : String(e);
+    buddySay("error", errorMessage);
+  }
+
+  // Per-outcome advisory line. The orchestrator (outer Claude) routinely
+  // misreads `exhausted` as "the task failed" and either gives up or fires
+  // another agent_do without observing — but exhausted is the most common
+  // shape for "the goal already landed and the brain didn't recognize
+  // completion before anti-loop fired" (e.g., file picker closed and
+  // upload thumbnail appeared, but the brain emitted dock-clicks). Force
+  // the orchestrator to observe before deciding the next move. Same
+  // applies to cancelled (timeout / user stop) — final state is unknown
+  // until observed. Mirrors the same advisory in src/mcp/tools.ts.
+  const advisory = errorMessage
+    ? null
+    : outcome === "exhausted"
+      ? "\nNOTE: 'exhausted' is NOT the same as failure. The goal may already be partially or fully achieved — the inner brain sometimes emits useless actions after success because it can't always recognize completion from the screen alone. Before retrying or reporting failure, call browser_snapshot AND screen_screenshot, then check whether the goal is already done."
+      : outcome === "cancelled"
+        ? "\nNOTE: 'cancelled' means the run stopped mid-flight (timeout or user stop). The final state is unknown until observed — call browser_snapshot AND screen_screenshot before deciding the next move."
+        : null;
+
+  const finalText = errorMessage
+    ? `Bridge run failed: ${errorMessage}`
+    : `Outcome: ${outcome}\nSteps: ${stepCount}${
+        advisory ?? ""
+      }${lastSnapshot ? `\nFinal URL: ${lastSnapshot.url}` : ""}`;
+  if (sessionId && convex) {
+    try {
+      await convex.mutation(convexApi.steps.append, {
+        sessionId: sessionId as never,
+        kind: "result",
+        text: finalText,
+      });
+      await convex.mutation(convexApi.sessions.setStatus, {
+        sessionId: sessionId as never,
+        status: errorMessage
+          ? "error"
+          : outcome === "done"
+            ? "done"
+            : outcome === "cancelled"
+              ? "cancelled"
+              : "error",
+        error: errorMessage,
+      });
+    } catch (e) {
+      console.warn(
+        `[bridge] convex finalize failed (${e instanceof Error ? e.message : String(e)})`,
+      );
+    }
+  }
+  activeSessionId = null;
+  broadcastState();
+  setBuddyMode("hidden");
+
+  // Include the latched final-frame PNG in the bridge response. The MCP
+  // attaches it as an image content part to the agent_do tool reply so
+  // the orchestrator gets visual ground truth in the same call. Skipped
+  // when the run errored before any frame was captured.
+  const finalScreenshotBase64 =
+    lastPng && !errorMessage ? lastPng.toString("base64") : undefined;
+
+  return {
+    outcome: errorMessage ? "error" : outcome,
+    sessionId,
+    steps: stepCount,
+    finalUrl: lastSnapshot?.url,
+    errorMessage,
+    transcript,
+    finalScreenshotBase64,
+  };
+}
+
+// ── HTTP bridge server (127.0.0.1 only) ──────────────────────────────
+//
+// MCP probes :7900/health to detect the bridge; if alive, it POSTs
+// /agent_do { task } and returns the response. localhost-only so no
+// remote attack surface; no auth needed.
+
+const BRIDGE_PORT = Number(process.env.PONDER_BRIDGE_PORT ?? 7900);
+let _bridgeServerStarted = false;
+
+function startBridgeServer(): void {
+  if (_bridgeServerStarted) return;
+  const server = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "";
+    const method = req.method ?? "GET";
+    res.setHeader("Content-Type", "application/json");
+    if (method === "GET" && url === "/health") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          ok: true,
+          provider: providerName,
+          warmup: warmup.getState(),
+          activeSessionId,
+        }),
+      );
+      return;
+    }
+    if (method === "POST" && url === "/agent_do") {
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+        // Hard cap to prevent runaway memory if a misbehaving client
+        // sends a huge prompt.
+        if (body.length > 64_000) {
+          res.writeHead(413);
+          res.end(JSON.stringify({ error: "task too large (>64k)" }));
+          req.destroy();
+        }
+      });
+      req.on("end", () => {
+        void (async () => {
+          try {
+            const parsed = JSON.parse(body) as { task?: unknown };
+            const task = typeof parsed.task === "string" ? parsed.task : "";
+            if (!task.trim()) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: "empty task" }));
+              return;
+            }
+            const result = await chainBridge(() => runAgentTaskForBridge(task));
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (e: unknown) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── screen_* forwarding endpoints ────────────────────────────────
+    //
+    // The MCP server runs in Claude Code's process, which often does NOT
+    // have macOS Screen Recording / Accessibility perms. The orchestrator
+    // sees BLANK screenshots and silent keystrokes — and then makes
+    // increasingly bad decisions because it can't see the screen. The
+    // Electron app DOES have those perms, so we expose the screen.*
+    // primitives over the bridge and the MCP forwards to them when
+    // available. Round-trip is ~5–20ms over localhost — cheaper than
+    // the existing 1.5s probe by an order of magnitude once cached on
+    // the MCP side.
+    //
+    // POST /screen/screenshot      → { pngBase64, width, height, offsetX, offsetY }
+    // POST /screen/type            → { text, thenPress? } → { ok: true }
+    // POST /screen/hotkey          → { combo } → { ok: true }
+    // POST /screen/scroll          → { direction, amount? } → { ok: true }
+    // POST /screen/click           → { x, y, mode? } → { ok: true }
+    // POST /screen/drag            → { fromX, fromY, toX, toY } → { ok: true }
+    const readJsonBody = (cb: (parsed: unknown, err?: string) => void): void => {
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+        if (body.length > 64_000) {
+          res.writeHead(413);
+          res.end(JSON.stringify({ error: "body too large" }));
+          req.destroy();
+        }
+      });
+      req.on("end", () => {
+        try {
+          cb(body.length > 0 ? JSON.parse(body) : {});
+        } catch (e) {
+          cb(null, e instanceof Error ? e.message : String(e));
+        }
+      });
+    };
+
+    if (method === "POST" && url === "/screen/screenshot") {
+      void (async () => {
+        try {
+          const shot = await captureScreenshot();
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              pngBase64: shot.png.toString("base64"),
+              width: shot.width,
+              height: shot.height,
+              offsetX: shot.offsetX,
+              offsetY: shot.offsetY,
+            }),
+          );
+        } catch (e) {
+          res.writeHead(500);
+          res.end(
+            JSON.stringify({
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      })();
+      return;
+    }
+
+    if (method === "POST" && url === "/screen/type") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { text, thenPress } = (parsed as {
+          text?: unknown;
+          thenPress?: unknown;
+        }) ?? {};
+        if (typeof text !== "string") {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "text must be a string" }));
+          return;
+        }
+        void (async () => {
+          try {
+            await screenTypeText(text);
+            if (typeof thenPress === "string" && thenPress) {
+              await new Promise((r) => setTimeout(r, 120));
+              await screenPressCombo(thenPress);
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    if (method === "POST" && url === "/screen/hotkey") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { combo } = (parsed as { combo?: unknown }) ?? {};
+        if (typeof combo !== "string" || !combo) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "combo must be a non-empty string" }));
+          return;
+        }
+        void (async () => {
+          try {
+            await screenPressCombo(combo);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // POST /screen/click → { x, y, mode? } → { ok: true }
+    //   Where mode is "single" (default) | "double" | "right" | "triple".
+    //   Coordinates are SCREEN-space (multi-monitor offsets already added
+    //   by the caller — same convention as the loop's nut-js path).
+    if (method === "POST" && url === "/screen/click") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const p = (parsed as {
+          x?: unknown;
+          y?: unknown;
+          mode?: unknown;
+        }) ?? {};
+        if (typeof p.x !== "number" || typeof p.y !== "number") {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({ error: "x and y must be numbers" }),
+          );
+          return;
+        }
+        const mode =
+          p.mode === "double" || p.mode === "right" || p.mode === "triple"
+            ? p.mode
+            : "single";
+        void (async () => {
+          try {
+            await screenClick(p.x as number, p.y as number, {
+              double: mode === "double",
+              triple: mode === "triple",
+              button: mode === "right" ? "right" : "left",
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, x: p.x, y: p.y, mode }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // POST /screen/drag → { fromX, fromY, toX, toY } → { ok: true }
+    //   Press at (fromX, fromY), drag to (toX, toY), release. Coordinates
+    //   are SCREEN-space (multi-monitor offsets already added by caller).
+    //   NOTE: drag inherently moves the visible cursor even in BACKGROUND
+    //   mode — there's no way to post drag CGEvents at coords without
+    //   moving. The user's mouse gets hijacked for ~200-400ms.
+    if (method === "POST" && url === "/screen/drag") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const p = (parsed as {
+          fromX?: unknown;
+          fromY?: unknown;
+          toX?: unknown;
+          toY?: unknown;
+        }) ?? {};
+        if (
+          typeof p.fromX !== "number" ||
+          typeof p.fromY !== "number" ||
+          typeof p.toX !== "number" ||
+          typeof p.toY !== "number"
+        ) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              error: "fromX, fromY, toX, toY must all be numbers",
+            }),
+          );
+          return;
+        }
+        void (async () => {
+          try {
+            await screenDrag(
+              p.fromX as number,
+              p.fromY as number,
+              p.toX as number,
+              p.toY as number,
+            );
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    if (method === "POST" && url === "/screen/scroll") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { direction, amount } = (parsed as {
+          direction?: unknown;
+          amount?: unknown;
+        }) ?? {};
+        if (direction !== "up" && direction !== "down") {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({ error: "direction must be 'up' or 'down'" }),
+          );
+          return;
+        }
+        const SCROLL_FLOOR = 50;
+        const ticks = Math.max(
+          SCROLL_FLOOR,
+          typeof amount === "number" ? amount : SCROLL_FLOOR,
+        );
+        const signed = direction === "up" ? ticks : -ticks;
+        void (async () => {
+          try {
+            await screenScroll(signed);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, ticks }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                error: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  server.on("error", (e: NodeJS.ErrnoException) => {
+    if (e.code === "EADDRINUSE") {
+      console.warn(
+        `[bridge] port ${BRIDGE_PORT} already in use — another Holo3 instance? MCP forwarding will fail; close the other instance and restart.`,
+      );
+    } else {
+      console.warn(
+        `[bridge] http server error: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  });
+  server.listen(BRIDGE_PORT, "127.0.0.1", () => {
+    _bridgeServerStarted = true;
+    console.log(
+      `[bridge] listening on http://127.0.0.1:${BRIDGE_PORT} — MCP can now forward agent_do here`,
+    );
+  });
+}
+
 function setupIpc(): void {
   ipcMain.handle("agent:run", async (_e, prompt: string) => {
     if (!prompt?.trim()) return { ok: false, error: "empty prompt" };
@@ -505,6 +1155,7 @@ function setupIpc(): void {
         events,
         shouldCancel: () => cancelFlag,
         browser: browserClient,
+        router,
         onBrowserSnapshot: (snap) => {
           lastSnapshot = snap;
         },
@@ -523,71 +1174,103 @@ function setupIpc(): void {
             ? "cancelled"
             : "exhausted";
 
-      // Extractor — the actual answer. Runs SYNCHRONOUSLY before the
-      // narrator's friendly fluff so the user sees substance first.
-      // Cancellable via cancelFlag → AbortController; if the user pressed
-      // Stop during the run, we skip the extractor entirely (they don't
-      // want to wait for a paragraph about a partial run they aborted).
+      // Extractor — the conversational answer. ALWAYS runs (except on
+      // cancel) and ALWAYS returns a string thanks to the templated
+      // fallback inside extractor.ts, so the buddy never goes silent.
+      //
+      // We deliberately do NOT call narrator.summary() afterward: the
+      // extractor's reply IS the conversational summary, and a follow-up
+      // narrator line would overwrite the answer bubble within a second.
+      // Better one substantive answer than answer-then-stomped-by-fluff.
       if (result !== "cancelled") {
-        try {
-          buddySay("status", "Reading the result…");
-          // If we have a browser snapshot in memory but the run just
-          // finished and the page may have changed under us, re-snapshot.
-          // Best-effort — if the tab closed or extension disconnected, we
-          // fall through to whatever lastSnapshot already held.
-          if (browserClient && (await browserClient.available().catch(() => false))) {
-            try {
-              lastSnapshot = await browserClient.snapshot();
-            } catch (e) {
-              console.warn(
-                `[extract] re-snapshot failed (${e instanceof Error ? e.message : String(e)}) — using previous`,
-              );
-            }
-          }
-          const extractor = createExtractor(warmup.getProvider());
-          const ctrl = new AbortController();
-          const cancelTick = setInterval(() => {
-            if (cancelFlag) ctrl.abort();
-          }, 100);
-          let answer: string;
+        buddySay("status", "Reading the result…");
+        // Best-effort fresh browser snapshot (page may have just settled).
+        // Failures fall through to whatever lastSnapshot already held.
+        let pageText: string | undefined;
+        if (browserClient && (await browserClient.available().catch(() => false))) {
           try {
-            answer = await extractor.extract({
-              task: prompt,
-              history: runHistory,
-              lastScreenshotB64: lastShot?.toString("base64") ?? "",
-              browserSnapshot: lastSnapshot,
-              outcome: summaryOutcome,
-              signal: ctrl.signal,
-            });
-          } finally {
-            clearInterval(cancelTick);
+            lastSnapshot = await browserClient.snapshot();
+          } catch (e) {
+            console.warn(
+              `[extract] re-snapshot failed (${e instanceof Error ? e.message : String(e)}) — using previous`,
+            );
           }
-          if (answer && answer.trim()) {
-            buddySay("answer", answer);
-            if (sessionId && convex) {
+          // Scrape the FULL page text so the closer has real listing
+          // content (titles, prices, locations) to summarize from. The
+          // accessibility tree by itself only carries roles+names; for an
+          // informational answer like "find 3 Camrys under $3k" the
+          // closer needs the actual page copy. readText() caps at 50KB
+          // internally so this is safe even on long Marketplace result
+          // pages. We swallow errors — pageText is optional context;
+          // the extractor degrades gracefully to history+snapshot only.
+          try {
+            pageText = await browserClient.readText();
+            console.log(
+              `[extract] page text scraped (${pageText.length}b) — feeding to closer`,
+            );
+          } catch (e) {
+            console.warn(
+              `[extract] readText failed (${e instanceof Error ? e.message : String(e)}) — closer will work from snapshot+history only`,
+            );
+          }
+        }
+        const extractor = createExtractor(warmup.getProvider());
+        const ctrl = new AbortController();
+        const cancelTick = setInterval(() => {
+          if (cancelFlag) ctrl.abort();
+        }, 100);
+
+        // extractor.extract() never throws — it has a templated fallback
+        // baked in. We catch defensively anyway so a wild bug can't kill
+        // the post-run path.
+        let answer: string;
+        try {
+          answer = await extractor.extract({
+            task: prompt,
+            history: runHistory,
+            lastScreenshotB64: lastShot?.toString("base64") ?? "",
+            browserSnapshot: lastSnapshot,
+            pageText,
+            outcome: summaryOutcome,
+            signal: ctrl.signal,
+          });
+        } catch (e) {
+          console.warn(
+            `[extract] threw unexpectedly (${e instanceof Error ? e.message : String(e)}) — synthesizing fallback`,
+          );
+          answer =
+            summaryOutcome === "exhausted"
+              ? `Got stuck before finishing "${prompt}". Try a more specific prompt.`
+              : `Done — ${runHistory.slice(-3).join(" → ") || "no actions recorded"}.`;
+        } finally {
+          clearInterval(cancelTick);
+        }
+
+        if (answer && answer.trim()) {
+          // Show in the buddy bubble. "answer" kind has a 60s fade in
+          // Buddy.tsx so multi-line list answers stay visible long
+          // enough to read.
+          buddySay("answer", answer);
+          // Persist to Convex. Failures here MUST NOT block — the user
+          // already saw the answer; we just want the History view to
+          // include it. If the deployed Convex schema is stale (no
+          // "result" kind yet), this throws ArgumentValidationError and
+          // we log + move on.
+          if (sessionId && convex) {
+            try {
               await convex.mutation(convexApi.steps.append, {
                 sessionId: sessionId as never,
                 kind: "result",
                 text: answer,
               });
+            } catch (e) {
+              console.warn(
+                `[extract] convex persist failed (${e instanceof Error ? e.message : String(e)}) — answer is in the buddy bubble but won't appear in History until you redeploy convex schema (run \`npx convex dev\`)`,
+              );
             }
           }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          console.warn(`[extract] failed: ${msg}`);
-          // Don't surface the extractor failure as a user-visible error —
-          // the narrator will still speak its fluff line below, and the
-          // user gets *something*. Only log so dev can see what broke.
         }
       }
-
-      // Narrator summary — short friendly sentence after the substantive
-      // answer. Non-blocking: if the narrator is slow, the answer is
-      // already on screen.
-      narrator
-        .summary({ task: prompt, outcome: summaryOutcome, history: runHistory })
-        .then((line) => buddySay("thought", line))
-        .catch(() => buddySay("status", result === "cancelled" ? "Cancelled" : "Done"));
       if (sessionId && convex) {
         await convex.mutation(convexApi.sessions.setStatus, {
           sessionId: sessionId as never,
@@ -735,10 +1418,18 @@ function buildTray(): void {
 function switchProvider(name: ProviderName): void {
   if (name === providerName) {
     console.log(`[provider] already on "${name}" — no-op`);
+    // Still persist — the user may have flipped to another provider in
+    // a previous session and the preference file might be stale.
+    setProviderPreference(name);
     return;
   }
   console.log(`[provider] switching: ${providerName} → ${name}`);
   providerName = name;
+  // Persist so the MCP server (separate process spawned by Claude Code)
+  // sees the new pick on its next agent_do call. Without this the MCP
+  // would re-derive provider from env vars on every call, ignoring the
+  // user's tray-menu choice.
+  setProviderPreference(name);
   warmup = new WarmupQueue(makeProvider(name));
   warmup.onChange((state, detail) => {
     broadcastState({ warmup: state, errorMessage: detail });
@@ -754,10 +1445,38 @@ function switchProvider(name: ProviderName): void {
   rebuildTrayMenu();
 }
 
-function humanProviderLabel(name: ProviderName): string {
-  if (name === "hcompany") return "H Company API";
-  if (name === "remote") return "Modal · Holo3";
-  return "Local (Ollama)";
+/**
+ * Open (or focus) the History window. Idempotent — first call creates
+ * the window and Electron's `ready-to-show` event fires `.show()` once
+ * the renderer has mounted; subsequent calls bring the existing window
+ * to the front.
+ *
+ * Old code called `.show() + .focus()` immediately after createAppWindow,
+ * but the window isn't actually visible yet at that point — Electron's
+ * `ready-to-show` event fires asynchronously after the renderer mounts
+ * (~100-300ms). Calling `.show()` before that is a no-op, which is why
+ * the tray menu used to require two clicks: first click created the
+ * window (silent show no-op), second click found the existing window
+ * and `.show()` worked. Now we let `ready-to-show` handle the first
+ * appearance and only force-show when the window already exists.
+ */
+function openHistoryWindow(): void {
+  if (!appWin || appWin.isDestroyed()) {
+    appWin = createAppWindow();
+    // ready-to-show in createAppWindow handles the first .show().
+    // Add focus once the window is visible so it pops to the foreground
+    // instead of mounting behind everything.
+    appWin.once("ready-to-show", () => {
+      appWin?.focus();
+      if (process.platform === "darwin") app.focus({ steal: true });
+    });
+    return;
+  }
+  // Window already exists — bring it forward.
+  if (appWin.isMinimized()) appWin.restore();
+  appWin.show();
+  appWin.focus();
+  if (process.platform === "darwin") app.focus({ steal: true });
 }
 
 function rebuildTrayMenu(): void {
@@ -795,12 +1514,9 @@ function rebuildTrayMenu(): void {
       ],
     },
     {
-      label: "Open History…",
-      click: () => {
-        if (!appWin || appWin.isDestroyed()) appWin = createAppWindow();
-        appWin.show();
-        appWin.focus();
-      },
+      label: "Open History (⌘⇧H)",
+      accelerator: "CommandOrControl+Shift+H",
+      click: () => openHistoryWindow(),
     },
     { type: "separator" },
     { label: "Quit", role: "quit" },
@@ -830,6 +1546,7 @@ app.whenReady().then(() => {
 
   buildTray();
   setupIpc();
+  startBridgeServer();
 
   // Auto-open the AppWindow on launch so the user sees the history view
   // immediately. They can close it; tray icon stays for re-summon.
@@ -874,6 +1591,17 @@ app.whenReady().then(() => {
   });
   if (!okStop) {
     console.warn(`Stop hotkey (${stopAccel}) failed to register.`);
+  }
+
+  // HISTORY — ⌘⇧H opens the History window from anywhere. Same code path
+  // as the tray menu's "Open History…" item, so first-press latency is
+  // identical and the keystroke is discoverable in the menu's accelerator.
+  const historyAccel = "CommandOrControl+Shift+H";
+  const okHistory = globalShortcut.register(historyAccel, () =>
+    openHistoryWindow(),
+  );
+  if (!okHistory) {
+    console.warn(`History hotkey (${historyAccel}) failed to register.`);
   }
 
   console.log(

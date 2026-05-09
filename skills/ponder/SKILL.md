@@ -1,6 +1,6 @@
 ---
 name: ponder
-description: Drive the user's REAL Chrome browser AND macOS desktop in a tight observe-decide-act loop. YOU are the planner — Ponder is your toolkit. After EVERY tool call, observe the new state (browser_snapshot or screen_screenshot) and decide your ONE next move. Never bundle multi-step goals into a single agent_do call. browser_* tools handle in-page Chrome; browser_set_input_files uploads files from disk without the native picker; agent_do handles ONE atomic OS-level mouse step (with a `surface` declared); the rest of screen_* are keyboard / scroll / inspect. Activates when the user mentions a website, asks to "open / visit / go to" a URL, asks to find/list/post/buy/search/message anything online, asks to drive a native app, or says "use ponder" / "use the ponder mcp".
+description: Drive the user's REAL Chrome browser AND macOS desktop in a tight observe-decide-act loop. YOU are the planner — Ponder is your toolkit. After EVERY tool call, observe the new state and decide your ONE next move. browser_* tools handle in-page Chrome; browser_set_input_files uploads files without the native picker; agent_click / agent_drag are the FAST primitives for atomic OS-level actions you already know how to describe (~2-3s, like browser_click but vision-grounded); agent_do is the autonomous loop for open-ended OS work where the brain decides verb AND target; agent_observe previews where a click would land. screen_* are keyboard / scroll / inspect. Activates when the user mentions a website, asks to "open / visit / go to" a URL, asks to find/list/post/buy/search/message anything online, asks to drive a native app, or says "use ponder" / "use the ponder mcp".
 ---
 
 # Ponder — drive Chrome + the macOS desktop in a state-grounded loop
@@ -19,14 +19,15 @@ end when the goal is satisfied or a step legitimately failed
 
 You're better at planning than the inner brain. Don't hand it multi-step goals — it over-decomposes.
 
-## The four hard rules
+## The five hard rules
 
-1. **ref present → `browser_click` / `browser_type`** — never `agent_do`. Even if the click *opens* a native dialog, the click itself is in-Chrome.
-2. **File upload from disk → `browser_set_input_files`** — never `agent_do`, never `browser_click` on the styled "Add photo" button as the upload step. The MCP surfaces hidden `<input type=file>` refs flagged `(use browser_set_input_files, accepts=…)`. If you don't see one, click the styled button first, then re-snapshot. **Don't know the exact path?** Use a Bash tool (`ls -t ~/Desktop/Screenshot*.png | head -1`, `find ~/Documents -name "report.pdf"`, `mdfind …`) to read it from disk — NEVER open Finder via `agent_do(surface: "finder")` to "find" a file; that burns ~30s of vision clicks when one Bash call gives you the path instantly.
-3. **agent_do requires a `surface`** — one of `file-picker | finder | spotlight | dock | menu-bar | native-dialog | drag-drop | other`. If the action is in a Chrome page, do NOT use agent_do; use a `browser_*` tool. Capped at 8 inner steps — atomic means atomic.
-4. **After ANY tool call, observe before the next one.** The agent_do reply includes the final-frame screenshot — look at it FIRST. `exhausted` often means the goal already landed and the inner brain just couldn't recognize completion. NEVER chain another action without checking state.
+1. **ref present → `browser_click` / `browser_type`** — never `agent_*`. Even if the click *opens* a native dialog, the click itself is in-Chrome.
+2. **File upload from disk → `browser_set_input_files`** — never `agent_*`, never `browser_click` on the styled "Add photo" button as the upload step. The MCP surfaces hidden `<input type=file>` refs flagged `(use browser_set_input_files, accepts=…)`. If you don't see one, click the styled button first, then re-snapshot. **Don't know the exact path?** Use a Bash tool (`ls -t ~/Desktop/Screenshot*.png | head -1`, `find ~/Documents -name "report.pdf"`, `mdfind …`) to read it from disk — NEVER open Finder via `agent_do(surface: "finder")` to "find" a file; that burns ~30s of vision clicks when one Bash call gives you the path instantly.
+3. **OS-level click you can describe → `agent_click(target, mode?)`. OS-level drag → `agent_drag(from, to)`.** These are the FAST primitives — ~2-3s per call, same shape as `browser_click` but vision-grounded for things outside Chrome (file picker rows, Open buttons, Finder items, Spotlight results, dock icons, menu-bar items). They return a post-action screenshot so you can verify in the same reply. Use these whenever you already know the verb AND the target.
+4. **agent_do is the AUTONOMOUS loop, not the default OS-click tool.** Reach for it ONLY when the brain has to decide verb AND target as it goes (open-ended exploration, multi-step OS dance with unknown surfaces). For atomic actions, agent_click is 5× faster. agent_do still requires a `surface` declaration; capped at 8 inner steps.
+5. **After ANY tool call, observe before the next one.** agent_click and agent_drag include a post-action screenshot in their reply — look at it FIRST. agent_do replies include a final-frame screenshot — look at it FIRST. `exhausted` often means the goal already landed and the inner brain just couldn't recognize completion. NEVER chain another action without checking state.
 
-## The 14 tools
+## The 17 tools
 
 | Tool | Surface | Use for |
 |---|---|---|
@@ -38,36 +39,54 @@ You're better at planning than the inner brain. Don't hand it multi-step goals �
 | `browser_set_input_files(ref, paths[])` | Chrome | Upload file(s) from disk — bypasses the native picker |
 | `browser_scroll(dir, ref?, amount?)` | Chrome | Scroll page or element |
 | `browser_read(ref?)` | Chrome | Get cleaned page text |
-| `agent_do(task, surface, context?, goal?)` | OS mouse | ONE atomic OS mouse step |
+| **`agent_click(target, mode?)`** | **OS mouse** | **Atomic vision-grounded click (~2-3s). FIRST CHOICE for OS-level clicks you can describe.** |
+| **`agent_drag(from, to)`** | **OS mouse** | **Atomic vision-grounded drag-and-drop (~2-3s). Parallel grounding of both endpoints.** |
+| **`agent_observe(target)`** | **OS** | **Preview where a click would land WITHOUT clicking. Sanity check before commit.** |
+| `agent_do(task, surface, context?, goal?)` | OS mouse | AUTONOMOUS loop for open-ended OS work — when verb AND target need to be decided as it goes |
 | `screen_screenshot()` | OS | Inspect current screen |
 | `screen_type(text, thenPress?)` | OS | Type at OS focus |
 | `screen_hotkey(combo)` | OS | Keyboard shortcut |
 | `screen_scroll_os(dir, amount?)` | OS | Scroll non-Chrome surface |
 | `screen_wait(ms)` | OS | Sleep (use sparingly) |
 
-There is intentionally NO low-level mouse-aim tool. For OS mouse work, use `agent_do` with `surface` set.
+`agent_click` and `agent_drag` are the OS-layer equivalent of `browser_click` — fast, atomic, deterministic-feeling. Reserve `agent_do` for the cases where you genuinely don't know what to click yet.
 
 ## What "ONE step" means
 
 ONE tool call, ONE observable state change.
 
-✅ `browser_navigate("…")` · `browser_click("e15")` · `browser_type("e16", "Bulbasaur")` · `browser_set_input_files("e22", ["/Users/me/Desktop/photo.png"])` · `agent_do(task: "click Open in the file picker", surface: "file-picker")` · `screen_hotkey("cmd+tab")`
+✅ `browser_navigate("…")` · `browser_click("e15")` · `browser_type("e16", "Bulbasaur")` · `browser_set_input_files("e22", ["/Users/me/Desktop/photo.png"])` · `agent_click("the Open button in the file picker")` · `agent_drag("the document.pdf icon", "the trash in the dock")` · `screen_hotkey("cmd+tab")`
 
 ❌ `agent_do(task: "open Marketplace, find listing, click Add Photo, select my screenshot, upload it", …)` — that's 5+ tool calls. YOU drive that loop.
 
-## When to reach for agent_do
+## When to reach for which OS tool
 
-Only when there's no `[eN]` ref AND no keyboard path. Always pass `surface`:
+Decision order:
 
-- File picker rows / Open / Cancel buttons → `surface: "file-picker"` (BUT prefer `browser_set_input_files` whenever you can — it skips the picker entirely)
+1. **Already know the verb + target?** → `agent_click(target, mode?)` or `agent_drag(from, to)`. ~2-3s. Returns post-action screenshot. This is the default; it's like `browser_click` but for the OS layer.
+2. **Want to verify the target exists before committing?** → `agent_observe(target)` first, then `agent_click(target)` if it looks right. The observe call returns a screenshot with the model's grounding noted; the click call re-grounds (don't pass coords back).
+3. **Don't know what to click yet — open-ended exploration?** → `agent_do(task, surface, context?, goal?)`. The autonomous loop runs the brain to figure out verb + target as it goes. Always pass `surface`.
+
+`agent_click` examples:
+- `agent_click("the Open button in the file picker")`
+- `agent_click("the highlighted Screenshot file in the Today section", mode: "double")`
+- `agent_click("the Calculator icon in the dock")`
+- `agent_click("the green Playwriter extension icon in the Chrome toolbar")`
+
+`agent_drag` examples:
+- `agent_drag("the document.pdf icon on the Desktop", "the trash in the dock")`
+- `agent_drag("the brightness slider handle", "the right end of the slider track")`
+
+`agent_do` surface enum (when you do need it):
+- File picker rows / Open / Cancel buttons → `surface: "file-picker"` (but prefer `browser_set_input_files` whenever you can)
 - Finder windows → `surface: "finder"`
 - Spotlight items → `surface: "spotlight"`
 - Dock / menu-bar icons → `surface: "dock"` / `surface: "menu-bar"`
 - System permission/alert dialogs → `surface: "native-dialog"`
-- OS-level drag-and-drop → `surface: "drag-drop"`
+- OS-level drag-and-drop → `surface: "drag-drop"` (but `agent_drag` is faster if you know both endpoints)
 - Anything else genuinely OS-level → `surface: "other"` and supply `context`
 
-Use `goal` to give the brain framing context: `agent_do(task: "click Open", surface: "file-picker", goal: "uploading screenshot to Marketplace listing")`.
+Use `goal` to give the autonomous brain framing context: `agent_do(task: "navigate Spotlight and pick the right Calculator", surface: "spotlight", goal: "computing 7*8")`.
 
 ## Quick rules of thumb
 

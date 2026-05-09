@@ -1446,7 +1446,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  // ── OS-LEVEL mouse / keyboard tools ───────────────────────────────────
+  // ── OS-LEVEL mouse / keyboard / vision-grounded tools ─────────────────
   //
   // These complement the in-page browser_* tools. Use them when the
   // target ISN'T a Chrome page element:
@@ -1454,26 +1454,481 @@ export function registerTools(server: McpServer): void {
   //   • Native app windows (Calculator, Finder, Slack, VS Code, etc.)
   //   • Anything that doesn't have an [eN] ref because there's no
   //     accessibility-tree snapshot
-  //   • Recovery when browser_click keeps failing — vision-grounded
-  //     screen_click via the same Holo3 model that powers agent_do
-  //     bypasses the ref/overlay layer entirely.
-  //
-  // The action tools (screen_click, screen_drag, screen_move) take a
-  // natural-language TARGET DESCRIPTION, not pixel coordinates. They
-  // screenshot, ask the vision model to ground the description, and add
-  // the multi-monitor offset internally. The orchestrator never supplies
-  // (x, y) — describe what you want clicked / dragged / hovered.
   //
   // Background mode (cliclick) is auto-detected at boot — when on, the
   // agent's mouse events fire without moving the user's visible cursor.
+  //
+  // ── Vision-grounded primitives: agent_click, agent_drag, agent_observe
+  //
+  // The Stagehand `act` / `observe` split applied to OS-level work:
+  // expose the vision-grounding primitive directly so atomic actions
+  // skip the full plan→ground→exec→loop overhead. They take a natural-
+  // language TARGET DESCRIPTION, never pixel coordinates. The harness
+  // screenshots, asks the vision model to ground the description, adds
+  // the multi-monitor offset, and executes. Round-trip ~2-3s vs
+  // ~10-15s for the autonomous agent_do loop.
+  //
+  // When to use which:
+  //   • agent_click / agent_drag — you KNOW what to click (you saw it
+  //     in a screenshot, the OS surface is predictable). Single
+  //     atomic action; no autonomous decision-making. Same shape as
+  //     browser_click but for the OS layer.
+  //   • agent_observe — preview where a click would land (returns
+  //     coords without executing). Useful for "is this thing on
+  //     screen?" sanity checks before committing.
+  //   • agent_do — open-ended autonomous flow. The brain decides the
+  //     verb AND the target as it goes. Use when you don't know what
+  //     you'll find on screen yet.
+  //
+  // The previous "no low-level click" design was deliberately cautious
+  // (worried about wrong-ground footguns). The harness now has enough
+  // verification surface (the orchestrator can take screen_screenshot
+  // before/after, agent_observe before agent_click, etc.) that direct
+  // primitives are safe — and they make atomic actions feel like
+  // Playwriter's `page.locator(...).click()`: one call, ~2s,
+  // deterministic.
 
-  // NOTE: there is intentionally NO low-level OS-mouse "click at target"
-  // tool exposed via MCP. The orchestrator should never be aiming a
-  // single mouse click — for any OS-level mouse work, use agent_do(task)
-  // and let the inner Holo3 loop handle aim + retry + anti-stuck guards.
-  // Single one-shot vision clicks (which we used to expose) are
-  // foot-guns: a wrong ground = a wrong click with no recovery, and
-  // chained vision calls amplify latency without the loop's protections.
+  server.registerTool(
+    "agent_click",
+    {
+      title: `${MCP_BRAND}: Click an element described in natural language`,
+      description:
+        "Vision-grounded click on an element you describe in plain English — no pixel " +
+        "coordinates, no [eN] ref. The harness screenshots, asks the vision model where " +
+        "the description lands, adds the multi-monitor offset, and clicks. Round-trip is " +
+        "~2-3 seconds, same shape as browser_click but for the OS layer (file pickers, " +
+        "Finder, Spotlight, native dialogs, dock, menu bar). " +
+        "Modes: 'single' (default), 'double', 'right', 'triple'. Returns the grounded " +
+        "coordinates AND a fresh post-click screenshot so you can verify the click " +
+        "landed without a separate screen_screenshot. " +
+        "Pick this over agent_do when you KNOW the verb and the target — agent_do is " +
+        "the autonomous-loop version for when you don't yet. Pick this over " +
+        "browser_click when the target is OUTSIDE Chrome (no [eN] ref). For Chrome " +
+        "elements with refs, browser_click is faster (no vision)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Plain-English description of the element to click. Be specific enough " +
+              "that the vision model can pick the right pixel: 'the Open button in " +
+              "the file picker', 'the Calculator icon in the dock', 'the highlighted " +
+              "Screenshot file in the Today section'. Avoid 'the button' / 'it' / " +
+              "ambiguous references.",
+          ),
+        mode: z
+          .enum(["single", "double", "right", "triple"])
+          .optional()
+          .describe(
+            "Click mode. Default 'single' (left click). 'double' for opening files / " +
+              "selecting words; 'right' for context menus; 'triple' to select a paragraph.",
+          ),
+      },
+    },
+    async ({ target, mode }) => {
+      const t0 = Date.now();
+      // 1. Capture screenshot — bridge first for perms.
+      const bridgeShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+        width: number;
+        height: number;
+        offsetX: number;
+        offsetY: number;
+      }>("/screen/screenshot", {});
+      let png: Buffer;
+      let width: number;
+      let height: number;
+      let offsetX: number;
+      let offsetY: number;
+      if (bridgeShot) {
+        png = Buffer.from(bridgeShot.pngBase64, "base64");
+        width = bridgeShot.width;
+        height = bridgeShot.height;
+        offsetX = bridgeShot.offsetX;
+        offsetY = bridgeShot.offsetY;
+      } else {
+        try {
+          const shot = await screen.screenshot();
+          png = shot.png;
+          width = shot.width;
+          height = shot.height;
+          offsetX = shot.offsetX;
+          offsetY = shot.offsetY;
+        } catch (e) {
+          return fail(
+            `Screenshot failed: ${e instanceof Error ? e.message : String(e)}. ` +
+              "Tip: start the Holo3 Electron app — its bridge has macOS Screen " +
+              "Recording perms granted.",
+          );
+        }
+      }
+
+      // 2. Ground via the vision model.
+      let provider: ProviderClient;
+      try {
+        ({ provider } = await getProviderWarmed());
+      } catch (e) {
+        return fail(
+          `Provider not configured: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      let coords: { x: number; y: number } | null;
+      try {
+        const r = await provider.ground({
+          instruction: target,
+          screenshotB64: png.toString("base64"),
+          screen: [width, height],
+        });
+        coords = r.error ? null : { x: r.x, y: r.y };
+      } catch (e) {
+        return fail(
+          `Grounding failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      if (!coords) {
+        return fail(
+          `Couldn't ground "${target}" on the current screen. Take a screen_screenshot ` +
+            "to see what's visible, then refine the description (mention surface, " +
+            'position, or a visual cue: "the Open button in the bottom-right of the ' +
+            'file picker").',
+        );
+      }
+      // 3. Multi-monitor offset (screenshot space → screen space).
+      const screenX = coords.x + offsetX;
+      const screenY = coords.y + offsetY;
+      const tGround = Date.now() - t0;
+
+      // 4. Execute click — bridge first for perms.
+      const clickMode = mode ?? "single";
+      const bridgedClick = await tryBridgeScreenCall<{ ok: boolean }>(
+        "/screen/click",
+        { x: screenX, y: screenY, mode: clickMode },
+      );
+      if (!bridgedClick?.ok) {
+        try {
+          await screen.click(screenX, screenY, {
+            double: clickMode === "double",
+            triple: clickMode === "triple",
+            button: clickMode === "right" ? "right" : "left",
+          });
+        } catch (e) {
+          return fail(
+            `Click at (${screenX}, ${screenY}) failed: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        }
+      }
+      const tExec = Date.now() - t0 - tGround;
+
+      // 5. Brief settle, then capture post-click screenshot for verification.
+      await screen.sleep(300);
+      let postPng: Buffer | undefined;
+      const postShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+      }>("/screen/screenshot", {});
+      if (postShot) {
+        postPng = Buffer.from(postShot.pngBase64, "base64");
+      } else {
+        try {
+          const s = await screen.screenshot();
+          postPng = s.png;
+        } catch {
+          /* skip post-shot if we can't get it */
+        }
+      }
+
+      const totalMs = Date.now() - t0;
+      const summary =
+        `Clicked "${target}" with mode=${clickMode} at (${screenX}, ${screenY}). ` +
+        `Ground ${tGround}ms, exec ${tExec}ms, total ${totalMs}ms. ` +
+        (bridgedClick?.ok ? "(via Electron bridge) " : "") +
+        "Post-click screenshot attached — verify the click landed.";
+      const responseContent: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [{ type: "text" as const, text: summary }];
+      if (postPng) {
+        responseContent.push({
+          type: "image" as const,
+          data: postPng.toString("base64"),
+          mimeType: "image/png",
+        });
+      }
+      return { content: responseContent };
+    },
+  );
+
+  server.registerTool(
+    "agent_drag",
+    {
+      title: `${MCP_BRAND}: Drag from one element to another`,
+      description:
+        "Vision-grounded drag-and-drop between two elements you describe in plain " +
+        "English. The harness screenshots ONCE, grounds source AND target IN PARALLEL " +
+        "(both via the vision model on the same screenshot), then performs the drag. " +
+        "Round-trip is ~2-3 seconds — only one extra ground call vs agent_click. " +
+        "Use for: file icons → trash, slider handles, items across panes, anywhere a " +
+        "click won't do because the element needs to MOVE. Both endpoints must be on " +
+        "the same screen at the same time (no scroll between source and target). " +
+        "NOTE: drag inherently moves the visible cursor (~200-400ms) even in " +
+        "background mode — there's no way to post drag CGEvents at coords without " +
+        "moving the cursor at the OS level." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        from: z
+          .string()
+          .min(1)
+          .describe("Source element description (what to grab)."),
+        to: z
+          .string()
+          .min(1)
+          .describe("Target element description (where to drop)."),
+      },
+    },
+    async ({ from, to }) => {
+      const t0 = Date.now();
+      // 1. Single screenshot — both endpoints come from the same frame.
+      const bridgeShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+        width: number;
+        height: number;
+        offsetX: number;
+        offsetY: number;
+      }>("/screen/screenshot", {});
+      let png: Buffer;
+      let width: number;
+      let height: number;
+      let offsetX: number;
+      let offsetY: number;
+      if (bridgeShot) {
+        png = Buffer.from(bridgeShot.pngBase64, "base64");
+        width = bridgeShot.width;
+        height = bridgeShot.height;
+        offsetX = bridgeShot.offsetX;
+        offsetY = bridgeShot.offsetY;
+      } else {
+        try {
+          const shot = await screen.screenshot();
+          png = shot.png;
+          width = shot.width;
+          height = shot.height;
+          offsetX = shot.offsetX;
+          offsetY = shot.offsetY;
+        } catch (e) {
+          return fail(
+            `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      const screenshotB64 = png.toString("base64");
+
+      let provider: ProviderClient;
+      try {
+        ({ provider } = await getProviderWarmed());
+      } catch (e) {
+        return fail(
+          `Provider not configured: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+
+      // 2. Ground source + target IN PARALLEL — Promise.all on two API calls.
+      // Both run against the same screenshot bytes, so we can fire them
+      // simultaneously and pay max(t_source, t_target) instead of sum.
+      const tGroundStart = Date.now();
+      const [fromR, toR] = await Promise.all([
+        provider.ground({
+          instruction: from,
+          screenshotB64,
+          screen: [width, height],
+        }),
+        provider.ground({
+          instruction: to,
+          screenshotB64,
+          screen: [width, height],
+        }),
+      ]);
+      const tGround = Date.now() - tGroundStart;
+
+      if (fromR.error || toR.error) {
+        return fail(
+          `Couldn't ground both endpoints. From: ${fromR.error ? `FAILED (${fromR.error})` : `(${fromR.x}, ${fromR.y})`}. ` +
+            `To: ${toR.error ? `FAILED (${toR.error})` : `(${toR.x}, ${toR.y})`}.`,
+        );
+      }
+      const fromX = fromR.x + offsetX;
+      const fromY = fromR.y + offsetY;
+      const toX = toR.x + offsetX;
+      const toY = toR.y + offsetY;
+
+      // 3. Execute drag — bridge first.
+      const tExecStart = Date.now();
+      const bridgedDrag = await tryBridgeScreenCall<{ ok: boolean }>(
+        "/screen/drag",
+        { fromX, fromY, toX, toY },
+      );
+      if (!bridgedDrag?.ok) {
+        try {
+          await screen.drag(fromX, fromY, toX, toY);
+        } catch (e) {
+          return fail(
+            `Drag failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      const tExec = Date.now() - tExecStart;
+
+      // 4. Post-drag screenshot for verification.
+      await screen.sleep(300);
+      let postPng: Buffer | undefined;
+      const postShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+      }>("/screen/screenshot", {});
+      if (postShot) {
+        postPng = Buffer.from(postShot.pngBase64, "base64");
+      } else {
+        try {
+          const s = await screen.screenshot();
+          postPng = s.png;
+        } catch {
+          /* skip */
+        }
+      }
+
+      const totalMs = Date.now() - t0;
+      const summary =
+        `Dragged "${from}" → "${to}": (${fromX}, ${fromY}) → (${toX}, ${toY}). ` +
+        `Ground (parallel) ${tGround}ms, exec ${tExec}ms, total ${totalMs}ms. ` +
+        (bridgedDrag?.ok ? "(via Electron bridge) " : "") +
+        "Post-drag screenshot attached.";
+      const responseContent: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [{ type: "text" as const, text: summary }];
+      if (postPng) {
+        responseContent.push({
+          type: "image" as const,
+          data: postPng.toString("base64"),
+          mimeType: "image/png",
+        });
+      }
+      return { content: responseContent };
+    },
+  );
+
+  server.registerTool(
+    "agent_observe",
+    {
+      title: `${MCP_BRAND}: Preview where a click would land (no execute)`,
+      description:
+        "Vision-grounded preview: ground a target description on the current screen " +
+        "WITHOUT clicking. Returns the screenshot the model used + the grounded " +
+        "coordinates as a text annotation. Use this for: " +
+        "(a) sanity-checking that the target you have in mind is actually on screen " +
+        "before agent_click commits; " +
+        "(b) checking 'is the file picker still open?' or 'did the popover close?' " +
+        "without firing an action; " +
+        "(c) reading off where the model thinks something is, when an agent_click " +
+        "missed and you want to debug. " +
+        "Same vision call as agent_click — pay one ~1-2s grounding round-trip, get " +
+        "back the result. The orchestrator never receives raw coords for re-use; " +
+        "agent_click re-grounds on its own (vision is fast and the screen may have " +
+        "changed since)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe("Plain-English description of the element to locate."),
+      },
+    },
+    async ({ target }) => {
+      const t0 = Date.now();
+      const bridgeShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+        width: number;
+        height: number;
+        offsetX: number;
+        offsetY: number;
+      }>("/screen/screenshot", {});
+      let png: Buffer;
+      let width: number;
+      let height: number;
+      let offsetX: number;
+      let offsetY: number;
+      if (bridgeShot) {
+        png = Buffer.from(bridgeShot.pngBase64, "base64");
+        width = bridgeShot.width;
+        height = bridgeShot.height;
+        offsetX = bridgeShot.offsetX;
+        offsetY = bridgeShot.offsetY;
+      } else {
+        try {
+          const shot = await screen.screenshot();
+          png = shot.png;
+          width = shot.width;
+          height = shot.height;
+          offsetX = shot.offsetX;
+          offsetY = shot.offsetY;
+        } catch (e) {
+          return fail(
+            `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+
+      let provider: ProviderClient;
+      try {
+        ({ provider } = await getProviderWarmed());
+      } catch (e) {
+        return fail(
+          `Provider not configured: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+
+      const tGroundStart = Date.now();
+      let r;
+      try {
+        r = await provider.ground({
+          instruction: target,
+          screenshotB64: png.toString("base64"),
+          screen: [width, height],
+        });
+      } catch (e) {
+        return fail(
+          `Grounding failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      const tGround = Date.now() - tGroundStart;
+
+      if (r.error) {
+        return fail(
+          `Couldn't locate "${target}" on the current screen. ${r.error}. ` +
+            "Take a screen_screenshot to see what's visible, then refine the description.",
+        );
+      }
+      const screenX = r.x + offsetX;
+      const screenY = r.y + offsetY;
+      const summary =
+        `Located "${target}" at (${screenX}, ${screenY}) ` +
+        `[screenshot space (${r.x}, ${r.y}); display offset (${offsetX}, ${offsetY})]. ` +
+        `Ground ${tGround}ms, total ${Date.now() - t0}ms. ` +
+        "Screenshot attached — verify the location matches what you intended. " +
+        "Call agent_click(target) with the SAME description to commit (it re-grounds; " +
+        "don't pass coords back).";
+      return {
+        content: [
+          { type: "text" as const, text: summary },
+          {
+            type: "image" as const,
+            data: png.toString("base64"),
+            mimeType: "image/png",
+          },
+        ],
+      };
+    },
+  );
 
   server.registerTool(
     "screen_type",
@@ -1662,7 +2117,11 @@ export const TOOL_NAMES = [
   "browser_type",
   "browser_scroll",
   "browser_read",
-  // OS-level keyboard / scroll / inspection (no mouse aiming)
+  // OS-level vision-grounded primitives (Stagehand-style act/observe split)
+  "agent_click",
+  "agent_drag",
+  "agent_observe",
+  // OS-level keyboard / scroll / inspection
   "screen_screenshot",
   "screen_type",
   "screen_hotkey",

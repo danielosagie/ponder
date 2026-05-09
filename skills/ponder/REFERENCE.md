@@ -69,17 +69,37 @@ screen_screenshot                                # read display
 
 ### 4. Hybrid (Chrome + OS file picker — only when set_input_files won't work)
 
-Some sites use a custom upload widget that doesn't expose a real `<input type=file>`. Then:
+Some sites use a custom upload widget that doesn't expose a real `<input type=file>`. Then prefer the atomic primitives over `agent_do`:
 
 ```
-browser_click("<add-photo-ref>")
-agent_do(task: "select the most recent screenshot in the Today section and click Open",
-         surface: "file-picker",
-         goal: "uploading screenshot to Marketplace listing")
-browser_snapshot                                 # back in Chrome — verify upload
+1. browser_click("<add-photo-ref>")                            # opens picker
+2. Bash: ls -t ~/Desktop/Screenshot*.png | head -1             # find the path
+3. agent_click("the file with the timestamp in the picker",
+               mode: "double")                                  # opens directly into the field
+4. browser_snapshot                                            # verify
 ```
 
-Note `surface: "file-picker"` is required. The brain gets `goal` as framing so it stays oriented.
+If the picker doesn't accept double-click for whatever reason, two atomic clicks:
+
+```
+3a. agent_click("the most recent screenshot in the Today section")  # selects
+3b. agent_click("the Open button in the file picker")               # commits
+```
+
+Each `agent_click` is ~2-3s, includes a post-action screenshot in its reply, and grounds the description through the same vision model that powers agent_do — without the autonomous loop overhead. Reserve `agent_do(surface: "file-picker", ...)` for cases where the picker layout is unfamiliar enough that the brain genuinely needs to explore.
+
+### 5. Native app — drag a file to the trash
+
+```
+1. agent_observe("the document.pdf icon on the Desktop")           # sanity check
+   → Located at (542, 318); screenshot attached. Looks right.
+2. agent_drag("the document.pdf icon on the Desktop",
+              "the trash in the dock")
+   → Dragged in ~3s. Post-drag screenshot shows the icon is gone.
+3. (optional) agent_click("the trash in the dock")                 # verify
+```
+
+`agent_drag` grounds source AND target IN PARALLEL on a single screenshot, so total time is roughly one ground call (~1-2s) + the drag itself (~300ms) + post-screenshot. Both endpoints must be visible at the same time — no scroll between source and target.
 
 ---
 
@@ -135,10 +155,11 @@ browser_snapshot       # new thumbnail in the photos row
 
 | Symptom | Recovery |
 |---|---|
-| `browser_click` failed twice on same ref | `browser_snapshot` again — page may have repainted; ref may have vanished. Or fall back to `agent_do(surface: "other", context: "<element description>")`. |
+| `browser_click` failed twice on same ref | `browser_snapshot` again — page may have repainted; ref may have vanished. Or fall back to `agent_click("<element description>")` for vision-grounded retry. |
 | `browser_navigate` keeps redirecting | Accept the redirect; use on-page nav. |
 | `browser_type` did nothing | Click the field with `browser_click` first, then type. |
 | Same action repeated 2+ times | STOP. Re-snapshot. Re-decide based on actual state, not what you "would have done next". |
+| `agent_click` clicked the wrong thing | Run `agent_observe(<better description>)` to see where the model thinks it is, then refine the description and `agent_click` with the new wording. Mention surface ("in the file picker"), position ("in the bottom-right"), or visual cue ("the highlighted row"). |
 | `agent_do exhausted` | OBSERVE FIRST (both `screen_screenshot` and `browser_snapshot`). Half the time the goal already landed. |
 
 ### Never call `screen_hotkey` to "see what's in another window"
@@ -149,9 +170,11 @@ browser_snapshot       # new thumbnail in the photos row
 
 ## Tool choice guidelines
 
-Default to keyboard-style verbs (`browser_navigate`, `browser_type`, `screen_hotkey`, `screen_type`) — fast and reliable. Mouse (`browser_click`, `agent_do`) wins when picking a SPECIFIC item from a list (search-result card, dropdown suggestion, listing tile, file in a picker).
+Default to keyboard-style verbs (`browser_navigate`, `browser_type`, `screen_hotkey`, `screen_type`) — fast and reliable. Mouse-style verbs (`browser_click`, `agent_click`, `agent_drag`, `agent_do`) win when picking a SPECIFIC item from a list (search-result card, dropdown suggestion, listing tile, file in a picker).
 
-For uploads, ALWAYS try `browser_set_input_files` before falling back to `agent_do(surface: "file-picker")`.
+For uploads: `browser_set_input_files` first (skips the picker entirely), then `browser_click` + `agent_click` if the site doesn't expose a real `<input type=file>`. `agent_do(surface: "file-picker")` is the last resort for unfamiliar pickers where exploration is needed.
+
+For OS-level mouse work: `agent_click` and `agent_drag` are the primary tools — they're like `browser_click` but vision-grounded. `agent_do` is reserved for autonomous loops where the brain has to figure out the next verb AND target as it goes.
 
 ---
 

@@ -152,10 +152,18 @@ async function ensureAttached(): Promise<string | null> {
   const browser = await getBrowser();
   if (await browser.available()) return null;
   return (
-    "No Chrome tab is attached to Playwriter. " +
-    "Open Chrome, install the Playwriter extension if needed, then click " +
-    "its icon on the tab you want me to control (the icon turns green). " +
-    "Re-call this tool once attached."
+    "Chrome tab not attached to Playwriter. Attaching requires a user " +
+    "gesture (Chrome's debugger.attach security model — no programmatic " +
+    "workaround exists; agent_do can't help). " +
+    "RECOVERY (do this before bouncing to the user): " +
+    "1) call screen_screenshot to see whether Chrome is open and on the " +
+    "right tab. 2) Give the user ONE concise instruction — 'click the " +
+    "green Playwriter icon on the <tab name> tab' if Chrome is visible " +
+    "on the right URL, or 'open Chrome to <url> and click the green " +
+    "Playwriter icon' if it isn't. Do NOT paste this whole recovery " +
+    "message back to the user — they want one action, not instructions. " +
+    "Once they click, browser_status will return 'Attached. URL: …' and " +
+    "you can proceed."
   );
 }
 

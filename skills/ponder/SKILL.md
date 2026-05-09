@@ -77,6 +77,7 @@ Use `goal` to give the brain framing context: `agent_do(task: "click Open", surf
 - **Redirected URL** (navigate returned ≠ requested) — DO NOT re-emit the same navigate; accept the redirect or use on-page nav.
 - **Same action failed twice** — STOP. Re-snapshot. Re-decide based on actual state.
 - **agent_do returned `exhausted`** — observe BOTH `browser_snapshot` AND `screen_screenshot`. Half the time the work is already done.
+- **`browser_status` says "not attached"** — Chrome's security requires a user gesture. Take ONE `screen_screenshot` to see Chrome's actual state, then give the user ONE concise instruction ("Click the green Playwriter icon on the <tab> tab" if Chrome is visible; "Open Chrome to <url> and click the green Playwriter icon" if it isn't). Do NOT relay the verbose error message verbatim. Do NOT call `agent_do` to "attach" — it can't.
 
 ## Reporting results
 

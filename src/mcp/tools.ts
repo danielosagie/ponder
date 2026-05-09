@@ -24,9 +24,11 @@ import {
   computeDefaultProvider,
   isProviderConfigured,
   makeProvider,
+  makeRouter,
   humanProviderLabel,
 } from "../agent/factory.js";
 import type { AgentEvents, ProviderClient } from "../agent/types.js";
+import type { RouterClient } from "../agent/router.js";
 
 const stderrLog = (...args: unknown[]): void => {
   process.stderr.write(args.map(String).join(" ") + "\n");
@@ -66,6 +68,30 @@ function getBrowser(): Promise<BrowserClient> {
     });
   }
   return _browserPromise;
+}
+
+// Best-effort browser fetch for paths that DON'T want to fail when Chrome
+// isn't attached — e.g., agent_do's tandem mode where vision can still
+// drive the OS surface even if Playwriter is down. Returns null on
+// constructor or availability failure rather than throwing.
+async function getBrowserOrNull(): Promise<BrowserClient | null> {
+  try {
+    const b = await getBrowser();
+    if (await b.available()) return b;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Local CLI router (qwen3.5:0.8b via Ollama). Cheap to construct (no
+// network at construction; `available()` is what probes Ollama). Memoized
+// like the browser. Returns null when the user has explicitly disabled
+// the router via HOLO3_ROUTER=off.
+let _router: RouterClient | null | undefined = undefined;
+function getRouter(): RouterClient | null {
+  if (_router === undefined) _router = makeRouter();
+  return _router;
 }
 
 // ── Provider lazy cache ──────────────────────────────────────────────
@@ -716,32 +742,48 @@ export function registerTools(server: McpServer): void {
           );
         }
 
-        // VISION-ONLY by design. We deliberately do NOT pass the
-        // Playwriter browser client or the router fast-path here:
+        // TANDEM MODE: vision and CDP run side-by-side, not as fallbacks.
+        // Sites are visual AND code-heavy; the orchestrator's `surface`
+        // declaration lets us bias correctly per step.
         //
-        //   • agent_do is meant for OS-level work (file pickers, native
-        //     apps, Spotlight, drag-and-drop) where the underlying
-        //     Chrome tab's accessibility snapshot is MISLEADING — a
-        //     native file dialog is on top of Chrome but Playwriter
-        //     still reports the underlying Marketplace page.
-        //   • The router (qwen3.5:0.8b) sees that Chrome snapshot and
-        //     keeps emitting `browser.navigate` for every subtask,
-        //     short-circuiting the vision path entirely. The user's
-        //     transcript showed this exact loop: planner decomposes
-        //     into "navigate to Desktop, find file, click Open" and
-        //     the router responds with `browser.navigate marketplace`
-        //     for every subtask. No actual screen work happens.
+        // We pass BOTH the browser and the router to runTask:
+        //   • browser → captures the Chrome accessibility snapshot every
+        //     step. The brain sees Chrome refs alongside the screenshot
+        //     and can emit `browser.click eN` even on agent_do calls
+        //     (e.g., dismissing Chrome UI after an OS-level upload).
+        //   • router → qwen3.5:0.8b short-circuits browser.* actions in
+        //     ~500ms when the snapshot covers the goal. Saves a Holo3
+        //     round-trip on every step where Chrome IS the right surface.
         //
-        // For in-browser orchestration the orchestrator should call
-        // browser_* directly — that surface keeps using [eN] refs.
-        // agent_do = pure vision, no Chrome context.
-        const browser = null;
-        const router = null;
+        // The historical reason for null/null was correct then but obsolete
+        // now. Two newer guards make tandem mode safe:
+        //   1. `browserStalled` in loop.ts (snapshot byte-equal across
+        //      steps but screen pixels moved) detects OS overlays on top
+        //      of Chrome and forces vision for that step + tells the
+        //      brain via routerHint that the AX tree is stale.
+        //   2. The `surface` enum in agent_do is threaded into the brain
+        //      task as `[Surface: file-picker]` etc., so the brain knows
+        //      it's operating an OS surface even on step 1 (before any
+        //      stall-detect history exists).
+        // Together those mean the router won't hijack a file-picker step
+        // by emitting `browser.click eN` against the page underneath.
+        // Best-effort: if Playwriter isn't attached, browser stays null
+        // and we run vision-only — same as before.
+        const browser = await getBrowserOrNull();
+        const router = getRouter();
+        const mode =
+          browser && router
+            ? "tandem"
+            : browser
+              ? "vision+browser"
+              : router
+                ? "vision+router"
+                : "vision-only";
         await sendProgress(
-          `Started agent_do (provider=${provider.name}, vision-only, surface=${surface})`,
+          `Started agent_do (provider=${provider.name}, mode=${mode}, surface=${surface})`,
         );
         stderrLog(
-          `[mcp] agent_do start: surface=${surface} task="${task.length > 80 ? task.slice(0, 77) + "..." : task}"` +
+          `[mcp] agent_do start: surface=${surface} mode=${mode} task="${task.length > 80 ? task.slice(0, 77) + "..." : task}"` +
             (goal ? ` goal="${goal.slice(0, 60)}"` : ""),
         );
 
@@ -892,6 +934,11 @@ export function registerTools(server: McpServer): void {
             // is already open) that the brain can't recognize as DONE.
             // See loop.ts RunOptions.flat for the rationale.
             flat: true,
+            // Tandem-mode safety: forward the declared surface so the
+            // loop can seed step 1's routerHint and suppress the router
+            // when an OS overlay is on top of Chrome. From step 2
+            // onward browserStalled handles it.
+            surface,
             // Cap inner steps tight. Atomic means atomic — if 8 steps
             // can't get there, the orchestrator should re-plan with
             // fresh state via browser_snapshot / screen_screenshot

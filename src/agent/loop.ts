@@ -144,6 +144,19 @@ export interface RunOptions {
    * don't benefit from long settles between actions either.
    */
   stepPause?: number;
+  /**
+   * OS surface declared by the caller (agent_do passes file-picker /
+   * finder / spotlight / dock / menu-bar / native-dialog / drag-drop /
+   * other). Used to seed step 1's routerHint so the router doesn't
+   * hijack a file-picker call by emitting `browser.click eN` against
+   * the Chrome page sitting behind the OS overlay. From step 2 onward
+   * the existing browserStalled detector takes over (DOM unchanged but
+   * pixels moved → OS dialog on top → force vision).
+   *
+   * Undefined = chrome-page surface or no declaration; router runs
+   * normally on step 1.
+   */
+  surface?: string;
 }
 
 /**
@@ -355,6 +368,26 @@ async function runOneSubtask(
   // into the next think() call so Holo3 inherits context. Cleared after
   // each vision step lands.
   let pendingRouterHint: string | undefined;
+  // Tandem-mode safety: when the orchestrator declared an OS-level surface
+  // (file-picker / finder / spotlight / etc.), the router would otherwise
+  // run on step 1 against the Chrome AX snapshot UNDERNEATH the OS overlay
+  // and might emit `browser.click eN` against the page behind the dialog.
+  // Seed step 1's routerHint with a surface-specific note so the brain
+  // knows the AX tree is informational only this step. From step 2 onward
+  // the existing browserStalled detector takes over.
+  if (
+    opts.surface &&
+    opts.surface !== "chrome-page" &&
+    opts.surface.length > 0
+  ) {
+    pendingRouterHint =
+      `Caller declared OS surface "${opts.surface}" — an OS overlay (file ` +
+      `picker / Finder / native dialog / etc.) is in front of Chrome. The ` +
+      `Chrome accessibility tree this step is the page UNDERNEATH; treat ` +
+      `it as informational only. Emit a vision-grounded mouse action ` +
+      `(click / double click / drag / etc.) targeting the OS surface. ` +
+      `browser.* refs are NOT applicable until the OS overlay is dismissed.`;
+  }
   const history: string[] = [];
   // Parallel array to history: the screen hash AT THE MOMENT each action
   // was emitted. Used by the screen-aware anti-loop check — if the same
@@ -571,7 +604,17 @@ async function runOneSubtask(
       pendingRouterHint =
         "Previous click opened a NATIVE OS dialog on top of Chrome (likely a file picker / save dialog / system prompt). The Chrome accessibility tree is stale — IGNORE browser.* refs this step. Look at the screenshot and emit a vision-grounded mouse action ('click on the file …', 'click the Open button', etc.) to drive the dialog.";
     }
-    if (router && browserSnapshot && !browserStalled) {
+    // Skip the router on step 1 of an OS-level agent_do call. The
+    // pendingRouterHint was seeded with the surface declaration before
+    // the loop started; it'll get folded into the brain's prompt this
+    // step. From step 2 onward the existing browserStalled detector
+    // owns OS-overlay handling.
+    const osSurfaceFirstStep =
+      step === 0 &&
+      opts.surface !== undefined &&
+      opts.surface !== "chrome-page" &&
+      opts.surface.length > 0;
+    if (router && browserSnapshot && !browserStalled && !osSurfaceFirstStep) {
       const tRouter = Date.now();
       try {
         const decision = await router.decide({

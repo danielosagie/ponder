@@ -12,6 +12,7 @@ import { createOllamaPlanner } from "./planner";
 import { canonicalizeUrl, type RouterClient } from "./router";
 import type { AgentEvents, ProviderClient } from "./types";
 import type { BrowserClient, BrowserSnapshot } from "./browser/types";
+import { verify, verifierEnabled } from "./verifier";
 import * as screen from "../screen";
 
 // Per-subtask cap. With hierarchical planning the inner loop only needs to
@@ -399,6 +400,12 @@ async function runOneSubtask(
   // on the Screenshot…PM.png file" emissions while the file was actually
   // being selected — the legacy guard killed a working flow.
   const actionScreenHashes: string[] = [];
+  // Ralph verifier: when the brain emits DONE we ask the same model
+  // (different prompt) "did the goal actually land?". If RETRY, we
+  // push a [note: …] to history and run one more iteration so the
+  // brain can course-correct. Capped at one verify per subtask — we'd
+  // rather trust the second DONE than enter an infinite verify loop.
+  let verificationAttempted = false;
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
   // from a screen we've already typed it on is the search-engine loop pattern
@@ -634,6 +641,46 @@ async function runOneSubtask(
           case "done":
             console.log(`[router] (${dt}ms) → DONE`);
             await events.onThought("DONE (router)");
+            // Same Ralph verifier path as brain DONE — the router's
+            // judgement is based on the AX snapshot only (no screenshot),
+            // so it's MORE likely than the brain to false-DONE on a UI
+            // that visually contradicts the snapshot (animations, OS
+            // overlays, race conditions). Skip when verifier disabled or
+            // already attempted.
+            if (!verificationAttempted && verifierEnabled()) {
+              verificationAttempted = true;
+              console.log("[loop] 🔍 verifying router DONE...");
+              await events.onStatus("Verifying that the goal landed…");
+              const verifyResult = await verify(provider, {
+                task: taskForPlanner,
+                screenshotB64: shot.png.toString("base64"),
+                screen: screenSize,
+                browserSnapshot,
+                signal: ctrl.signal,
+              });
+              if (cancelled()) return "cancelled";
+              if (verifyResult.verified) {
+                console.log("[loop] ✅ DONE (router, verified)");
+                return "done";
+              }
+              const reason = verifyResult.reason ?? "no reason given";
+              console.log(`[loop] ❌ verifier said retry — ${reason}`);
+              const note = `[note: verifier said router DONE was wrong — ${reason}; reconsider state and continue]`;
+              history.push(note);
+              actionScreenHashes.push(screenHash);
+              opts.onHistory?.(note);
+              await events.onError(
+                `Verifier rejected router DONE — ${reason}. Retrying once.`,
+              );
+              if (await interruptiblePause(stepPause, cancelled))
+                return "cancelled";
+              // Update prevSnapshotHash/prevScreenHash before continuing
+              // so the next iteration's stall-detect compares against
+              // current state.
+              prevSnapshotHash = snapHash;
+              prevScreenHash = screenHash;
+              continue;
+            }
             return "done";
           case "vision_needed":
             console.log(`[router] (${dt}ms) → VISION_NEEDED: ${decision.reason}`);
@@ -690,6 +737,40 @@ async function runOneSubtask(
     }
 
     if (isDone(action)) {
+      // Ralph verifier — confirm the goal actually landed before
+      // returning. Skipped if disabled (PONDER_VERIFIER=off) or if
+      // we already gave the brain one chance to correct itself.
+      if (!verificationAttempted && verifierEnabled()) {
+        verificationAttempted = true;
+        console.log("[loop] 🔍 verifying claimed DONE...");
+        await events.onStatus("Verifying that the goal landed…");
+        const verifyResult = await verify(provider, {
+          task: taskForPlanner,
+          screenshotB64: shot.png.toString("base64"),
+          screen: screenSize,
+          browserSnapshot,
+          signal: ctrl.signal,
+        });
+        if (cancelled()) return "cancelled";
+        if (verifyResult.verified) {
+          console.log("[loop] ✅ DONE (verified)");
+          return "done";
+        }
+        // Verifier rejected DONE — push a [note: …] and run one more
+        // iteration so the brain can react. Don't push a "DONE" history
+        // entry; the brain should produce a fresh action.
+        const reason = verifyResult.reason ?? "no reason given";
+        console.log(`[loop] ❌ verifier said retry — ${reason}`);
+        const note = `[note: verifier said the goal is NOT yet achieved — ${reason}; reconsider state and continue]`;
+        history.push(note);
+        actionScreenHashes.push(screenHash);
+        opts.onHistory?.(note);
+        await events.onError(
+          `Verifier rejected the claimed DONE — ${reason}. Retrying once.`,
+        );
+        if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
+        continue;
+      }
       console.log("[loop] ✅ DONE");
       return "done";
     }

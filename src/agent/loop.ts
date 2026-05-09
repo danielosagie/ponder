@@ -135,6 +135,15 @@ export interface RunOptions {
    * rather than burn 50 retries on a stuck inner loop.
    */
   maxSteps?: number;
+  /**
+   * Per-call inter-step pause (ms). Defaults to the provider-aware
+   * legacy values: 6500ms for hcompany (rate-limit safety), 1200ms
+   * otherwise. agent_do overrides to 1500ms — at 8 inner steps the
+   * total runtime stays inside the MCP client's typical 30-60s request
+   * timeout even on the slow rate-limited path. Atomic OS-level steps
+   * don't benefit from long settles between actions either.
+   */
+  stepPause?: number;
 }
 
 /**
@@ -382,8 +391,15 @@ async function runOneSubtask(
   // it overlaps with the inter-step pause; by the time the next iteration
   // starts, the bytes are already in memory and we skip a 50-200ms grab+encode.
   let prefetched: Promise<screen.Screenshot> | null = null;
+  // Caller can override (agent_do passes 1500ms to keep total runtime
+  // inside the MCP client's request timeout). Falls back to the
+  // provider-aware default: 6500ms for hcompany rate-limit safety,
+  // 1200ms otherwise.
   const stepPause =
-    provider.name === "hcompany" ? STEP_PAUSE_MS_HCOMPANY : STEP_PAUSE_MS_DEFAULT;
+    opts.stepPause ??
+    (provider.name === "hcompany"
+      ? STEP_PAUSE_MS_HCOMPANY
+      : STEP_PAUSE_MS_DEFAULT);
 
   // Per-task AbortController. We feed its signal to provider HTTP calls and
   // tick `abort()` the moment cancelFlag flips, which makes Stop near-instant

@@ -516,6 +516,13 @@ export function registerTools(server: McpServer): void {
               "one target). For multi-step goals, decompose into multiple tool calls " +
               "and observe state (browser_snapshot / screen_screenshot) between them.",
           ),
+        // Marked optional in the schema so a missing value falls
+        // through to our handler-side validator, which returns a
+        // friendly LLM-shaped error message instead of the bare Zod
+        // "Required" payload (the MCP SDK formats Zod errors as raw
+        // JSON which is hard for the model to act on). The
+        // description still says REQUIRED so well-formed callers
+        // include it.
         surface: z
           .enum([
             "file-picker",
@@ -527,6 +534,7 @@ export function registerTools(server: McpServer): void {
             "drag-drop",
             "other",
           ])
+          .optional()
           .describe(
             "REQUIRED. Where the action lands. " +
               "'file-picker' = Open/Save dialog (typically opened by a Chrome upload " +
@@ -566,16 +574,41 @@ export function registerTools(server: McpServer): void {
       return chainAgentDo(async () => {
         const t0 = Date.now();
 
-        // Belt-and-suspenders: the schema enforces `surface`, but we
-        // surface a clearer error when the orchestrator picks 'other'
-        // without any context — that's the only legitimate use case
-        // where the surface isn't self-describing, and a missing
-        // context strongly suggests an in-Chrome click was meant. The
-        // text-heuristic guards (compound-task, in-Chrome click) that
-        // used to live here are intentionally GONE — they generated
-        // too many false positives by inferring intent from
+        // Surface is REQUIRED. The schema marks it optional only so we
+        // can return this friendly message instead of the bare Zod
+        // "Required" error the MCP SDK would otherwise emit (which
+        // shows up as a raw JSON validation payload in the orchestrator's
+        // tool result — hard to act on). The text-heuristic guards
+        // (compound-task by separator count, in-Chrome by click-verb
+        // regex) that used to live here are intentionally GONE — they
+        // generated too many false positives by inferring intent from
         // punctuation and verb shape. The orchestrator now declares
         // surface explicitly; that's the contract.
+        if (!surface) {
+          return fail(
+            "agent_do requires a `surface` declaration so we know what kind of " +
+              "OS surface you're driving (and confirm the target isn't reachable " +
+              "via browser_*). Pass one of:\n" +
+              "  • file-picker — native Open/Save dialog\n" +
+              "  • finder — a Finder window\n" +
+              "  • spotlight — the Spotlight overlay\n" +
+              "  • dock — the macOS dock\n" +
+              "  • menu-bar — the macOS menu bar / status icons\n" +
+              "  • native-dialog — system permission/alert prompts\n" +
+              "  • drag-drop — OS-level drag-and-drop (source or target outside Chrome)\n" +
+              "  • other — anything else (also supply `context` describing the surface)\n\n" +
+              "If the action is in a Chrome page (anything with a [eN] ref in " +
+              "browser_snapshot), use browser_click / browser_type / " +
+              "browser_set_input_files instead — agent_do does not see Chrome's " +
+              "accessibility tree and will vision-ground from pixels.\n\n" +
+              "Need a file path on disk for an upload? Use a Bash tool " +
+              "(ls -t ~/Desktop/Screenshot*.png | head -1, find …, mdfind …) " +
+              "to read the path, then pass it to browser_set_input_files. " +
+              "Do NOT call agent_do(surface: 'finder') just to find a file.",
+          );
+        }
+        // Belt-and-suspenders: 'other' is the catch-all surface, and a
+        // missing context strongly suggests an in-Chrome click was meant.
         if (surface === "other" && !context) {
           return fail(
             "agent_do called with surface='other' and no context. The 'other' " +
@@ -857,6 +890,14 @@ export function registerTools(server: McpServer): void {
             // instead of letting the brain spin for 50 retries. Override
             // via PONDER_AGENT_DO_MAX_STEPS for legacy callers.
             maxSteps: Number(process.env.PONDER_AGENT_DO_MAX_STEPS ?? 8),
+            // Tighter inter-step pause for atomic OS-level work. The
+            // legacy 6500ms pause (hcompany rate-limit safety) × 8
+            // steps + plan/ground per step pushes total runtime over
+            // the MCP client's typical 30-60s request timeout, even
+            // with progress notifications. 1500ms keeps an 8-step run
+            // under ~30s wall time on the rate-limited path. Override
+            // via PONDER_AGENT_DO_STEP_PAUSE_MS.
+            stepPause: Number(process.env.PONDER_AGENT_DO_STEP_PAUSE_MS ?? 1500),
             // Thread the orchestrator's optional higher-level goal so
             // the brain stays oriented if the immediate task is just a
             // mechanical step.

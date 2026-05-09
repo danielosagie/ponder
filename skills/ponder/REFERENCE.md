@@ -11,28 +11,31 @@ The prescriptive rules live in `SKILL.md`. This file is everything else: example
 User: "upload my latest screenshot to my Bulbasaur Marketplace listing."
 
 ```
-1. browser_status                           # observe: where are we?
+1. browser_status                                           # where are we?
    → Attached. URL: …/marketplace/edit/?listing_id=…
 
 2. browser_snapshot
-   → [e15] button "Add photo"
-     [e22] file-input "" (use browser_set_input_files, accepts=image/*)
+   → [e14] file-input "" (use browser_set_input_files, accepts=image/*…)
+     [e17] button "Add photo"
    The hidden <input type=file> is right there — flagged for you.
 
-3. browser_set_input_files("e22", ["/Users/dosagie/Desktop/Screenshot 2026-05-08 at 1.59.53 PM.png"])
-   → Attached 1 file to e22: Screenshot 2026-05-08 at 1.59.53 PM.png.
+3. Bash: ls -t ~/Desktop/Screenshot*.png | head -1         # read the REAL path
+   → /Users/you/Desktop/Screenshot 2026-05-08 at 1.59.53 PM.png
 
-4. browser_snapshot                         # verify the upload landed
+4. browser_set_input_files("e14", [<path-from-step-3>])
+   → Attached 1 file to e14: Screenshot 2026-05-08 at 1.59.53 PM.png.
+
+5. browser_snapshot                                         # verify
    → "Photos · 2 / 10" + new thumbnail visible
 
-5. Report: "Uploaded the screenshot to the Bulbasaur listing."
+6. Report: "Uploaded the screenshot to the Bulbasaur listing."
 ```
 
-5 tool calls. No native picker. No `agent_do`. No vision.
+6 tool calls. No native picker. No `agent_do`. No vision. The Bash call in step 3 is critical — guessing the path produces `ENOENT` and forces the agent down the slow vision-grounded picker path. `ls -t` (most-recent-first) + `head -1` is the canonical "latest screenshot" lookup.
 
 If the file-input ref is missing from the snapshot:
 ```
-browser_click("e15")          # click the styled "Add photo" — opens picker
+browser_click("e17")          # click the styled "Add photo" — opens picker
 browser_snapshot              # the hidden <input type=file> usually appears now
 browser_set_input_files(<ref>, [path])
 screen_hotkey("escape")       # dismiss the picker that's still on screen

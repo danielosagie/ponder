@@ -187,21 +187,34 @@ export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
     },
 
     async plan(args): Promise<PlanResult> {
-      // Numbered history with the most recent action labeled "← last" so the
-      // model can directly compare it against the new screenshot. Without
-      // numbering, multi-step plans drift because the model doesn't realize
-      // how far through the task it is.
-      const recent = args.history.slice(-5);
-      const baseStep = args.history.length - recent.length;
+      // KV-cache-friendly history: append-only, no shifting numbers, only the
+      // most recent line carries a "← last" marker. Why this shape matters:
+      //
+      // The hcompany / OpenAI-compatible API auto-caches the LONGEST IDENTICAL
+      // PREFIX of consecutive requests. If we slice history to the last 5 and
+      // prepend absolute step numbers like `47. click on the search bar`,
+      // EVERY step shifts the numbers and rewrites the entire history block —
+      // the prefix changes mid-message and the cache invalidates after the
+      // system prompt. Step 1's user message is `1. <action>`, step 2's is
+      // `2. <action> ← last\n3. <action>`, and so on. No cache hit beyond the
+      // system boundary.
+      //
+      // With append-only no-number history, step N's history is a strict
+      // prefix of step N+1's history — modulo the moving "← last" marker,
+      // which only mutates the trailing line. The cache hits the entire
+      // (system + earlier history) prefix on every call after the first.
+      //
+      // We don't slice anymore: most runs are <50 steps and history entries
+      // are short (one verb + brief annotation). The token cost is bounded
+      // and amortized via the cache. If history ever grows pathological we
+      // can introduce a hard cap (say 200 entries) — but slicing-then-
+      // numbering was the worst of both worlds.
+      const items = args.history;
       const historyBlock =
-        recent.length === 0
+        items.length === 0
           ? "(none — this is step 1)"
-          : recent
-              .map((h, i) => {
-                const idx = baseStep + i + 1;
-                const tag = i === recent.length - 1 ? "  ← last" : "";
-                return `${idx}. ${h}${tag}`;
-              })
+          : items
+              .map((h, i) => (i === items.length - 1 ? `${h}  ← last` : h))
               .join("\n");
       const dupWarning =
         args.history.length >= 2 &&
@@ -423,10 +436,21 @@ export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
         '  type({"text":"figma"}) and press enter   ← chained + JSON\n' +
         '  "click on the icon"                      ← outer quotes\n' +
         "  Click the search box, then type figma    ← multi-step prose\n";
-      const stepNum = args.history.length + 1;
+      // Build the user text in cache-friendly order: STABLE prefix (goal +
+      // screen size + history that the model has seen on prior calls), then
+      // the dynamic dup-warning, then the closing instruction (also stable).
+      // The screenshot lives ahead of the text in the user content array
+      // (image bytes change every step; the API treats per-image cache
+      // separately).
+      //
+      // We deliberately drop the per-call `Step N of up to 30` counter — it
+      // was a moving integer in a stable-looking string, which prevented
+      // any prefix-cache hit on the user text. The model can count history
+      // entries itself if it cares; the closing instruction tells it the
+      // answer shape regardless of step number.
       const userText =
         `USER GOAL: ${args.task}\n` +
-        `Step ${stepNum} of up to 30. Screen: ${args.screen[0]}x${args.screen[1]}\n` +
+        `Screen: ${args.screen[0]}x${args.screen[1]}\n` +
         `Action history (most recent last; \`[note: …]\` lines are system observations, not your prior actions):\n${historyBlock}${dupWarning}\n\n` +
         "Compare the screenshot to the goal, then emit ONE action verb:\n" +
         "  • If the goal is already visible / achieved → emit DONE on its own.\n" +

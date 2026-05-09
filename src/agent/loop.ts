@@ -406,6 +406,14 @@ async function runOneSubtask(
   // brain can course-correct. Capped at one verify per subtask — we'd
   // rather trust the second DONE than enter an infinite verify loop.
   let verificationAttempted = false;
+  // Hierarchical retry: when anti-loop guard #1 would bail (same
+  // action 3/4 times AND screen unchanged), give the brain ONE
+  // chance to recover by force-resnapshotting + pushing a strong
+  // "you are stuck — change strategy" note. If the next iteration
+  // ALSO emits the same action, we bail for real. This converts the
+  // hard cliff at the anti-loop boundary into a single graceful
+  // recovery step. Tracked once per subtask.
+  let hardRetryAttempted = false;
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
   // from a screen we've already typed it on is the search-engine loop pattern
@@ -1003,12 +1011,53 @@ async function runOneSubtask(
         recentHashes.length === 3 &&
         recentHashes.every((h) => h === screenHash);
       if (screensIdentical) {
+        // Hierarchical retry: instead of bailing immediately, give the
+        // brain ONE chance to course-correct by force-resnapshotting
+        // and pushing a strong [note: …] that names the failure mode.
+        // If the next iteration emits the same action again, then we
+        // bail for real. This converts the anti-loop cliff into a
+        // single recovery step.
+        if (!hardRetryAttempted) {
+          hardRetryAttempted = true;
+          console.warn(
+            `[loop] ⚠ anti-loop wants to bail (action "${action}" repeated ${same}/4 + screen unchanged) — trying ONE hierarchical recovery first`,
+          );
+          await events.onStatus(
+            "Stuck — re-observing state and asking the brain to change approach…",
+          );
+          // Drop the prefetched screenshot so step N+1 takes a fresh
+          // capture (don't trust the cached one — we want certainty
+          // the screen really hasn't changed, not a 250ms-old read).
+          prefetched = null;
+          // Push a forceful note. The brain will see this on its next
+          // plan() call and (hopefully) emit a different verb.
+          const note =
+            `[note: STUCK — same action "${action}" was emitted ${same} of the last 4 steps with no visible screen change. ` +
+            `The current target is NOT working. DO NOT repeat this action. ` +
+            `Try a DIFFERENT approach: switch verbs (mouse↔keyboard), pick a different target ref, ` +
+            `scroll to reveal what's hidden, press esc to dismiss any blocker, or emit DONE if the goal is already satisfied.]`;
+          history.push(note);
+          actionScreenHashes.push(screenHash);
+          opts.onHistory?.(note);
+          // Reset the action's prevSnapshotHash/prevScreenHash so the
+          // next step's stall-detect compares against current state,
+          // not the pre-stuck state.
+          prevSnapshotHash = snapHash;
+          prevScreenHash = screenHash;
+          // Brief settle then continue. Don't pay full stepPause here
+          // because this is a recovery step — the user is already
+          // waiting on stuck behavior; another 6.5s of silence makes
+          // it worse.
+          await screen.sleep(400);
+          if (cancelled()) return "cancelled";
+          continue;
+        }
         console.warn(
-          `[loop] 🛑 anti-loop: action "${action}" repeated ${same}/4 times AND screen unchanged — stopping`,
+          `[loop] 🛑 anti-loop: action "${action}" repeated ${same}/4 times AND screen unchanged AFTER recovery attempt — stopping`,
         );
         await events.onError(
-          `Stuck in a loop: "${action}" was emitted ${same} of the last 4 steps with no screen change. ` +
-            "The screen isn't updating, or the target isn't reachable from this state.",
+          `Stuck in a loop after one recovery attempt: "${action}" was emitted ${same} of the last 4 steps with no screen change. ` +
+            "The brain didn't switch strategy when prompted. Bailing.",
         );
         return "exhausted";
       }

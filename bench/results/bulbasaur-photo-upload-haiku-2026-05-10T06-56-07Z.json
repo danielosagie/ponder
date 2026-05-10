@@ -1,0 +1,51 @@
+{
+  "id": "bulbasaur-photo-upload-haiku-2026-05-10T06-56-07Z",
+  "case": "bulbasaur-photo-upload",
+  "model": "haiku",
+  "started_at": "2026-05-10T06:56:07Z",
+  "ended_at": "2026-05-10T06:57:51Z",
+  "elapsed_ms": 33370,
+  "outcome": "success_with_caveats",
+  "tool_call_count": 8,
+  "tool_calls": [
+    "browser_status",
+    "Bash",
+    "screen_screenshot",
+    "agent_click",
+    "browser_click",
+    "agent_click",
+    "browser_snapshot",
+    "browser_set_input_files"
+  ],
+  "verification": "Post-run orchestrator browser_snapshot shows: e14 file-input value = 'C:\\fakepath\\Screenshot 2026-05-08 at 1.59.53 PM.png' (Chrome's HTML5 sentinel — file IS attached); 3 thumbnails present (e38/e39/e40); 3 'Remove photo' buttons (e16/e17/e18). U+202F resolveFilePathTolerant fuzz-match shipped in b330fee resolved the path correctly — no ENOENT this run.",
+  "errors": [],
+  "haiku_subagent_summary": "File-input e14 accepted the screenshot upload at /Users/dosagie/Desktop/Screenshot 2026-05-08 at 1.59.53 PM.png for the Bulbasaur listing edit page on Facebook Marketplace.",
+  "ground_truth_correction": "Haiku claimed 'success' but had NO evidence — its 8th and final call was browser_set_input_files, with no follow-up snapshot to verify the photo count or new thumbnail. The success claim is only validated by the orchestrator's separate post-run snapshot. Strategy was also wasteful: 3 click calls (screen_screenshot, agent_click, browser_click, agent_click) before browser_snapshot, when snapshot-first would have revealed e14 directly without any clicks.",
+  "primary_issues": [
+    {
+      "id": "strategy-snapshot-first",
+      "severity": "high",
+      "description": "Haiku didn't snapshot first. Sequence began status → Bash → screen_screenshot → agent_click → browser_click → agent_click → snapshot → set_input_files. The right shape is status → snapshot → Bash → set_input_files → snapshot (5 calls). File-inputs surface directly in browser_snapshot — no need to click 'Add photo' to 'open' anything.",
+      "fix": "SKILL.md / REFERENCE.md should make 'snapshot before clicking' the visible top-of-page rule for file-upload tasks."
+    },
+    {
+      "id": "no-final-verification",
+      "severity": "medium",
+      "description": "Haiku reported 'success' without taking a final snapshot. Its verification text described what it CALLED, not what it OBSERVED post-call. The bench can't trust this without orchestrator-side ground-truthing.",
+      "fix": "case spec subagent prompt should explicitly require: 'final tool call MUST be browser_snapshot, and verification MUST cite a post-state observation (photo count or thumbnail count change)'. Budget the final snapshot in the 5-call happy path."
+    }
+  ],
+  "validated_fixes": [
+    {
+      "id": "u202f-tolerant-path",
+      "shipped_in": "b330fee",
+      "evidence": "browser_set_input_files succeeded this run with no error. Last run hit ENOENT on the same file path. resolveFilePathTolerant fuzz-matched the ASCII-space input to the U+202F on-disk filename."
+    }
+  ],
+  "duration_breakdown": {
+    "subagent_total_tokens": 55812,
+    "subagent_tool_uses": 8,
+    "subagent_duration_ms": 33370,
+    "wall_time_ms": 104000
+  }
+}

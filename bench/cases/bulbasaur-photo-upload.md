@@ -53,22 +53,32 @@ TASK
 CONSTRAINTS
 {constraints}
 
+PRESCRIBED SEQUENCE (5 calls — follow unless state forces a deviation)
+1. browser_status                 — confirm tab attached, URL is the marketplace edit page
+2. browser_snapshot               — find the file-input ref (e.g. e14, flagged "use browser_set_input_files")
+3. Bash: ls -t ~/Desktop/Screenshot*.png | head -1   — read the real path from disk
+4. browser_set_input_files(<ref-from-step-2>, [<path-from-step-3>])
+5. browser_snapshot               — verify: photo count incremented, new thumbnail visible
+
+DO NOT click "Add photo" or any other button before step 2's snapshot. The hidden file-input is surfaced directly in browser_snapshot for ~80% of upload widgets, including this one.
+
 TOOL BUDGET
 - Hard cap: 8 tool calls. If you can't finish by then, abort and report `exhausted`.
-- Prefer the structured tools — read SKILL.md guidance applies.
+- Happy path: 5 calls per the prescribed sequence above.
 
 REPORT BACK
 After the task is done (or when you abort), reply with EXACTLY this JSON shape on the LAST line of your reply, no markdown fences, no prose after it:
 
-{"tool_call_count": N, "tool_calls": ["tool_name_1", "tool_name_2", ...], "outcome": "success|failure|exhausted|error", "verification": "<one sentence describing what you saw in the final state>", "errors": ["..."] }
+{"tool_call_count": N, "tool_calls": ["tool_name_1", "tool_name_2", ...], "outcome": "success|unverified|failure|exhausted|error", "verification": "<one sentence describing what you saw in the final state>", "errors": ["..."] }
 
 Where:
-- tool_calls is the EXACT list of tool names you invoked, in order, including duplicates.
-- outcome=success means the photo count went up and you saw the new thumbnail.
-- outcome=exhausted means you hit the budget without completing.
+- tool_calls is the EXACT list of tool names you invoked, in order, including duplicates. Use the bare tool name (strip any mcp__ponder__ / mcp__holo3-browser__ prefix).
+- outcome=success REQUIRES (a) your last call to be browser_snapshot AND (b) the verification text to cite a specific post-state observation (e.g., "Photos · 2 / 10 + new thumbnail at e40"). Without both, report outcome=unverified.
+- outcome=unverified means the upload likely succeeded but you didn't take a final snapshot to prove it.
+- outcome=exhausted means you hit the budget without reaching browser_set_input_files.
 - outcome=error/failure means a tool returned a hard error you couldn't recover from.
-- verification: one sentence of evidence (e.g., "Photos · 2 / 10 in final snapshot, new thumbnail visible").
-- errors: array of any tool errors observed (Cancel/empty if none).
+- verification: one sentence of evidence (e.g., "Photos · 2 / 10 in final snapshot, new thumbnail visible at e40").
+- errors: array of any tool errors observed (Cancel/empty if none). Include the literal error message text.
 ````
 
 ## Running

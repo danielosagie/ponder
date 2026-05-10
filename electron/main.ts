@@ -54,6 +54,10 @@ let buddyWin: BrowserWindow | null = null;
 let providerName: ProviderName = computeDefaultProvider();
 let cancelFlag = false;
 let activeSessionId: string | null = null;
+let fleetWorkerId: string | null = null;
+let fleetHeartbeatTimer: NodeJS.Timeout | null = null;
+let fleetClaimTimer: NodeJS.Timeout | null = null;
+let fleetClaimInFlight = false;
 
 function computeDefaultProvider(): ProviderName {
   if (process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY) return "hcompany";
@@ -398,49 +402,70 @@ async function checkActionPermissions(): Promise<{
   };
 }
 
-function setupIpc(): void {
-  ipcMain.handle("agent:run", async (_e, prompt: string) => {
-    if (!prompt?.trim()) return { ok: false, error: "empty prompt" };
+interface RunAgentSessionArgs {
+  prompt: string;
+  /** When set, skip the sessions.create mutation — caller already claimed one. */
+  existingSessionId?: string;
+  /** When set, the run is on behalf of a fleet worker; releaseSession fires at end. */
+  workerId?: string;
+}
 
-    // Bail early if macOS hasn't granted Accessibility/Screen-Recording —
-    // otherwise the loop fires for 30 steps and nothing moves on screen.
-    const permsCheck = await checkActionPermissions();
-    if (!permsCheck.ok) {
-      const msg = permsCheck.message ?? "Missing permissions";
-      console.error(`[agent:run] blocked by perms: ${msg}`);
-      buddySay("error", msg);
-      // Auto-open the system pane that's missing — user is one click from fixing it.
-      void requestAccessibility();
-      void requestScreenRecording();
-      return { ok: false, error: msg };
-    }
+/**
+ * Core orchestrator: warmup → narrator intro → runTask → extractor →
+ * narrator summary → status mutation. Two callers:
+ *   1. The `agent:run` IPC handler (user typed into their own buddy bubble).
+ *   2. The fleet claim-poll loop in fleet.ts (a session arrived from an
+ *      SDK consumer's PonderClient.dispatch, claimed via workers.claimNext).
+ * The two paths share UI (narrator, extractor, buddy) so the customer's
+ * experience is identical regardless of who initiated the task.
+ */
+async function runAgentSession(
+  args: RunAgentSessionArgs,
+): Promise<{ ok: boolean; result?: string; error?: string }> {
+  const { prompt } = args;
+  if (!prompt?.trim()) return { ok: false, error: "empty prompt" };
 
-    cancelFlag = false;
+  // Bail early if macOS hasn't granted Accessibility/Screen-Recording —
+  // otherwise the loop fires for 30 steps and nothing moves on screen.
+  const permsCheck = await checkActionPermissions();
+  if (!permsCheck.ok) {
+    const msg = permsCheck.message ?? "Missing permissions";
+    console.error(`[agent:run] blocked by perms: ${msg}`);
+    buddySay("error", msg);
+    // Auto-open the system pane that's missing — user is one click from fixing it.
+    void requestAccessibility();
+    void requestScreenRecording();
+    return { ok: false, error: msg };
+  }
 
-    // The Buddy is already visible at all times. Activate its bubble mode +
-    // dismiss the input pill if it was open.
-    dismissInputPill();
-    setBuddyMode("active");
+  cancelFlag = false;
 
-    // Narrator intro — fires before warmup so the user hears the agent
-    // acknowledge their request immediately. Don't await before the buddy
-    // says SOMETHING; if the narrator is slow, fall back. We push a quick
-    // status first to never leave the user staring at silence.
-    buddySay("status", "Got it…");
-    void (async () => {
-      const line = await narrator.intro({ task: prompt });
-      buddySay("thought", line);
-    })();
+  // The Buddy is already visible at all times. Activate its bubble mode +
+  // dismiss the input pill if it was open.
+  dismissInputPill();
+  setBuddyMode("active");
 
-    let sessionId: string | null = null;
-    if (convex) {
-      sessionId = (await convex.mutation(convexApi.sessions.create, {
-        prompt,
-        provider: providerName,
-      })) as unknown as string;
-      activeSessionId = sessionId;
-      broadcastState();
-    }
+  // Narrator intro — fires before warmup so the user hears the agent
+  // acknowledge their request immediately. Don't await before the buddy
+  // says SOMETHING; if the narrator is slow, fall back. We push a quick
+  // status first to never leave the user staring at silence.
+  buddySay("status", "Got it…");
+  void (async () => {
+    const line = await narrator.intro({ task: prompt });
+    buddySay("thought", line);
+  })();
+
+  let sessionId: string | null = args.existingSessionId ?? null;
+  if (!sessionId && convex) {
+    sessionId = (await convex.mutation(convexApi.sessions.create, {
+      prompt,
+      provider: providerName,
+    })) as unknown as string;
+  }
+  if (sessionId) {
+    activeSessionId = sessionId;
+    broadcastState();
+  }
 
     void warmup.warmInBackground();
     if (warmup.getState() !== "ready") {
@@ -627,7 +652,27 @@ function setupIpc(): void {
       setBuddyMode("hidden");
       // Hide the agent's blue ghost cursor — the run is over.
       buddyAgentCursor(null);
+      // If this run was claimed from the fleet queue, free the worker so the
+      // next claimNext() pulls the subsequent pending session.
+      if (args.workerId && sessionId && convex) {
+        try {
+          await convex.mutation(convexApi.workers.releaseSession, {
+            workerId: args.workerId,
+            sessionId: sessionId as never,
+            status: "done",
+          });
+        } catch (e) {
+          console.warn(
+            `[fleet] releaseSession failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
     }
+}
+
+function setupIpc(): void {
+  ipcMain.handle("agent:run", async (_e, prompt: string) => {
+    return runAgentSession({ prompt });
   });
 
   ipcMain.handle("agent:cancel", () => {
@@ -866,6 +911,108 @@ function handleDeepLink(url: string): void {
   }).show();
 }
 
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const CLAIM_POLL_INTERVAL_MS = 5_000;
+
+/**
+ * Read or generate this machine's persistent worker id. Stored as
+ * `<userData>/worker.json` so re-launches reuse the same workers row in
+ * Convex (claimNext semantics depend on a stable id across restarts).
+ */
+function loadOrGenerateWorkerId(): string {
+  const path = join(app.getPath("userData"), "worker.json");
+  try {
+    const fs = require("node:fs") as typeof import("node:fs");
+    if (fs.existsSync(path)) {
+      const parsed = JSON.parse(fs.readFileSync(path, "utf-8")) as {
+        workerId?: string;
+      };
+      if (parsed.workerId) return parsed.workerId;
+    }
+    const id = require("node:crypto").randomUUID();
+    fs.mkdirSync(join(path, ".."), { recursive: true });
+    fs.writeFileSync(path, JSON.stringify({ workerId: id }, null, 2));
+    return id;
+  } catch (e) {
+    console.warn(
+      `[fleet] worker.json read/write failed (${e instanceof Error ? e.message : String(e)}) — using ephemeral id`,
+    );
+    return require("node:crypto").randomUUID();
+  }
+}
+
+/**
+ * Register this Ponder.app instance as a worker, start the heartbeat, and
+ * begin polling claimNext for SDK-dispatched sessions. Idempotent — calling
+ * twice is a no-op (used on Convex URL change).
+ */
+async function startFleetWorker(): Promise<void> {
+  if (!convex) return;
+  if (fleetWorkerId) return; // already started
+  fleetWorkerId = loadOrGenerateWorkerId();
+
+  const os = require("node:os") as typeof import("node:os");
+  try {
+    await convex.mutation(convexApi.workers.register, {
+      workerId: fleetWorkerId,
+      hostname: os.hostname(),
+      platform: process.platform as "darwin" | "win32" | "linux",
+      capabilities: ["desktop"],
+    });
+    console.log(`[fleet] registered worker ${fleetWorkerId} on ${os.hostname()}`);
+  } catch (e) {
+    console.warn(
+      `[fleet] worker.register failed (${e instanceof Error ? e.message : String(e)}) — will retry on next heartbeat`,
+    );
+  }
+
+  fleetHeartbeatTimer = setInterval(() => {
+    if (!convex || !fleetWorkerId) return;
+    void convex
+      .mutation(convexApi.workers.heartbeat, { workerId: fleetWorkerId })
+      .catch((e) => {
+        console.warn(
+          `[fleet] heartbeat failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      });
+  }, HEARTBEAT_INTERVAL_MS);
+
+  fleetClaimTimer = setInterval(() => {
+    void pollAndClaim();
+  }, CLAIM_POLL_INTERVAL_MS);
+  // Kick one immediately so the first claim doesn't wait 5s.
+  void pollAndClaim();
+}
+
+async function pollAndClaim(): Promise<void> {
+  if (!convex || !fleetWorkerId) return;
+  if (fleetClaimInFlight) return; // a previous claim is still running
+  if (activeSessionId) return; // local user is in the middle of a session
+  fleetClaimInFlight = true;
+  try {
+    const claimed = (await convex.mutation(convexApi.workers.claimNext, {
+      workerId: fleetWorkerId,
+      runtime: "desktop",
+    })) as null | { _id: string; prompt: string };
+    if (!claimed) return;
+    console.log(`[fleet] claimed session ${claimed._id} from queue`);
+    // runAgentSession is async-fire-and-forget here: we let it own the worker
+    // status (stays "busy" until releaseSession in the finally block) and
+    // pollAndClaim simply skips on its next tick because activeSessionId is set.
+    void runAgentSession({
+      prompt: claimed.prompt,
+      existingSessionId: claimed._id,
+      workerId: fleetWorkerId,
+    });
+  } catch (e) {
+    console.warn(
+      `[fleet] claimNext failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  } finally {
+    fleetClaimInFlight = false;
+  }
+}
+
 app.whenReady().then(() => {
   // Keep dock visible during dev so the user has a visual anchor; can hide
   // later via tray menu or remove this check entirely once tray icon ships.
@@ -979,6 +1126,24 @@ app.whenReady().then(() => {
     broadcastState({ warmup: "error", errorMessage: hint });
   } else {
     warmup.warmInBackground();
+  }
+
+  // Fleet: register this Ponder.app with the Convex deployment so SDK
+  // dispatches (PonderClient.dispatch) get routed here via workers.claimNext.
+  // No-op when convex is null (dev hasn't configured a deployment yet).
+  void startFleetWorker();
+});
+
+app.on("before-quit", () => {
+  if (fleetHeartbeatTimer) clearInterval(fleetHeartbeatTimer);
+  if (fleetClaimTimer) clearInterval(fleetClaimTimer);
+  // Best-effort: tell Convex we're going offline so the cron doesn't have to
+  // wait 45s before re-routing in-flight sessions.
+  if (convex && fleetWorkerId) {
+    void convex.mutation(convexApi.workers.heartbeat, {
+      workerId: fleetWorkerId,
+      status: "offline",
+    });
   }
 });
 

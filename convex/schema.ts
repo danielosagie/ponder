@@ -28,7 +28,31 @@ export default defineSchema({
     runtime: v.optional(
       v.union(v.literal("desktop"), v.literal("headless")),
     ),
-  }).index("by_created", ["createdAt"]),
+    // ---- v1.1 fleet fields (item 7) ----
+    // Set when a worker calls workers.claimNext and atomically transitions
+    // status pending → running. Optional so v1 sessions (no claim semantics)
+    // and SDK-dispatched sessions (un-targeted, claimed-by-anyone) round-trip
+    // through the schema unchanged.
+    claimedBy: v.optional(v.id("workers")),
+    claimedAt: v.optional(v.number()),
+    // Set the next phase (item 8) once Convex Auth scopes per-workspace.
+    // Self-host deployments leave this undefined; Ponder Cloud workspaces
+    // populate it on every dispatch via withWorkspace().
+    workspaceId: v.optional(v.string()),
+    // Optional dispatch hint from the SDK: if set, only the matching worker
+    // will claim this session (round-robin within a single dev's fleet —
+    // e.g. "always run customer X's tasks on customer X's Mac").
+    targetWorkerId: v.optional(v.string()),
+  })
+    .index("by_created", ["createdAt"])
+    // Drives the claimNext query. Worker filters by (workspaceId, status,
+    // runtime) and orders by createdAt for FIFO drain.
+    .index("by_status_runtime", [
+      "workspaceId",
+      "status",
+      "runtime",
+      "createdAt",
+    ]),
 
   steps: defineTable({
     sessionId: v.id("sessions"),
@@ -57,4 +81,36 @@ export default defineSchema({
     screenshotId: v.optional(v.id("_storage")),
     createdAt: v.number(),
   }).index("by_session", ["sessionId", "index"]),
+
+  // ---- v1.1 fleet (item 7) ----
+  // One row per Ponder.app instance pointed at this deployment. The desktop
+  // generates a UUID on first launch and persists it under app.getPath
+  // ("userData")/worker.json so re-launches reuse the same row.
+  workers: defineTable({
+    workerId: v.string(),
+    hostname: v.string(),
+    platform: v.union(
+      v.literal("darwin"),
+      v.literal("win32"),
+      v.literal("linux"),
+    ),
+    capabilities: v.array(
+      v.union(v.literal("desktop"), v.literal("headless")),
+    ),
+    workspaceId: v.optional(v.string()), // forward-compat for item 8
+    registeredAt: v.number(),
+    lastHeartbeatAt: v.number(),
+    status: v.union(
+      v.literal("idle"),
+      v.literal("busy"),
+      v.literal("offline"),
+    ),
+    currentSessionId: v.optional(v.id("sessions")),
+  })
+    .index("by_workerId", ["workerId"])
+    .index("by_workspace_status", [
+      "workspaceId",
+      "status",
+      "lastHeartbeatAt",
+    ]),
 });

@@ -10,6 +10,7 @@
 
 import type * as sessions from "../sessions.js";
 import type * as steps from "../steps.js";
+import type * as workers from "../workers.js";
 
 import type {
   ApiFromModules,
@@ -20,6 +21,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   sessions: typeof sessions;
   steps: typeof steps;
+  workers: typeof workers;
 }>;
 
 /**

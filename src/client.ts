@@ -42,6 +42,18 @@ export interface Step {
 export interface DispatchOptions {
   /** Override the client's default provider for this single dispatch. */
   provider?: ProviderName;
+  /**
+   * Mark this session as headless so the desktop fleet (item 7) ignores it
+   * and the SDK consumer is expected to drive it via `serveHeadless`.
+   * Defaults to "desktop".
+   */
+  runtime?: "desktop" | "headless";
+  /**
+   * Pin this session to a specific worker (matches workers.workerId in the
+   * fleet table). When omitted, any idle worker in the deployment can claim
+   * it via FIFO drain.
+   */
+  worker?: string;
 }
 
 export interface DispatchResult {
@@ -89,6 +101,8 @@ export class PonderClient {
     const sessionId = await this.http.mutation(anyApi.sessions.create, {
       prompt: task,
       provider: opts.provider ?? this.defaultProvider,
+      ...(opts.runtime ? { runtime: opts.runtime } : {}),
+      ...(opts.worker ? { targetWorkerId: opts.worker } : {}),
     });
     return { sessionId: String(sessionId) };
   }

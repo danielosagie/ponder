@@ -41,6 +41,8 @@
     "convex/schema.ts",
     "convex/sessions.ts",
     "convex/steps.ts",
+    "convex/workers.ts",
+    "convex/crons.ts",
     "convex/tsconfig.json",
     "scripts/setup-local.sh",
     "scripts/Holo3.Modelfile",

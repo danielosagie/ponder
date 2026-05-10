@@ -59,10 +59,13 @@ Click it once. The Ponder desktop app stores the URL in `~/Library/Application S
 
 ## How dispatch works
 
-The Convex schema is the **public protocol**. Two tables, both shipped in the package and copied into your project by `ponder init`:
+The Convex schema is the **public protocol**. Three tables, all shipped in the package and copied into your project by `ponder init`:
 
-- **`sessions`** — `{ prompt, provider, status, createdAt, endedAt?, error? }`. The SDK inserts a row with `status: "pending"`; the desktop app subscribes and starts running.
+- **`sessions`** — `{ prompt, provider, runtime?, status, claimedBy?, claimedAt?, targetWorkerId?, createdAt, endedAt?, error? }`. The SDK inserts a row with `status: "pending"`; a worker (Ponder.app instance) atomically claims it via `workers.claimNext` and runs it.
 - **`steps`** — append-only event log: `{ kind: thought | ground | action | screenshot | error | status | result, text?, coords?, action?, screenshotId?, index, createdAt }`. The agent loop streams these as it works; the SDK's `subscribe()` and the React `usePonderSession` hook surface them live.
+- **`workers`** — fleet table, one row per Ponder.app instance pointed at this deployment. Heartbeats every 15s; a Convex cron marks workers offline if heartbeat is older than 45s and releases their in-flight session back to `pending` so another worker can pick it up. Multiple Macs can point at the same deployment — claims are FIFO across the fleet.
+
+To pin a session to a specific worker (e.g. always run customer X's tasks on customer X's Mac), pass `{ worker: "their-worker-id" }` to `dispatch`. Otherwise any idle worker drains FIFO.
 
 There is no per-customer auth in v1 — anyone with the Convex URL can dispatch. Fine for closed beta, internal tools, and gated invite flows. Auth is on the v2 roadmap.
 

@@ -122,13 +122,19 @@ export function createRemoteProvider(cfg: RemoteConfig): ProviderClient {
       );
     },
     async groundBatch(args): Promise<GroundResult[]> {
-      // Timeout shaped to the inference cost: with llama-server --parallel 4
-      // on the Modal side, the first 4 prompts share a forward pass (~3-4s
-      // wall), and a 5th-onwards queues at the inference layer. Worst-case
-      // batch of 12 lands around (12/4)*4s = 12s plus warmup. Use 30s base
-      // + 6s per additional instruction past 1, capped reasonably.
+      // Timeout shaped to the inference cost. Bumped from (30s + 6s/extra)
+      // to (60s + 10s/extra) after observing the actual /ground/batch wall
+      // come in at 60.7s for N=6 on the May-10 llama.cpp build — JUST over
+      // the previous 60s ceiling, causing the TS client to abandon and
+      // fall back to Promise.all 0.7s before the server's response was
+      // already on the wire. The fallback path is slower (single /ground
+      // calls don't batch through llama-server's --parallel 4 slots once
+      // Modal's max_inputs=4 cap is hit), so a too-tight timeout actively
+      // makes things worse. With the bump, N=6 gets 60+50=110s, N=12 gets
+      // 60+110=170s — both safely within the Modal endpoint's 300s
+      // function ceiling.
       const n = args.instructions.length;
-      const timeoutMs = Math.min(180_000, 30_000 + Math.max(0, n - 1) * 6_000);
+      const timeoutMs = Math.min(180_000, 60_000 + Math.max(0, n - 1) * 10_000);
       // Server returns either {results: GroundResult[]} on success or
       // {error: "..."} on validation failure (empty list, oversized batch,
       // etc.). The error case throws so callers' fallback path can run

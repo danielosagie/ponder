@@ -461,7 +461,12 @@ function chainBridge<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-async function runAgentTaskForBridge(prompt: string): Promise<BridgeResult> {
+async function runAgentTaskForBridge(
+  opts: { prompt: string; targetApp?: string } | string,
+): Promise<BridgeResult> {
+  // Backwards-compat: prior callers passed a bare prompt string.
+  const { prompt, targetApp } =
+    typeof opts === "string" ? { prompt: opts, targetApp: undefined } : opts;
   // Mirror the perms gate from the IPC handler — better to fail fast
   // with an actionable message than 50 silent no-op steps.
   const permsCheck = await checkActionPermissions();
@@ -605,6 +610,13 @@ async function runAgentTaskForBridge(prompt: string): Promise<BridgeResult> {
       // which produced the dock-icon spin loops in the wild. Skip the
       // planner entirely. See loop.ts RunOptions.flat.
       flat: true,
+      // Optional macOS window crop. When set, every screenshot the loop
+      // takes is cropped to the front window of `targetApp` before
+      // being sent to plan/ground — empirically ~6× wall-time
+      // reduction on /ground/batch and a comparable reduction on
+      // /plan because image-patch tokens scale with pixel count. See
+      // src/agent/loop.ts maybeCropToTargetApp.
+      targetApp,
       onBrowserSnapshot: (snap) => {
         lastSnapshot = snap;
       },
@@ -724,14 +736,24 @@ function startBridgeServer(): void {
       req.on("end", () => {
         void (async () => {
           try {
-            const parsed = JSON.parse(body) as { task?: unknown };
+            const parsed = JSON.parse(body) as {
+              task?: unknown;
+              targetApp?: unknown;
+            };
             const task = typeof parsed.task === "string" ? parsed.task : "";
+            const targetApp =
+              typeof parsed.targetApp === "string" &&
+              parsed.targetApp.trim().length > 0
+                ? parsed.targetApp.trim()
+                : undefined;
             if (!task.trim()) {
               res.writeHead(400);
               res.end(JSON.stringify({ error: "empty task" }));
               return;
             }
-            const result = await chainBridge(() => runAgentTaskForBridge(task));
+            const result = await chainBridge(() =>
+              runAgentTaskForBridge({ prompt: task, targetApp }),
+            );
             res.writeHead(200);
             res.end(JSON.stringify(result));
           } catch (e: unknown) {

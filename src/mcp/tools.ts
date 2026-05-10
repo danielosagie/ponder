@@ -350,11 +350,13 @@ type ToolResult =
 async function tryForwardToBridge(
   task: string,
   sendProgress: (msg: string) => Promise<void>,
+  opts?: { targetApp?: string },
 ): Promise<{ isError: boolean; payload: ToolResult } | null> {
   if (!(await bridgeAvailable())) return null;
 
   await sendProgress(
-    `Forwarding to Electron bridge at :${BRIDGE_PORT} (Holo3 app handles the work)`,
+    `Forwarding to Electron bridge at :${BRIDGE_PORT} (Holo3 app handles the work)` +
+      (opts?.targetApp ? ` — targetApp="${opts.targetApp}"` : ""),
   );
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), BRIDGE_RUN_TIMEOUT_MS);
@@ -362,7 +364,10 @@ async function tryForwardToBridge(
     const res = await fetch(`http://127.0.0.1:${BRIDGE_PORT}/agent_do`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task }),
+      body: JSON.stringify({
+        task,
+        ...(opts?.targetApp ? { targetApp: opts.targetApp } : {}),
+      }),
       signal: ctrl.signal,
     });
     if (!res.ok) {
@@ -607,9 +612,27 @@ export function registerTools(server: McpServer): void {
               "into the brain's prompt as `(this is part of: …)` so it stays oriented " +
               "when the immediate task is just the next mechanical step.",
           ),
+        targetApp: z
+          .string()
+          .optional()
+          .describe(
+            "macOS-only speedup. When set, every screenshot the inner Holo3 loop " +
+              "takes is cropped to the front window of this process before being sent " +
+              "to /plan and /ground. Empirically a 6× wall-time reduction per step " +
+              "for a typical 230×408 app window vs. a 1512×982 full-screen capture " +
+              "(image-patch tokens scale with pixel count: ~4100 → ~175 per call). " +
+              "ALSO defends against the embedded-screenshot decoy (when a chat / IDE " +
+              "elsewhere on the same display is showing a screenshot of the same app, " +
+              "the vision model can ground against the picture instead of the real " +
+              "window — cropping deletes the decoy from the model's input). " +
+              "Use the System Events process name: 'Calculator', 'Finder', 'Safari', " +
+              "'Google Chrome', etc. Falls back to uncropped grounding silently if " +
+              "the app isn't running, has no front window, or the bridge's window-" +
+              "bounds query fails — never blocks the run.",
+          ),
       },
     },
-    async ({ task, surface, context, goal }, extra) => {
+    async ({ task, surface, context, goal, targetApp }, extra) => {
       return chainAgentDo(async () => {
         const t0 = Date.now();
 
@@ -709,7 +732,11 @@ export function registerTools(server: McpServer): void {
         // path would. The bridge protocol is task-only today; threading
         // surface/goal as separate fields is a follow-up that requires
         // an Electron-side bump.
-        const bridgeResult = await tryForwardToBridge(augmentedTask, sendProgress);
+        const bridgeResult = await tryForwardToBridge(
+          augmentedTask,
+          sendProgress,
+          { targetApp },
+        );
         if (bridgeResult !== null) {
           stderrLog(
             `[mcp] agent_do forwarded to bridge: outcome=${bridgeResult.isError ? "error" : "ok"}`,

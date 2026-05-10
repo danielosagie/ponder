@@ -158,6 +158,21 @@ export interface RunOptions {
    * normally on step 1.
    */
   surface?: string;
+  /**
+   * macOS-only optimization: when set, every screenshot captured by
+   * this loop is cropped to the front window of `targetApp` before
+   * being sent to the planner and grounder. Defends against the
+   * embedded-screenshot decoy AND drops `prompt_tokens` from ~4100
+   * (full 1512×982 display) to ~175 (typical 230×408 app window) —
+   * empirically a ~6× wall-time reduction on /ground/batch and a
+   * comparable reduction on /plan. Uses the existing
+   * screen.getMacWindowBounds() (which proxies through the Holo3
+   * bridge's /window/bounds endpoint so the bridge's Accessibility
+   * grant is used, not this process's). Falls through to uncropped
+   * grounding on any error (process not running, bounds-query timeout,
+   * crop math invalid).
+   */
+  targetApp?: string;
 }
 
 /**
@@ -170,6 +185,105 @@ export interface RunOptions {
  */
 function hashScreen(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex").slice(0, 16);
+}
+
+/**
+ * Crop a screenshot to the front window of the given macOS process and
+ * return a new Screenshot with adjusted offsets so the existing click-
+ * translation code (`coords = r.x + shot.offsetX, r.y + shot.offsetY`)
+ * resolves into screen-space coords correctly without any other changes.
+ *
+ * Returns the original shot unmodified on any failure path:
+ *   - non-darwin
+ *   - process not running / no front window
+ *   - bounds query timeout (osascript / bridge perms denied)
+ *   - Electron module unavailable (no nativeImage to crop with)
+ *   - computed crop rect doesn't fit inside the screenshot
+ *
+ * Logged in either case so the run transcript shows whether the crop
+ * fired and the resulting savings.
+ */
+async function maybeCropToTargetApp(
+  shot: screen.Screenshot,
+  targetApp: string | undefined,
+): Promise<screen.Screenshot> {
+  if (!targetApp || process.platform !== "darwin") return shot;
+  const tBounds = Date.now();
+  const bounds = await screen.getMacWindowBounds(targetApp);
+  if (!bounds) {
+    console.log(
+      `[loop] 🪟 crop skipped: getMacWindowBounds("${targetApp}") returned null in ${Date.now() - tBounds}ms — running uncropped this step.`,
+    );
+    return shot;
+  }
+  // Translate screen-space window bounds into screenshot-pixel space. On
+  // a single-display setup both offsets are 0; on multi-monitor where
+  // the cursor sits on the secondary display, shot.offsetX/Y carry that
+  // display's screen-space origin and we subtract to get a rect inside
+  // the captured PNG.
+  const cropX = bounds.x - shot.offsetX;
+  const cropY = bounds.y - shot.offsetY;
+  if (
+    cropX < 0 ||
+    cropY < 0 ||
+    cropX + bounds.width > shot.width ||
+    cropY + bounds.height > shot.height
+  ) {
+    console.log(
+      `[loop] 🪟 crop skipped: window rect ${bounds.width}×${bounds.height}@(${cropX},${cropY}) doesn't fit inside captured frame ${shot.width}×${shot.height} (window may be partially off-screen).`,
+    );
+    return shot;
+  }
+
+  // Electron's nativeImage is the only PNG decode/encode primitive we
+  // have in-process without adding a new dep. Lazy require so the
+  // module loads in Electron contexts (where the loop actually runs)
+  // and silently no-ops in non-Electron contexts (Jest, doctor scripts).
+  let nativeImage: typeof import("electron").nativeImage | undefined;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    nativeImage = (require("electron") as typeof import("electron")).nativeImage;
+  } catch {
+    console.log(
+      `[loop] 🪟 crop skipped: nativeImage unavailable (non-Electron context).`,
+    );
+    return shot;
+  }
+  if (!nativeImage) return shot;
+
+  const tCrop = Date.now();
+  try {
+    const img = nativeImage.createFromBuffer(shot.png);
+    const cropped = img.crop({
+      x: cropX,
+      y: cropY,
+      width: bounds.width,
+      height: bounds.height,
+    });
+    const croppedPng = cropped.toPNG();
+    console.log(
+      `[loop] 🪟 cropped to ${targetApp} (${bounds.width}×${bounds.height} @ ${cropX},${cropY} in screenshot): ` +
+        `bounds=${Date.now() - tBounds}ms, crop=${Date.now() - tCrop}ms, ` +
+        `${shot.png.length}→${croppedPng.length} bytes ` +
+        `(~${Math.round(((shot.width * shot.height) / (bounds.width * bounds.height)) * 10) / 10}× fewer pixels)`,
+    );
+    return {
+      png: croppedPng,
+      width: bounds.width,
+      height: bounds.height,
+      // Add the crop offset to the existing display offset so the
+      // click-translation site (`r.x + shot.offsetX`) still resolves
+      // into screen-space coords. Caller doesn't have to know about
+      // cropping — it's transparent to the rest of the loop.
+      offsetX: shot.offsetX + cropX,
+      offsetY: shot.offsetY + cropY,
+    };
+  } catch (e) {
+    console.log(
+      `[loop] 🪟 crop failed: ${e instanceof Error ? e.message : String(e)} — using uncropped`,
+    );
+    return shot;
+  }
 }
 
 /**
@@ -508,6 +622,13 @@ async function runOneSubtask(
     } else {
       shot = await screen.screenshot();
     }
+    // Crop to targetApp's front window if the caller requested it.
+    // Cheap — the bridge proxy resolves bounds in ~50ms when perms are
+    // granted, and Electron's nativeImage crop is sub-10ms. The savings
+    // downstream are large: ~6× faster /plan and /ground calls because
+    // image-patch tokens scale with pixel count and a typical app
+    // window is ~16× smaller than the full display.
+    shot = await maybeCropToTargetApp(shot, opts.targetApp);
     const screenHash = hashScreen(shot.png);
     console.log(
       `[loop] 📸 screenshot ${shot.width}x${shot.height} (${shot.png.length} bytes, ${Date.now() - t0}ms${prefetchUsed ? " prefetched" : ""}) hash=${screenHash}`,

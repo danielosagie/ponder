@@ -50,8 +50,18 @@ image = (
         "libgomp1",
     )
     .run_commands(
-        "git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp || "
-        "git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp",
+        # PINNED to llama.cpp tag b9082 (released ~2026-05-08, before the
+        # May-10 changes that broke our deploy). Without the pin, --depth 1
+        # tracked main and a recent rebuild pulled mmproj changes that
+        # (a) produce ~30 more image-tokens per screenshot (pushed prompts
+        # over the prior 4096 per-slot ceiling) and (b) made each forward
+        # pass over the image patches ~30× slower (~9.7s/target on L4 vs.
+        # ~0.33s/target previously). See bench/results/calculator-mouse-
+        # math-batched-opus-2026-05-10T16-48-14Z.json modal_inference_
+        # regression for the diagnosis. Bump this tag deliberately when
+        # you're ready to absorb behavior changes.
+        "git clone --depth 1 --branch b9082 https://github.com/ggml-org/llama.cpp /opt/llama.cpp || "
+        "git clone --depth 1 --branch b9082 https://github.com/ggerganov/llama.cpp /opt/llama.cpp",
         # The CUDA *driver* (libcuda.so.1) is not in the build container — it's
         # only on the GPU host at runtime. Point the linker at the CUDA stubs
         # so symbols (cuMemCreate, cuMemMap, …) resolve at link time, and add

@@ -135,8 +135,22 @@ export interface WindowBounds {
  * as the `.app` bundle name without ".app" (e.g. "Calculator", "Finder",
  * "Safari", "Google Chrome"). Case-sensitive.
  *
+ * Resolution order:
+ *   1. Holo3 Electron bridge at 127.0.0.1:7900/window/bounds. The
+ *      bridge has macOS Accessibility perms granted by the user (it's
+ *      what the user adds in System Settings → Privacy → Accessibility).
+ *      Routing the query through it sidesteps the perms gap when this
+ *      module runs from a tsx process (Claude Code's MCP child) that
+ *      DOES NOT have those perms — without this proxy, osascript would
+ *      hang for 2 minutes waiting on the user to dismiss a perms prompt
+ *      that never appears for a child process.
+ *   2. Local osascript fallback — for environments where the bridge
+ *      isn't running (smoke tests, doctor scripts, future headless
+ *      contexts). Same code as before; gated by a 2s timeout.
+ *
  * Returns null on any error: process not running, no window open,
- * Accessibility perms denied, non-darwin platform. Never throws.
+ * perms denied at every layer, non-darwin platform, malformed
+ * processName. Never throws.
  */
 export async function getMacWindowBounds(
   processName: string,
@@ -147,9 +161,88 @@ export async function getMacWindowBounds(
   // legitimate macOS process names don't have any of those.
   if (/["\\\n\r]/.test(processName)) return null;
 
-  // The script returns four integers comma-separated: "x, y, w, h".
-  // `position` is {x, y}, `size` is {w, h}; we concat both lists, AppleScript
-  // serializes lists as "1, 2, 3, 4". osascript's stdout terminator is "\n".
+  // 1) Bridge proxy. Cheap probe: 1.5s budget. Bridge resolves perms-
+  //    granted queries in ~50ms; if the bridge is down or slow, fall
+  //    through to the local path.
+  const bridgePort = Number(process.env.PONDER_BRIDGE_PORT ?? 7900);
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${bridgePort}/window/bounds`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ processName }),
+          signal: ctrl.signal,
+        },
+      );
+      if (res.ok) {
+        const j = (await res.json()) as
+          | { x: number; y: number; width: number; height: number }
+          | { error: string; detail?: string };
+        if ("error" in j) {
+          // Salvage path for the OLD bridge build that has the
+          // split-on-comma parser bug — when AppleScript serialized
+          // the integer-list as "690, ,, 334, ,, 230, ,, 408", the
+          // bridge returned `{error:"parse_failed", detail:<raw>}`
+          // instead of the parsed bounds. We can recover by pulling
+          // signed integers out of `detail` ourselves. Avoids
+          // requiring a second Electron restart for users who
+          // already restarted to pick up the route. Newer bridges
+          // (with the regex parser) won't hit this branch — they
+          // return the parsed bounds directly.
+          if (
+            j.error === "parse_failed" &&
+            typeof j.detail === "string"
+          ) {
+            const nums = (j.detail.match(/-?\d+/g) ?? []).map(Number);
+            if (
+              nums.length >= 4 &&
+              nums.every((n) => Number.isFinite(n)) &&
+              nums[2]! > 0 &&
+              nums[3]! > 0
+            ) {
+              return {
+                x: nums[0]!,
+                y: nums[1]!,
+                width: nums[2]!,
+                height: nums[3]!,
+              };
+            }
+          }
+          // Real error (missing, nowindow, perms denied at the
+          // bridge level). No point falling back to local osascript
+          // — it can only do worse, and hanging on a perms prompt
+          // would block the sequence.
+          return null;
+        }
+        if (
+          typeof j.x === "number" &&
+          typeof j.y === "number" &&
+          j.width > 0 &&
+          j.height > 0
+        ) {
+          return { x: j.x, y: j.y, width: j.width, height: j.height };
+        }
+        return null;
+      }
+      // Non-2xx — fall through to local. The bridge being up but
+      // returning 4xx/5xx is rare and worth retrying via the local
+      // path before giving up entirely.
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    // Bridge unreachable (not running, port closed, ECONNREFUSED).
+    // Try the local osascript path so non-bridge contexts still work.
+  }
+
+  // 2) Local osascript fallback. Same script the bridge runs; works
+  //    only when the spawning process itself has Accessibility perms
+  //    (rare for tsx/Node spawned by Claude Code, common for tests
+  //    run from a terminal that DOES have perms granted).
   const script = `tell application "System Events"
   if not (exists process "${processName}") then return "missing"
   tell process "${processName}"
@@ -168,16 +261,17 @@ end tell`;
     );
     const out = stdout.trim();
     if (out === "missing" || out === "nowindow") return null;
-    // AppleScript's `&` joins lists with ", " — accept either ", " or "," to be safe.
-    const parts = out.split(/\s*,\s*/).map((s) => Number(s.trim()));
-    if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) {
+    // AppleScript's `&` on integers builds a list ({n, ",", n, ...}) which
+    // renders as "690, ,, 334, ,, 230, ,, 408" — split-on-comma fails. Pull
+    // signed integers directly via regex; first 4 in order are x,y,w,h.
+    const nums = (out.match(/-?\d+/g) ?? []).map(Number);
+    if (nums.length < 4 || nums.some((n) => !Number.isFinite(n))) {
       return null;
     }
-    const [x, y, w, h] = parts as [number, number, number, number];
+    const [x, y, w, h] = nums as [number, number, number, number];
     if (w <= 0 || h <= 0) return null;
     return { x, y, width: w, height: h };
   } catch {
-    // osascript not found, perms denied, timeout, target app not running, etc.
     return null;
   }
 }

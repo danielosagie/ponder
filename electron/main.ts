@@ -11,6 +11,7 @@ import {
   Notification,
 } from "electron";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { ConvexHttpClient } from "convex/browser";
@@ -983,6 +984,109 @@ function startBridgeServer(): void {
       return;
     }
 
+    // POST /window/bounds → { processName } → { x, y, width, height } | { error }
+    //
+    // Proxy for `osascript -e 'tell process "<name>" to get position+size of
+    // window 1'`, exposed here so callers in the MCP server (which runs in a
+    // separate tsx process WITHOUT macOS Accessibility permissions) can use
+    // THIS process's existing Accessibility grant. The bridge is the only
+    // process the user grants Accessibility to in System Settings; routing
+    // window-bounds queries through here closes that perms gap for the
+    // `agent_click_sequence` `targetApp` cropping path.
+    //
+    // Returns { error: "missing"|"nowindow"|"perm_denied"|<message> } on
+    // failure (caller treats any error as "fall back to uncropped").
+    if (method === "POST" && url === "/window/bounds") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { processName } = (parsed as { processName?: unknown }) ?? {};
+        if (typeof processName !== "string" || processName.trim().length === 0) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "processName required (string)" }));
+          return;
+        }
+        // Defensive: reject characters that could escape AppleScript string
+        // quoting. Legitimate macOS process names don't carry quotes,
+        // backslashes, or newlines.
+        if (/["\\\n\r]/.test(processName)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "processName contains invalid characters" }));
+          return;
+        }
+        if (process.platform !== "darwin") {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: "non-darwin platform" }));
+          return;
+        }
+        const script =
+          `tell application "System Events"\n` +
+          `  if not (exists process "${processName}") then return "missing"\n` +
+          `  tell process "${processName}"\n` +
+          `    if (count of windows) is 0 then return "nowindow"\n` +
+          `    set p to position of front window\n` +
+          `    set s to size of front window\n` +
+          `    return (item 1 of p as integer) & "," & (item 2 of p as integer) & "," & (item 1 of s as integer) & "," & (item 2 of s as integer)\n` +
+          `  end tell\n` +
+          `end tell`;
+        // Tight 1.5s timeout — perms-granted queries return in ~50ms;
+        // perms-denied hangs until the system prompt is dismissed (default
+        // 2 minutes), which is way too long for an interactive sequence.
+        execFile(
+          "/usr/bin/osascript",
+          ["-e", script],
+          { timeout: 1500, encoding: "utf-8" },
+          (e, stdout, stderr) => {
+            if (e) {
+              res.writeHead(200);
+              res.end(
+                JSON.stringify({
+                  error: "osascript_failed",
+                  detail:
+                    (stderr && String(stderr).trim()) ||
+                    (e instanceof Error ? e.message : String(e)),
+                }),
+              );
+              return;
+            }
+            const out = String(stdout).trim();
+            if (out === "missing" || out === "nowindow") {
+              res.writeHead(200);
+              res.end(JSON.stringify({ error: out }));
+              return;
+            }
+            // AppleScript's `&` operator on integers produces a LIST, not a
+            // string — so `(item 1 of p) & "," & (item 2 of p) & ...` returns
+            // `{690, ",", 334, ",", 230, ",", 408}` which serializes with
+            // ", " separators as `"690, ,, 334, ,, 230, ,, 408"`. Splitting
+            // on comma yields 7 fragments with 3 empties. Robust fix: pull
+            // any signed integers out of the output via regex. Works
+            // regardless of how AppleScript renders the list.
+            const nums = (out.match(/-?\d+/g) ?? []).map(Number);
+            if (nums.length < 4 || nums.some((n) => !Number.isFinite(n))) {
+              res.writeHead(200);
+              res.end(
+                JSON.stringify({ error: "parse_failed", detail: out }),
+              );
+              return;
+            }
+            const [x, y, w, h] = nums as [number, number, number, number];
+            if (w <= 0 || h <= 0) {
+              res.writeHead(200);
+              res.end(JSON.stringify({ error: "zero_size" }));
+              return;
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ x, y, width: w, height: h }));
+          },
+        );
+      });
+      return;
+    }
+
     if (method === "POST" && url === "/screen/scroll") {
       readJsonBody((parsed, err) => {
         if (err) {
@@ -1405,7 +1509,7 @@ function buildTray(): void {
     // No icon file — use an empty image but set a title so the user can see it
     // in the menu bar. macOS will render the title text instead of an icon.
     tray = new Tray(nativeImage.createEmpty());
-    if (process.platform === "darwin") tray.setTitle("◐ Holo3");
+    if (process.platform === "darwin") tray.setTitle("◐ Ponder"); //Tray title
   } else {
     tray = new Tray(icon);
   }

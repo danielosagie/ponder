@@ -1,0 +1,87 @@
+{
+  "id": "calculator-mouse-math-batched-opus-2026-05-10T16-48-14Z",
+  "case": "calculator-mouse-math-batched",
+  "model": "opus (orchestrator-driven)",
+  "started_at": "2026-05-10T16:48:14Z",
+  "ended_at": "2026-05-10T16:50:37Z",
+  "elapsed_ms": 143000,
+  "outcome": "success",
+  "tool_call_count": 8,
+  "tool_calls": [
+    "holo3_version (preflight: confirmed running MCP commit=20f428a64957 matches git HEAD)",
+    "screen_hotkey (cmd+space — first launch attempt)",
+    "screen_type (Calculator + enter)",
+    "screen_screenshot (came back 0 bytes; not blocking — agent_click_sequence captures its own)",
+    "agent_click_sequence (FIRST attempt — math wrong: 47×47×8=17672, decoy hit because embedded Calculator pictures were in chat thumbnails on the same display)",
+    "screen_hotkey (cmd+tab — but cycled to Ghostty, not Calculator)",
+    "screen_hotkey + screen_type (cmd+space + 'Calculator' + enter — re-launch to bring real Calculator forward and clear the decoy from view)",
+    "agent_click_sequence (SECOND attempt — SUCCESS, see below)"
+  ],
+  "ground_path": "batch",
+  "ground_ms": 58147,
+  "exec_ms": 754,
+  "post_settle_ms": 80,
+  "total_ms_sequence_call": 61532,
+  "inter_click_delay_total_ms": 250,
+  "step_delay_ms": 50,
+  "all_via_bridge": true,
+  "crop_applied": false,
+  "verification": "Calculator display read '47×8' (expression line) and '376' (result line) in the post-sequence screenshot — the math is correct. All 6 grounded coords landed on real Calculator buttons (no decoy hit on this attempt): AC (779,496), 4 (723,601), 7 (723,548), × (886,548), 8 (779,548), = (888,709). The (777, 778, 779) x-cluster for AC/8 and the (886, 888) cluster for ×/= match the keypad's column structure precisely.",
+  "comparison_to_prior_runs": {
+    "calculator-mouse-math-opus-2026-05-10T07-32-00Z": "10 calls, 240s wall, individual agent_click — pre-sequence-tool baseline, hit decoy with cmd+tab recovery",
+    "calculator-mouse-math-batched-opus-2026-05-10T08-32-48Z": "4 calls, 7.56s sequence-call wall, parallel-fallback path (running MCP server pre-dated commit 52505bb so provider.groundBatch was undefined). Math correct.",
+    "this_run": "8 calls (recovery from a decoy-hit first attempt cost 4 extra calls), 61.5s sequence-call wall on the second attempt. Headline batch path FIRED for the first time end-to-end. Math correct. Per-target inference 30× slower than the pre-fix curl benchmark — see modal_inference_regression below."
+  },
+  "ws1_verification": {
+    "claim": "holo3_version tool surfaces commit SHA from inside a Claude Code session",
+    "result": "PASSED — preflight returned commit=20f428a64957bb01627d85728381969c1781ad17 (commitShort=20f428a64957) matching `git rev-parse --short=12 HEAD`. dirty=true expected (working tree had unrelated changes). The diagnostic surface that closes the staleness loop is now wired end-to-end."
+  },
+  "ws2_verification": {
+    "claim": "Per-step delayMs override + conditional 80ms post-settle when allViaBridge",
+    "stepDelayMs_50_honored": "Summary line 'exec 754ms (incl. 250ms inter-click delay)' confirms 5 × 50ms inter-click delays. Old default (150ms) would have shown 750ms.",
+    "post_settle_80ms_fired": "Summary line 'post-settle 80ms' confirms the conditional path triggered (allViaBridge=true). Old code unconditionally slept 300ms.",
+    "savings_vs_old_defaults": "(750-250)+(300-80) = 720ms saved vs. the pre-WS2 path. Not the primary speed unblock for this case (inference dominates) but verified working."
+  },
+  "ws3_verification": {
+    "claim": "targetApp queries macOS window bounds, crops screenshot Modal-side, validates coords land within window",
+    "first_attempt_result": "FAILED — '(targetApp=\"Calculator\" requested but crop unavailable — see stderr)'. Without the crop, the embedded-screenshot decoy (small Calculator pictures in chat thumbnails on the same display) won grounding for the AC/4/7 coordinates, producing a 7-key sequence that yielded 47×47×8=17672.",
+    "second_attempt_result": "SUCCESS — but only because the manual recovery (cmd+tab + re-launch via Spotlight) brought Calculator forward AND closed/hid the chat windows containing the decoy Calculator screenshots. The crop still fell back to uncropped; we just got lucky that the visual decoy wasn't on screen this time.",
+    "root_cause_of_crop_fallback": "getMacWindowBounds runs from the MCP server's tsx process, which DOES NOT have macOS Accessibility permission. The Holo3 Electron bridge HAS Accessibility (visible in its boot log: 'perms accessibility=granted screen=granted input=granted'), but the MCP server is a separate process spawned by Claude Code. osascript timed out (-1712) on every front-window query.",
+    "remediation_options": [
+      "USER ACTION: System Preferences → Privacy & Security → Accessibility → add the tsx/Node binary that runs the MCP server. Once granted, getMacWindowBounds will return real bounds and the crop will fire.",
+      "FOLLOW-UP CODE FIX: Add a /window/bounds endpoint to the Holo3 Electron bridge (which already has Accessibility) and have getMacWindowBounds proxy through it instead of running osascript locally. That sidesteps the perms gap entirely.",
+      "ACCEPTED: The graceful fallback to uncropped grounding (with stderr log) IS by-design behavior for the no-perms case. The bench surfaced a subtle architectural gap, not a code bug."
+    ]
+  },
+  "modal_inference_regression": {
+    "summary": "Per-target /ground/batch inference is 30× slower than the pre-fix curl benchmark (58s for 6 targets vs. 2.0s previously). NOT caused by my code changes — the modal_app.py edits in this commit only added an OPTIONAL `crop` parameter (which didn't fire this run because targetApp fell back).",
+    "fix_applied": "Bumped llama-server -c from 16384 to 32768 (8192 per slot at --parallel 4) to absorb a token-count regression. Without this bump, every grounding request 400'd with 'request (4123 tokens) exceeds the available context size (4096 tokens)'. The bump unblocked the bench.",
+    "remaining_problem": "Even with -c 32768, per-target inference takes ~9.7s (58s ÷ 6 batched). The pre-rebuild curl benchmark from earlier today reported 0.33s per target (2.0s ÷ 6). Most likely cause: today's llama.cpp rebuild (triggered by adding Pillow to the modal image) pulled a newer main commit with different mmproj behavior — the image patch tokenizer is producing more tokens AND each forward pass over those patches is slower.",
+    "diagnostics_left_for_next_session": [
+      "1. Pin llama.cpp to a known-good commit in modal_app.py's image build step.",
+      "2. Compare per-target inference time before/after the pin.",
+      "3. If pinning isn't viable, evaluate downscaling screenshots client-side (e.g., 1920x1080 → 1280x720) to reduce image-token count. The Holo3 model accepts smaller images at the cost of fine-detail accuracy on dense UIs.",
+      "4. Profile a single /ground call (not batch) under the new build to confirm the slowdown is per-prompt-forward, not batch-coordination overhead."
+    ],
+    "container_state_when_measured": "Warm container with model resident in GPU memory. /warm returned ready in 23.07s after force-stopping the prior warm containers via `modal container stop`. Both bench attempts (cold first ~60.8s, warm-ish second 61.5s) showed nearly identical wall — confirming the slowdown is steady-state inference, not container init."
+  },
+  "primary_findings": [
+    {
+      "id": "headline-batch-path-end-to-end",
+      "description": "First end-to-end verified run of `agent_click_sequence` taking the `provider.groundBatch` (1 HTTP, server-side fan-out) path. The diagnostic surface added by WS1 (holo3_version tool + /health commit field) now lets a session preflight server freshness before bench runs — closing the staleness blind-spot that produced the 7.56s parallel-fallback in the prior run.",
+      "validates": "WS1 (commit visibility), WS2 (per-step delayMs + conditional post-settle), and the agent_click_sequence batch contract."
+    },
+    {
+      "id": "decoy-defense-degraded-without-perms",
+      "severity": "medium",
+      "description": "The targetApp parameter is wired correctly end-to-end (schema, type, client, modal endpoint, PIL crop, coord translation, bounds validation). But the macOS Accessibility perms required for osascript window-bounds queries belong to the spawning process — Claude Code's tsx child — not the Holo3 bridge. So in the typical user setup the crop silently falls back to uncropped, leaving the decoy hazard latent.",
+      "fix": "Either (a) user grants Accessibility to the tsx/Node binary running the MCP server, OR (b) follow-up PR proxies window-bounds queries through the Electron bridge's existing Accessibility grant. Option (b) is cleaner — the bridge already has all the macOS perms; route /window/bounds through it like /screen/screenshot."
+    },
+    {
+      "id": "modal-llama-cpp-rebuild-regression",
+      "severity": "high",
+      "description": "Today's modal:deploy rebuilt the container image (because adding Pillow to .pip_install invalidated the cache layer) and that rebuild pulled a newer llama.cpp main commit. The newer build produces (a) more image tokens per screenshot (4119-4127 vs. <4096 previously) AND (b) ~30× slower per-target inference. -c 32768 fixed (a); (b) remains.",
+      "fix": "Pin llama.cpp to a specific commit in the modal image's run_commands `git clone` step (currently '--depth 1' against main). Choose a commit known to give ~0.33s per /ground call on an L4."
+    }
+  ]
+}

@@ -198,14 +198,22 @@ class Holo3:
             "--host", "127.0.0.1",
             "--port", str(LLAMA_PORT),
             "-ngl", "999",
-            # Context budget. With --parallel 4 below, llama.cpp splits this
-            # into 4 KV-cache slots (~4096 tokens each — was 8192/1).
-            # 4096/slot is plenty for grounding (image patches + ~50 tokens
-            # prompt + 256 max_tokens output) and brain (~512 tokens prompt
-            # + 256 output). Bumped 8192 → 16384 so each slot still gets
-            # 4k post-split rather than 2k. Cost: ~2-3 GB more KV cache,
-            # well within the L4's 24 GB headroom (model is ~17 GB).
-            "-c", "16384",
+            # Context budget. With --parallel 4 below, llama.cpp splits
+            # this into 4 KV-cache slots (-c / --parallel = per-slot
+            # ceiling). For grounding the prompt is ~50 tokens of text
+            # plus the mmproj's image patches; for an L4-typical screen
+            # capture the patch count alone is ~4000-4100 tokens. The
+            # 16384/4 = 4096 per-slot budget we previously ran with was
+            # JUST under that — we got bitten by a rebuild that nudged
+            # the patch tokenizer slightly, pushing prompts to 4119-4127
+            # tokens and producing exceed_context_size_error 400s on
+            # every grounding call (see commit log).
+            #
+            # 32768/4 = 8192 per slot doubles the headroom, comfortably
+            # absorbs any future patch-tokenizer drift, and stays well
+            # within the L4's 24 GB total (model ~17 GB; the extra KV
+            # cache is ~4-6 GB).
+            "-c", "32768",
             # CONTINUOUS BATCHING — the unlock for ground_batch and for
             # parallel agent_click_sequence-style fan-outs. Without this,
             # llama-server processes ONE request at a time even when the

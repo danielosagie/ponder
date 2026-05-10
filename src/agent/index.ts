@@ -18,6 +18,13 @@ export type {
 export type { ClickOpts, Screenshot, ScreenAdapter } from "./screen/types";
 export { createNutScreenAdapter } from "./screen/nut";
 export { createNoopScreenAdapter } from "./screen/noop";
+export {
+  createHeadlessScreenAdapter,
+  HeadlessVisionActionError,
+} from "./screen/headless";
+
+export { createConvexEvents } from "./events/convex";
+export type { ConvexEventsOptions } from "./events/convex";
 
 export {
   createRemoteProvider,

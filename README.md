@@ -98,6 +98,26 @@ ollama serve
 npx ponder set-provider local
 ```
 
+## Headless serving (`ponder/server`)
+
+For browser-only automation where there's no end-user machine in the loop — background jobs, scheduled scrapers, server-side workflows. Sessions are marked `runtime: "headless"` so item 7's desktop fleet doesn't try to claim them, but they still stream through Convex so `PonderClient.subscribe()` works for observability.
+
+```ts
+import { serveHeadless } from "ponder/server";
+
+const result = await serveHeadless({
+  task: "go to example.com and read the page title",
+  convexUrl: process.env.VITE_CONVEX_URL!,
+  provider: { name: "hcompany", apiKey: process.env.HAI_API_KEY! },
+  // Optional — bring your own Playwright wrapper for browser actions.
+  // Without one, every action throws HeadlessVisionActionError because
+  // there's no screen to fall back to.
+  browser: yourBrowserClient,
+});
+
+console.log(result.outcome, result.sessionId);
+```
+
 ## Embedded mode (`ponder/agent`)
 
 For advanced consumers who want to run the agent loop inside their own Node process instead of dispatching to the desktop app:

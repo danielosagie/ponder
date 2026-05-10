@@ -9,11 +9,15 @@ export const create = mutation({
       v.literal("local"),
       v.literal("hcompany"),
     ),
+    runtime: v.optional(
+      v.union(v.literal("desktop"), v.literal("headless")),
+    ),
   },
   handler: async (ctx, args) => {
     return await ctx.db.insert("sessions", {
       prompt: args.prompt,
       provider: args.provider,
+      runtime: args.runtime,
       status: "pending",
       createdAt: Date.now(),
     });

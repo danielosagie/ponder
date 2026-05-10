@@ -19,6 +19,15 @@ export default defineSchema({
     ),
     endedAt: v.optional(v.number()),
     error: v.optional(v.string()),
+    // Where this session is meant to run. "desktop" is the default and the
+    // legacy behavior — a Ponder.app on the customer's Mac picks it up.
+    // "headless" means the SDK consumer is running the loop themselves in a
+    // Node process via `ponder/server`'s serveHeadless(); the desktop fleet
+    // (item 7) filters these out so they're not double-claimed.
+    // Optional for forward-compat: undefined = treated as "desktop".
+    runtime: v.optional(
+      v.union(v.literal("desktop"), v.literal("headless")),
+    ),
   }).index("by_created", ["createdAt"]),
 
   steps: defineTable({

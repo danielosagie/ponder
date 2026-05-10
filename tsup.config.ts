@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     index: "src/index.ts",
     "agent/index": "src/agent/index.ts",
+    server: "src/server.ts",
     react: "src/react.ts",
     "cli/index": "src/cli/index.ts",
   },

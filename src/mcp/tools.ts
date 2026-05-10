@@ -27,7 +27,11 @@ import {
   makeRouter,
   humanProviderLabel,
 } from "../agent/factory.js";
-import type { AgentEvents, ProviderClient } from "../agent/types.js";
+import type {
+  AgentEvents,
+  GroundResult,
+  ProviderClient,
+} from "../agent/types.js";
 import type { RouterClient } from "../agent/router.js";
 
 const stderrLog = (...args: unknown[]): void => {
@@ -2091,16 +2095,55 @@ export function registerTools(server: McpServer): void {
       // 2. Parallel grounding — all targets fire simultaneously against the
       //    same screenshot bytes. Total wall time ≈ max(per-call grounding)
       //    instead of sum, which is the whole point of this tool.
+      //
+      //    PREFER provider.groundBatch when available: ONE HTTP round-trip,
+      //    ONE image upload, server-side fan-out into the model's parallel
+      //    inference slots (e.g. llama-server --parallel 4 on Modal). Falls
+      //    back to N parallel ground() calls when the provider doesn't
+      //    implement batch — still saves the per-call screenshot capture
+      //    but pays N HTTP round-trips.
       const tGroundStart = Date.now();
-      const groundResults = await Promise.all(
-        steps.map((s) =>
-          provider.ground({
-            instruction: s.target,
+      let groundResults: GroundResult[];
+      let groundPath: "batch" | "parallel-fallback";
+      if (typeof provider.groundBatch === "function") {
+        try {
+          groundResults = await provider.groundBatch({
+            instructions: steps.map((s) => s.target),
             screenshotB64,
             screen: [width, height],
-          }),
-        ),
-      );
+          });
+          groundPath = "batch";
+        } catch (e) {
+          // Server-side batch errors out (validation failure, container
+          // crash, etc.) — fall through to the per-call path so the
+          // sequence still has a chance to land. The orchestrator will
+          // see the slower wall time but doesn't have to retry by hand.
+          console.error(
+            `[agent_click_sequence] provider.groundBatch failed (${e instanceof Error ? e.message : String(e)}); falling back to N parallel ground() calls`,
+          );
+          groundResults = await Promise.all(
+            steps.map((s) =>
+              provider.ground({
+                instruction: s.target,
+                screenshotB64,
+                screen: [width, height],
+              }),
+            ),
+          );
+          groundPath = "parallel-fallback";
+        }
+      } else {
+        groundResults = await Promise.all(
+          steps.map((s) =>
+            provider.ground({
+              instruction: s.target,
+              screenshotB64,
+              screen: [width, height],
+            }),
+          ),
+        );
+        groundPath = "parallel-fallback";
+      }
       const tGround = Date.now() - tGroundStart;
 
       // 3. Fail-fast if ANY ground failed. The orchestrator gets a clear
@@ -2208,10 +2251,14 @@ export function registerTools(server: McpServer): void {
             c.mode !== "single" ? ` [${c.mode}]` : ""
           }`,
       );
+      const groundLabel =
+        groundPath === "batch"
+          ? `provider.groundBatch (1 HTTP, server-side fan-out)`
+          : `Promise.all of ${steps.length} ground() calls`;
       const summary =
         `Clicked ${clicked.length} targets in sequence, sharing one screenshot:\n` +
         perStepLines.join("\n") +
-        `\nGround (parallel, ${steps.length} targets) ${tGround}ms, ` +
+        `\nGround via ${groundLabel}: ${tGround}ms, ` +
         `exec ${tExec}ms (incl. ${(steps.length - 1) * delayMs}ms inter-click delay), ` +
         `total ${totalMs}ms. ` +
         (allViaBridge ? "(via Electron bridge) " : "") +

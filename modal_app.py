@@ -194,7 +194,26 @@ class Holo3:
             "--host", "127.0.0.1",
             "--port", str(LLAMA_PORT),
             "-ngl", "999",
-            "-c", "8192",
+            # Context budget. With --parallel 4 below, llama.cpp splits this
+            # into 4 KV-cache slots (~4096 tokens each — was 8192/1).
+            # 4096/slot is plenty for grounding (image patches + ~50 tokens
+            # prompt + 256 max_tokens output) and brain (~512 tokens prompt
+            # + 256 output). Bumped 8192 → 16384 so each slot still gets
+            # 4k post-split rather than 2k. Cost: ~2-3 GB more KV cache,
+            # well within the L4's 24 GB headroom (model is ~17 GB).
+            "-c", "16384",
+            # CONTINUOUS BATCHING — the unlock for ground_batch and for
+            # parallel agent_click_sequence-style fan-outs. Without this,
+            # llama-server processes ONE request at a time even when the
+            # Modal class is configured for max_inputs=4 — the four
+            # concurrent in-flight Modal calls all serialize through the
+            # single llama-server inference slot, defeating the point.
+            # With --parallel 4, llama.cpp interleaves up to 4 prompts in
+            # the same forward pass; total throughput for batches ≤ 4 ≈
+            # one request's wall time + a small overhead, which is
+            # exactly what makes the batch endpoint a 4× speedup instead
+            # of a wash.
+            "--parallel", "4",
             "--no-warmup",
             # NB: --log-disable removed. We need llama-server's stderr in Modal
             # logs when image loading or chat-template rendering fails — the
@@ -210,6 +229,15 @@ class Holo3:
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
         self.client = httpx.Client(
+            base_url=f"http://127.0.0.1:{LLAMA_PORT}",
+            timeout=httpx.Timeout(120.0, connect=5.0),
+        )
+        # Separate async client so ground_batch() can fire N concurrent
+        # POSTs to llama-server's --parallel slots via asyncio.gather.
+        # httpx's sync Client and AsyncClient are independent — keeping
+        # both means the existing sync ground()/plan() methods don't have
+        # to change, and ground_batch can use the async path natively.
+        self.aclient = httpx.AsyncClient(
             base_url=f"http://127.0.0.1:{LLAMA_PORT}",
             timeout=httpx.Timeout(120.0, connect=5.0),
         )
@@ -371,6 +399,99 @@ class Holo3:
         y = max(0, min(screen_h - 1, y))
         return {"x": x, "y": y, "raw": [rx, ry], "usage": out.get("usage", {})}
 
+    # ---- Eyes (batched grounder) ----
+
+    async def _ground_one_async(
+        self,
+        instruction: str,
+        screenshot_b64: str,
+        screen_w: int,
+        screen_h: int,
+    ) -> dict[str, Any]:
+        """Async single-target grounding. Same shape as ground() but uses
+        the async httpx client so multiple calls can fan out to
+        llama-server's --parallel slots simultaneously via asyncio.gather.
+
+        Returns the same dict shape as ground() — caller (ground_batch)
+        builds a list[dict] and the endpoint forwards it. Errors are
+        returned as {"error": ..., "raw_text": ...} so a partial batch
+        success is representable (vs. raising and aborting the whole
+        batch on a single bad target).
+        """
+        system = (
+            "You return (x,y) coordinates to click as JSON: "
+            "{\"x\": <int 0-1000>, \"y\": <int 0-1000>} "
+            "where coordinates are normalized to a 1000x1000 grid over the screenshot."
+        )
+        user_text = f"Click target: {instruction}"
+
+        body = {
+            "messages": self._messages(system, user_text, screenshot_b64),
+            "temperature": 0.0,
+            "max_tokens": 256,
+            "grammar": GROUND_GRAMMAR,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        try:
+            r = await self.aclient.post("/v1/chat/completions", json=body)
+        except Exception as e:
+            return {"error": f"llama-server request failed: {e!r}"}
+        if r.status_code != 200:
+            return {
+                "error": (
+                    f"llama-server /v1/chat/completions returned {r.status_code}: "
+                    f"{r.text[:300]}"
+                )
+            }
+        out = r.json()
+        raw = _strip_think(out["choices"][0]["message"]["content"])
+
+        coords = self._parse_xy(raw)
+        if coords is None:
+            return {"error": f"could not parse coordinates: {raw[:120]}", "raw_text": raw}
+
+        rx, ry = coords
+        x = int(round((rx / 1000.0) * screen_w)) if rx <= 1000 else int(rx)
+        y = int(round((ry / 1000.0) * screen_h)) if ry <= 1000 else int(ry)
+        x = max(0, min(screen_w - 1, x))
+        y = max(0, min(screen_h - 1, y))
+        return {"x": x, "y": y, "raw": [rx, ry], "usage": out.get("usage", {})}
+
+    @modal.method()
+    async def ground_batch(
+        self,
+        instructions: list[str],
+        screenshot_b64: str,
+        screen_w: int,
+        screen_h: int,
+    ) -> list[dict[str, Any]]:
+        """Ground N instructions against ONE screenshot.
+
+        Mechanically: fires N concurrent POSTs to llama-server via the
+        async client, all sharing the same screenshot bytes (the image
+        is encoded once in this Python process and embedded in each
+        request's content list). With --parallel 4 on llama-server,
+        up to 4 prompts run in the same forward pass; for batches > 4,
+        the extra requests queue at llama-server's level (not Modal's),
+        so we don't burn additional containers.
+
+        Wall time ≈ ceil(N / 4) × per-request-time + small overhead,
+        vs. N × per-request-time for sequential single calls. For N=6
+        on an L4 that typically lands at ~5s vs. ~15s.
+
+        Returns a list of N dicts in the SAME order as `instructions`.
+        Each dict is either `{"x":int,"y":int,"raw":[...],"usage":{...}}`
+        on success or `{"error": str, ...}` on per-target failure —
+        callers handle partial success.
+        """
+        import asyncio
+        return await asyncio.gather(
+            *[
+                self._ground_one_async(instr, screenshot_b64, screen_w, screen_h)
+                for instr in instructions
+            ]
+        )
+
     # ---- Helpers ----
 
     def _messages(self, system: str, user_text: str, screenshot_b64: str) -> list[dict]:
@@ -486,3 +607,45 @@ def ground_endpoint(
         int(body.get("screen", [0, 0])[0]),
         int(body.get("screen", [0, 0])[1]),
     )
+
+
+# Batch grounding: ONE screenshot + N instructions → N coords. The win over
+# N parallel calls to /ground (the existing endpoint) is two-fold:
+#   1. The screenshot is uploaded ONCE over the wire instead of N times.
+#      For a 1-3 MB PNG and a batch of 6, that's 5-15 MB and ~half a
+#      second of bandwidth saved on a typical home connection.
+#   2. The single Modal call routes to ONE container's --parallel 4 slots
+#      instead of fanning out to N independent containers — keeps the
+#      L4 GPU resident and avoids cold-start churn for batches > 4.
+#
+# Timeout is 5 min (vs. 2 min for /ground) so a worst-case batch of 12
+# targets hitting a cold container can complete without a 504. Each
+# inference still has its own 120s ceiling inside the model method.
+@app.function(image=image, secrets=[auth_secret], timeout=300)
+@modal.fastapi_endpoint(method="POST", docs=True)
+def ground_batch_endpoint(
+    body: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_auth(authorization)
+    instructions = body.get("instructions") or []
+    if not isinstance(instructions, list) or not instructions:
+        return {"error": "instructions must be a non-empty list of strings"}
+    if not all(isinstance(s, str) and s.strip() for s in instructions):
+        return {"error": "every instruction must be a non-empty string"}
+    if len(instructions) > 16:
+        return {
+            "error": (
+                f"max 16 instructions per batch (got {len(instructions)}). "
+                "Split into multiple calls — long sequences usually hide a "
+                "screen state-change that should split anyway."
+            )
+        }
+    holo3 = Holo3()
+    results = holo3.ground_batch.remote(
+        instructions,
+        body["screenshot_b64"],
+        int(body.get("screen", [0, 0])[0]),
+        int(body.get("screen", [0, 0])[1]),
+    )
+    return {"results": results}

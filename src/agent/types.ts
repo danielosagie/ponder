@@ -34,6 +34,35 @@ export interface ProviderClient {
     screen: [number, number];
     signal?: AbortSignal;
   }): Promise<GroundResult>;
+  /**
+   * OPTIONAL batch-grounding: ONE screenshot, N instructions, N coords.
+   *
+   * Provider-side optimization. When a provider implements this, callers
+   * (notably `agent_click_sequence` in src/mcp/tools.ts) get the full
+   * benefit of:
+   *   • a single image upload over the wire (bandwidth + latency),
+   *   • a single Modal/H Company HTTP round-trip (TLS + parsing overhead),
+   *   • server-side fan-out to a continuous-batching inference slot
+   *     (e.g. llama-server --parallel 4) so multiple prompts can share
+   *     a forward pass instead of serializing through one slot.
+   *
+   * Providers without server-side batching (Local Ollama, H Company in
+   * its current shape) simply omit this method; callers detect the
+   * missing implementation and fall back to `Promise.all` of `ground()`,
+   * which still saves the per-call screenshot capture but pays N HTTP
+   * round-trips and N image uploads.
+   *
+   * Result-list ORDER must match the input `instructions` order. Per-
+   * target failures appear as entries with `error` set — the batch
+   * itself succeeds, the orchestrator decides whether one bad target
+   * aborts the action sequence or not.
+   */
+  groundBatch?(args: {
+    instructions: string[];
+    screenshotB64: string;
+    screen: [number, number];
+    signal?: AbortSignal;
+  }): Promise<GroundResult[]>;
 }
 
 export interface AgentEvents {

@@ -8,11 +8,13 @@ interface RemoteConfig {
 
 // Modal exposes each @fastapi_endpoint as a separate web function with its
 // own subdomain: `${prefix}-<funcname>.modal.run`. Map our logical paths
-// (`/warm`, `/plan`, `/ground`) to the actual Modal function names.
+// (`/warm`, `/plan`, `/ground`, `/ground/batch`) to the actual Modal
+// function names.
 const PATH_TO_FUNC: Record<string, string> = {
   "/warm": "warm",
   "/plan": "plan-endpoint",
   "/ground": "ground-endpoint",
+  "/ground/batch": "ground-batch-endpoint",
   "/health": "health",
 };
 
@@ -21,11 +23,14 @@ function resolveUrl(baseUrl: string, path: string): string {
   //   1. A bare prefix like  "https://you--holo3-agent"
   //      → produces        "https://you--holo3-agent-warm.modal.run"
   //   2. A full URL like   "https://you--holo3-agent-warm.modal.run"
-  //      → strips the trailing "-warm.modal.run" and rebuilds per path
+  //      → strips the trailing "-<funcname>.modal.run" and rebuilds per path
   const func = PATH_TO_FUNC[path] ?? path.replace(/^\//, "");
   const prefix = baseUrl
     .replace(/\/+$/, "")
-    .replace(/-(?:warm|plan-endpoint|ground-endpoint|health)\.modal\.run$/, "")
+    .replace(
+      /-(?:warm|plan-endpoint|ground-endpoint|ground-batch-endpoint|health)\.modal\.run$/,
+      "",
+    )
     .replace(/\.modal\.run$/, "");
   return `${prefix}-${func}.modal.run`;
 }
@@ -115,6 +120,38 @@ export function createRemoteProvider(cfg: RemoteConfig): ProviderClient {
         60_000,
         args.signal,
       );
+    },
+    async groundBatch(args): Promise<GroundResult[]> {
+      // Timeout shaped to the inference cost: with llama-server --parallel 4
+      // on the Modal side, the first 4 prompts share a forward pass (~3-4s
+      // wall), and a 5th-onwards queues at the inference layer. Worst-case
+      // batch of 12 lands around (12/4)*4s = 12s plus warmup. Use 30s base
+      // + 6s per additional instruction past 1, capped reasonably.
+      const n = args.instructions.length;
+      const timeoutMs = Math.min(180_000, 30_000 + Math.max(0, n - 1) * 6_000);
+      // Server returns either {results: GroundResult[]} on success or
+      // {error: "..."} on validation failure (empty list, oversized batch,
+      // etc.). The error case throws so callers' fallback path can run
+      // — they fan out to N parallel ground() calls instead.
+      const r = await post<{ results?: GroundResult[]; error?: string }>(
+        "/ground/batch",
+        {
+          instructions: args.instructions,
+          screenshot_b64: args.screenshotB64,
+          screen: args.screen,
+        },
+        timeoutMs,
+        args.signal,
+      );
+      if (r.error || !r.results) {
+        throw new Error(`groundBatch: ${r.error ?? "no results returned"}`);
+      }
+      if (r.results.length !== n) {
+        throw new Error(
+          `groundBatch: expected ${n} results, got ${r.results.length}`,
+        );
+      }
+      return r.results;
     },
   };
 }

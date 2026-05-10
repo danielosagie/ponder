@@ -77,8 +77,18 @@ async function cliclickRun(...args: string[]): Promise<void> {
 
 export interface Screenshot {
   png: Buffer;
+  /** Logical width of the captured display (NOT the user's whole desktop). */
   width: number;
+  /** Logical height of the captured display. */
   height: number;
+  /** Display-bounds X in screen-space. 0 for primary / single-display setups.
+   *  On multi-monitor setups where the focused display is to the RIGHT of the
+   *  primary, this is the primary's width; loop.ts adds it to grounded click
+   *  coords before firing cliclick so the click lands on the right monitor. */
+  offsetX: number;
+  /** Display-bounds Y in screen-space. Non-zero when the focused display is
+   *  ABOVE the primary in the macOS arrangement (rare). */
+  offsetY: number;
 }
 
 export async function size(): Promise<{ width: number; height: number }> {
@@ -87,7 +97,211 @@ export async function size(): Promise<{ width: number; height: number }> {
   return { width: w, height: h };
 }
 
+// ---------------------------------------------------------------------------
+// macOS window-bounds query (Accessibility API via osascript)
+//
+// Used by `agent_click_sequence` when the caller passes `targetApp` —
+// the tool crops the screenshot to that app's front window before
+// grounding, defending against the "embedded-screenshot decoy" hazard
+// (a chat client showing a screenshot of the target app on the same
+// display as the real app — the vision model can ground against the
+// picture instead of the real window). See bench/cases/calculator-
+// mouse-math.md "Known gotcha" for the original incident.
+//
+// Reliability caveat: this uses `tell process "<name>"` from System
+// Events, which requires Accessibility permissions for the spawning
+// process (tsx / node). When perms are missing, osascript exits with
+// `errOSAStatusError -1719` and we return null. Caller MUST treat
+// null as "fall back to uncropped grounding" — never fail the
+// sequence on a missing window. The decoy is a probabilistic hazard,
+// not a correctness barrier; cropping is an optimization.
+// ---------------------------------------------------------------------------
+
+export interface WindowBounds {
+  /** Screen-space x of the window's top-left corner. */
+  x: number;
+  /** Screen-space y of the window's top-left corner. */
+  y: number;
+  /** Window width in logical pixels. */
+  width: number;
+  /** Window height in logical pixels. */
+  height: number;
+}
+
+/**
+ * Query the bounds of the FRONT window of the given macOS process.
+ *
+ * `processName` is the System Events process name — usually the same
+ * as the `.app` bundle name without ".app" (e.g. "Calculator", "Finder",
+ * "Safari", "Google Chrome"). Case-sensitive.
+ *
+ * Returns null on any error: process not running, no window open,
+ * Accessibility perms denied, non-darwin platform. Never throws.
+ */
+export async function getMacWindowBounds(
+  processName: string,
+): Promise<WindowBounds | null> {
+  if (process.platform !== "darwin") return null;
+  // Defensive: a maliciously-shaped processName could escape AppleScript
+  // string quoting. Reject anything with quotes/backslashes/newlines —
+  // legitimate macOS process names don't have any of those.
+  if (/["\\\n\r]/.test(processName)) return null;
+
+  // The script returns four integers comma-separated: "x, y, w, h".
+  // `position` is {x, y}, `size` is {w, h}; we concat both lists, AppleScript
+  // serializes lists as "1, 2, 3, 4". osascript's stdout terminator is "\n".
+  const script = `tell application "System Events"
+  if not (exists process "${processName}") then return "missing"
+  tell process "${processName}"
+    if (count of windows) is 0 then return "nowindow"
+    set p to position of front window
+    set s to size of front window
+    return (item 1 of p as integer) & "," & (item 2 of p as integer) & "," & (item 1 of s as integer) & "," & (item 2 of s as integer)
+  end tell
+end tell`;
+
+  try {
+    const { stdout } = await execFileAsync(
+      "/usr/bin/osascript",
+      ["-e", script],
+      { timeout: 2000 },
+    );
+    const out = stdout.trim();
+    if (out === "missing" || out === "nowindow") return null;
+    // AppleScript's `&` joins lists with ", " — accept either ", " or "," to be safe.
+    const parts = out.split(/\s*,\s*/).map((s) => Number(s.trim()));
+    if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) {
+      return null;
+    }
+    const [x, y, w, h] = parts as [number, number, number, number];
+    if (w <= 0 || h <= 0) return null;
+    return { x, y, width: w, height: h };
+  } catch {
+    // osascript not found, perms denied, timeout, target app not running, etc.
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-monitor support.
+//
+// nut-js is HARD-CODED to the primary display: `screen.width()` returns the
+// primary's width and `screen.grabRegion(0,0,w,h)` only sees the primary's
+// pixel buffer. On a multi-monitor Mac with Chrome on a secondary display,
+// the agent screenshots a black/empty primary and emits clicks at the wrong
+// monitor — the trace looks like the agent is "blind".
+//
+// Fix: Electron's `desktopCapturer` IS multi-monitor-aware (each Display gets
+// its own source). We use Electron's `screen` module to find which display
+// the cursor is on (the "focused" display from the user's POV), then ask
+// desktopCapturer for that display's thumbnail at logical resolution.
+//
+// Trade-off: desktopCapturer is ~200ms vs nut-js ~50ms. So we still use
+// nut-js when we're confidently on the primary display (the cursor is at
+// (offsetX=0, offsetY=0)) and only pay the slower path when actually needed.
+// On a single-display setup this means zero overhead.
+//
+// Lazy require: `electron` is unavailable in non-Electron contexts (tests,
+// future CLI-only entrypoints). If require throws, the focused-display path
+// silently degrades to the nut-js primary-only behavior.
+// ---------------------------------------------------------------------------
+
+interface ElectronDisplay {
+  id: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  scaleFactor: number;
+}
+interface ElectronModule {
+  screen?: {
+    getCursorScreenPoint(): { x: number; y: number };
+    getDisplayNearestPoint(pt: { x: number; y: number }): ElectronDisplay;
+  };
+  desktopCapturer?: {
+    getSources(opts: {
+      types: string[];
+      thumbnailSize?: { width: number; height: number };
+    }): Promise<
+      Array<{
+        display_id: string;
+        thumbnail: { toPNG: () => Buffer };
+      }>
+    >;
+  };
+}
+
+let cachedElectron: ElectronModule | null | undefined;
+function getElectron(): ElectronModule | null {
+  if (cachedElectron !== undefined) return cachedElectron;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    cachedElectron = require("electron") as ElectronModule;
+  } catch {
+    cachedElectron = null;
+  }
+  return cachedElectron;
+}
+
+function getFocusedDisplay(): ElectronDisplay | null {
+  const e = getElectron();
+  if (!e?.screen) return null;
+  try {
+    const pt = e.screen.getCursorScreenPoint();
+    return e.screen.getDisplayNearestPoint(pt);
+  } catch {
+    return null;
+  }
+}
+
+async function captureViaDesktopCapturer(
+  d: ElectronDisplay,
+): Promise<Screenshot | null> {
+  const e = getElectron();
+  if (!e?.desktopCapturer) return null;
+  try {
+    const sources = await e.desktopCapturer.getSources({
+      types: ["screen"],
+      // Logical pixels — desktopCapturer scales the native-resolution
+      // capture down to this size. Avoids us having to deal with Retina
+      // scaleFactor in the click-coord math (cliclick uses logical pixels
+      // matching what we display to the LLM).
+      thumbnailSize: { width: d.bounds.width, height: d.bounds.height },
+    });
+    const matching = sources.find(
+      (s) => Number(s.display_id) === d.id,
+    );
+    if (!matching) return null;
+    return {
+      png: matching.thumbnail.toPNG(),
+      width: d.bounds.width,
+      height: d.bounds.height,
+      offsetX: d.bounds.x,
+      offsetY: d.bounds.y,
+    };
+  } catch (e) {
+    console.warn(
+      `[screen] desktopCapturer failed (${e instanceof Error ? e.message : String(e)}) — falling back to nut-js primary`,
+    );
+    return null;
+  }
+}
+
 export async function screenshot(): Promise<Screenshot> {
+  // Multi-monitor path: figure out which display the cursor is on. On a
+  // single-display Mac, `display.bounds.x` and `.y` are both 0, so we
+  // skip to the fast nut-js path below. On multi-monitor with the cursor
+  // on a secondary display, we go through desktopCapturer.
+  const focused = getFocusedDisplay();
+  if (focused && (focused.bounds.x !== 0 || focused.bounds.y !== 0)) {
+    const shot = await captureViaDesktopCapturer(focused);
+    if (shot) {
+      return shot;
+    }
+    // captureViaDesktopCapturer logged the reason; fall through to nut-js
+    // which will at least give us SOMETHING (the primary display) instead
+    // of crashing the whole step.
+  }
+
+  // Fast path: primary display via nut-js. No multi-monitor offset.
   const { width, height } = await size();
   const region = new Region(0, 0, width, height);
   const img = await nutScreen.grabRegion(region);
@@ -95,7 +309,7 @@ export async function screenshot(): Promise<Screenshot> {
   // The library exposes `image.toRGB()` raw bytes. We rely on its toRGB() helper
   // through the screen.captureRegion signature when available, else fallback.
   const png = await imageToPng(img);
-  return { png, width, height };
+  return { png, width, height, offsetX: 0, offsetY: 0 };
 }
 
 async function imageToPng(img: unknown): Promise<Buffer> {

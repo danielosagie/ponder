@@ -49,6 +49,8 @@ When Cursor IDE / Claude Code is showing a screenshot of Calculator in its chat 
 
 **Avoidance:** if you can, place Calculator on a DIFFERENT display from the orchestrator's chat window — there's no decoy if the displays don't both contain Calculator.
 
+**Fix-by-design (preferred):** the batched variant below supports `targetApp: "Calculator"`, which crops the screenshot to Calculator's front window before grounding so the decoy can't even reach the model. See the Batched variant section.
+
 ## Success criteria
 
 - Calculator's display reads `376` (the correct answer for 47 × 8).
@@ -69,19 +71,28 @@ Once `agent_click_sequence` is wired up (commit 52505bb and the matching Modal-s
 
 1. `screen_hotkey("cmd+space")` — open Spotlight
 2. `screen_type("Calculator", thenPress: "enter")` — launch
-3. `screen_screenshot` — confirm Calculator is foregrounded on the cursor's display (catches the embedded-screenshot decoy from the gotcha section above)
-4. `agent_click_sequence({ steps: [AC, 4, 7, ×, 8, =], stepDelayMs: 150 })` — one screenshot capture, six grounded coords (server-side fan-out via `provider.groundBatch` when available, else `Promise.all` of N parallel `ground()` calls), six serial clicks, ONE post-sequence screenshot returned in the tool response
+3. `screen_screenshot` — confirm Calculator is foregrounded (cheap pre-flight; even with `targetApp` set you want to be sure the app is running before the sequence call burns a grounding round-trip)
+4. `agent_click_sequence({ steps: [AC, 4, 7, ×, 8, =], stepDelayMs: 50, targetApp: "Calculator" })` — single screenshot capture, six grounded coords via `provider.groundBatch` (one HTTP, server-side fan-out into llama-server's `--parallel 4` slots), six serial clicks at the bridge layer, ONE post-sequence screenshot returned in the tool response.
+
+Two things to call out about the call shape:
+
+- `stepDelayMs: 50` — Calculator buttons respond synchronously to `cliclick`, so the conservative 150ms default is just dead time. 50ms gives ~3 display frames of margin and saves ~500ms across 5 inter-click gaps.
+- `targetApp: "Calculator"` — the screenshot is cropped to Calculator's front window before grounding, eliminating the embedded-screenshot decoy at the source. If Accessibility perms are missing or Calculator isn't running, the tool falls back to uncropped grounding silently (logs to stderr; the response's summary line tells you whether crop fired). On grounded coords landing OUTSIDE Calculator's window, the tool returns a `target_outside_window` error and refuses to click — the orchestrator should `screen_hotkey('cmd+tab')` and retry.
 
 That's it. No separate post-verification `screen_screenshot` — the sequence tool's response already includes the post-sequence screenshot.
 
 ### Verification
 
-The tool's text summary line tells you which ground path fired:
+The tool's text summary line tells you which ground path fired and whether crop was applied:
 
-- `Ground via provider.groundBatch (1 HTTP, server-side fan-out)` → headline path. Target wall time ~5s (curl benchmark: 6-target `/ground/batch` in 2.0s vs 6 sequential `/ground` in 9s, a 4.5× HTTP-layer win with `--parallel 4` + `-c 16384` continuous batching on the Modal-side llama-server).
-- `Ground via Promise.all of 6 ground() calls` → parallel-fallback. Still ~2.4× faster than 6 individual `agent_click` calls because the screenshot is shared, but missing the single-HTTP-fan-out win.
+- `Ground via provider.groundBatch (1 HTTP, server-side fan-out)` → headline path. With `stepDelayMs: 50` + bridge clicks, target wall time ~3.2s (curl benchmark: 6-target `/ground/batch` in 2.0s vs 6 sequential `/ground` in 9s, a 4.5× HTTP-layer win on `--parallel 4` + `-c 16384` continuous batching).
+- `Ground via Promise.all of 6 ground() calls` → parallel-fallback. Still much faster than 6 individual `agent_click` calls because the screenshot is shared, but no single-HTTP-fan-out win and `targetApp` cropping is silently dropped (single `ground()` doesn't carry a crop param).
+- `(cropped to Calculator window: WxH at X,Y)` in the summary → `targetApp` cropping fired. The model only saw Calculator pixels; the decoy is impossible.
+- `(targetApp="Calculator" requested but crop unavailable — see stderr)` → Accessibility perms denied, the app wasn't running, or the platform isn't darwin. Grounding still ran un-cropped; the run is still likely to succeed if there's no decoy on screen, just without the by-design defense.
 
-If you see the fallback path on a freshly-deployed Modal: check (a) the running `src/mcp/server.ts` PID — if it predates commit 52505bb, restart it; (b) `curl /health` against `$MODAL_BASE_URL` returns 200.
+**Fresh-server pre-flight.** Before running this benchmark, call `holo3_version` from the orchestrator. The returned `commit` should match `git rev-parse --short=12 HEAD`. If it doesn't, the running MCP server is stale (a child process from a prior session that predates the current code) — run `bash scripts/kill-stale-mcp.sh`, restart Claude Code, and re-call `holo3_version` to confirm.
+
+If you see the fallback path on a freshly-restarted Claude Code session: check `curl $MODAL_BASE_URL/health` returns 200 with a `commit` field — that's the Modal endpoint's freshness check.
 
 ### Result JSONs
 

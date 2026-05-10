@@ -133,13 +133,26 @@ export function createRemoteProvider(cfg: RemoteConfig): ProviderClient {
       // {error: "..."} on validation failure (empty list, oversized batch,
       // etc.). The error case throws so callers' fallback path can run
       // — they fan out to N parallel ground() calls instead.
+      //
+      // `crop` is forwarded snake_case for the FastAPI shim. When set, the
+      // server PIL-crops the screenshot before grounding and returns coords
+      // in CROPPED-image space — caller translates back via `r.x + crop.x`.
+      const body: Record<string, unknown> = {
+        instructions: args.instructions,
+        screenshot_b64: args.screenshotB64,
+        screen: args.screen,
+      };
+      if (args.crop) {
+        body.crop = {
+          x: args.crop.x,
+          y: args.crop.y,
+          w: args.crop.w,
+          h: args.crop.h,
+        };
+      }
       const r = await post<{ results?: GroundResult[]; error?: string }>(
         "/ground/batch",
-        {
-          instructions: args.instructions,
-          screenshot_b64: args.screenshotB64,
-          screen: args.screen,
-        },
+        body,
         timeoutMs,
         args.signal,
       );

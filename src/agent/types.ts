@@ -61,6 +61,24 @@ export interface ProviderClient {
     instructions: string[];
     screenshotB64: string;
     screen: [number, number];
+    /**
+     * OPTIONAL screenshot crop rect, in screenshot-pixel space (NOT
+     * screen-space — apply offsetX/offsetY translation BEFORE passing).
+     * When set, the server crops the screenshot to this rect before
+     * grounding, and the returned coords are in CROPPED-image space.
+     * The caller must translate back: `actual_x = result.x + crop.x`.
+     *
+     * Used by `agent_click_sequence` with `targetApp` — defends against
+     * the embedded-screenshot decoy (a chat showing the same app's
+     * screenshot on the same display) by giving the vision model only
+     * the real app's pixels.
+     *
+     * Caller-side bounds-checking IS REQUIRED: the server has no way
+     * to know whether a grounded coord landing outside the crop
+     * indicates a decoy hit vs. a legitimate edge. Validate at the
+     * caller; treat out-of-bounds as a recoverable error.
+     */
+    crop?: { x: number; y: number; w: number; h: number };
     signal?: AbortSignal;
   }): Promise<GroundResult[]>;
 }

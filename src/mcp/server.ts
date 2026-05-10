@@ -43,6 +43,7 @@ import "./bootstrap.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools, TOOL_NAMES, MCP_BRAND } from "./tools.js";
+import { BUILD_INFO, buildInfoLabel } from "./build-info.js";
 
 const stderrLog = (...args: unknown[]): void => {
   process.stderr.write(args.map(String).join(" ") + "\n");
@@ -52,7 +53,10 @@ const server = new McpServer({
   // Lowercase + dash form for the server identity that some clients
   // log; the human-friendly brand string lives on every tool's title.
   name: MCP_BRAND.toLowerCase().replace(/\s+/g, "-"),
-  version: "0.1.0",
+  // Stamp with the loaded commit so a session can detect when it's
+  // talking to a stale child process (a prior session's PID that
+  // predates the current `git HEAD`). See ./build-info.ts.
+  version: BUILD_INFO.commitShort,
 });
 registerTools(server);
 
@@ -64,7 +68,8 @@ void (async () => {
   try {
     await server.connect(transport);
     stderrLog(
-      `[mcp:stdio] holo3-browser ready. Tools: ${TOOL_NAMES.join(", ")}.`,
+      `[mcp:stdio] holo3-browser ready. ${buildInfoLabel()}. ` +
+        `Tools: ${TOOL_NAMES.join(", ")}.`,
     );
   } catch (e) {
     stderrLog(

@@ -33,6 +33,7 @@ import type {
   ProviderClient,
 } from "../agent/types.js";
 import type { RouterClient } from "../agent/router.js";
+import { BUILD_INFO } from "./build-info.js";
 
 const stderrLog = (...args: unknown[]): void => {
   process.stderr.write(args.map(String).join(" ") + "\n");
@@ -2020,6 +2021,19 @@ export function registerTools(server: McpServer): void {
                 .enum(["single", "double", "right", "triple"])
                 .optional()
                 .describe("Click mode for THIS step. Default 'single'."),
+              delayMs: z
+                .number()
+                .int()
+                .min(0)
+                .max(2000)
+                .optional()
+                .describe(
+                  "Per-step override for the delay AFTER this click before the next " +
+                    "one fires. Takes precedence over the global stepDelayMs. Useful " +
+                    "for mixed-pacing sequences — e.g. when ONE button in the chain " +
+                    "triggers a re-render that needs 300ms to settle, but the rest are " +
+                    "instant native buttons. Ignored on the last step (no 'next click').",
+                ),
             }),
           )
           .min(2)
@@ -2036,13 +2050,30 @@ export function registerTools(server: McpServer): void {
           .max(2000)
           .optional()
           .describe(
-            "Delay between clicks within the sequence, in ms. Default 150ms — enough " +
-              "for fast UIs like Calculator. Bump to 300-500ms for animation-heavy UIs " +
-              "or when the post-click effect needs time before the next click registers.",
+            "Default delay between clicks within the sequence, in ms. Default 150ms — " +
+              "conservative for animation-heavy web UIs. For native macOS apps that " +
+              "respond synchronously to cliclick (Calculator, Finder, Spotlight) drop " +
+              "to 30-50ms. Bump to 300-500ms for animation-heavy UIs. Per-step " +
+              "`step.delayMs` overrides this for individual steps.",
+          ),
+        targetApp: z
+          .string()
+          .optional()
+          .describe(
+            "macOS-only. When set, the screenshot is cropped to the front window of " +
+              "this process before grounding, defending against the 'embedded-screenshot " +
+              "decoy' (a chat / IDE showing a screenshot of the same app on the same " +
+              "display — the vision model can ground against the picture instead of the " +
+              "real window). Use the System Events process name (Calculator, Finder, " +
+              "Safari, 'Google Chrome'). Requires Accessibility permission for the " +
+              "spawning process; falls back to UNCROPPED grounding if perms missing or " +
+              "the app isn't running. On grounded coords landing OUTSIDE the cropped " +
+              "window, the tool returns a `target_outside_window` structured error and " +
+              "performs no clicks — orchestrator should recover with cmd+tab + retry.",
           ),
       },
     },
-    async ({ steps, stepDelayMs }) => {
+    async ({ steps, stepDelayMs, targetApp }) => {
       const t0 = Date.now();
       const delayMs = stepDelayMs ?? 150;
 
@@ -2092,6 +2123,59 @@ export function registerTools(server: McpServer): void {
         );
       }
 
+      // 1b. Optional window-bounds crop (defends against the embedded-
+      //     screenshot decoy — see schema description for `targetApp`).
+      //     We resolve the crop rect HERE so the same rect can be:
+      //       (a) sent to provider.groundBatch via its `crop` arg, AND
+      //       (b) used for client-side bounds validation of returned coords.
+      //     If anything fails (non-darwin, perms denied, app not running,
+      //     window-bounds query times out), we set `crop = null` and the
+      //     rest of the pipeline behaves exactly like the un-targetApp path.
+      let crop: { x: number; y: number; w: number; h: number } | null = null;
+      if (targetApp && process.platform === "darwin") {
+        const bounds = await screen.getMacWindowBounds(targetApp);
+        if (bounds) {
+          // Translate screen-space window bounds into screenshot-pixel
+          // space. On a single-display machine offsetX/Y are 0 and this
+          // is a no-op; on a multi-monitor setup where the cursor (and
+          // thus the captured display) is the secondary, bounds.x will
+          // be in screen-space and we subtract the display's offset to
+          // get a rect inside the captured PNG.
+          const cropX = bounds.x - offsetX;
+          const cropY = bounds.y - offsetY;
+          // Clamp to the captured frame so a partially-offscreen window
+          // still produces a valid rect.
+          const clampedX = Math.max(0, Math.min(width, cropX));
+          const clampedY = Math.max(0, Math.min(height, cropY));
+          const clampedW = Math.max(
+            0,
+            Math.min(width - clampedX, bounds.width + (cropX - clampedX)),
+          );
+          const clampedH = Math.max(
+            0,
+            Math.min(height - clampedY, bounds.height + (cropY - clampedY)),
+          );
+          if (clampedW > 0 && clampedH > 0) {
+            crop = { x: clampedX, y: clampedY, w: clampedW, h: clampedH };
+          } else {
+            stderrLog(
+              `[agent_click_sequence] targetApp="${targetApp}" window is fully offscreen ` +
+                `relative to the captured display — falling back to uncropped grounding.`,
+            );
+          }
+        } else {
+          stderrLog(
+            `[agent_click_sequence] targetApp="${targetApp}": no front window bounds ` +
+              `returned (process not running, no window, or Accessibility perms denied) — ` +
+              `falling back to uncropped grounding.`,
+          );
+        }
+      } else if (targetApp && process.platform !== "darwin") {
+        stderrLog(
+          `[agent_click_sequence] targetApp="${targetApp}" ignored on non-darwin platform.`,
+        );
+      }
+
       // 2. Parallel grounding — all targets fire simultaneously against the
       //    same screenshot bytes. Total wall time ≈ max(per-call grounding)
       //    instead of sum, which is the whole point of this tool.
@@ -2102,6 +2186,10 @@ export function registerTools(server: McpServer): void {
       //    back to N parallel ground() calls when the provider doesn't
       //    implement batch — still saves the per-call screenshot capture
       //    but pays N HTTP round-trips.
+      //
+      //    When `crop` is set, the model only sees the targetApp window
+      //    (decoy defense). Grounded coords come back in CROPPED-image
+      //    space and we translate them back below.
       const tGroundStart = Date.now();
       let groundResults: GroundResult[];
       let groundPath: "batch" | "parallel-fallback";
@@ -2110,7 +2198,8 @@ export function registerTools(server: McpServer): void {
           groundResults = await provider.groundBatch({
             instructions: steps.map((s) => s.target),
             screenshotB64,
-            screen: [width, height],
+            screen: crop ? [crop.w, crop.h] : [width, height],
+            ...(crop ? { crop } : {}),
           });
           groundPath = "batch";
         } catch (e) {
@@ -2166,8 +2255,44 @@ export function registerTools(server: McpServer): void {
         );
       }
 
+      // 3b. When `crop` was applied AND we took the batch path that
+      //     honors it: validate every returned coord falls within the
+      //     cropped window. Out-of-bounds means either the model's
+      //     grounding is wrong or (much more likely) the embedded-
+      //     screenshot decoy is hitting and the model returned coords
+      //     for a target that exists on the picture but not in the
+      //     real window — refuse to click and let the orchestrator
+      //     recover (cmd+tab + retry).
+      if (crop && groundPath === "batch") {
+        const oob = groundResults
+          .map((r, i) => ({ r, i }))
+          .filter(
+            ({ r }) => r.x < 0 || r.y < 0 || r.x > crop!.w || r.y > crop!.h,
+          );
+        if (oob.length > 0) {
+          const lines = oob
+            .map(
+              ({ r, i }) =>
+                `  step ${i + 1} "${steps[i]!.target}" → (${r.x}, ${r.y}) ` +
+                `(outside cropped ${crop!.w}×${crop!.h} window)`,
+            )
+            .join("\n");
+          return fail(
+            `target_outside_window: ${oob.length}/${steps.length} target(s) grounded ` +
+              `outside ${targetApp}'s window — likely the embedded-screenshot decoy is ` +
+              `hitting (the vision model picked targets from a picture-of-the-app shown ` +
+              `in another window on the same display). No clicks were performed. ` +
+              `Recover with screen_hotkey('cmd+tab') to refocus ${targetApp} on its ` +
+              `display, then re-run this sequence. Out-of-bounds steps:\n${lines}`,
+          );
+        }
+      }
+
       // 4. Sequential click execution. Bridge per click for perms; small
       //    delay between clicks so each press registers before the next.
+      //    Per-step `step.delayMs` overrides the global `delayMs` so a
+      //    mixed-pacing sequence (e.g. one slow button in a chain of fast
+      //    ones) doesn't have to flatten to its slowest member.
       const tExecStart = Date.now();
       const clicked: Array<{
         target: string;
@@ -2176,18 +2301,39 @@ export function registerTools(server: McpServer): void {
         screenY: number;
         viaBridge: boolean;
       }> = [];
+      // Track whether every click took the bridge path. Used to decide
+      // whether the trailing post-settle can be the short 80ms (bridge
+      // is synchronous on macOS) or has to be the conservative 300ms
+      // (nut-js needs that long for the cursor animation + click event
+      // to drain before the post-shot is meaningful). We compute this
+      // ALONGSIDE the loop instead of after, so the value is available
+      // for the next-iteration delay decision too.
+      let allBridgeSoFar = true;
+      // Time spent in actual `screen.sleep(delay)` calls. Surfaced in
+      // the summary so a slow run is debuggable without re-reading the
+      // input args ("did the orchestrator pass stepDelayMs:300 by
+      // accident?").
+      let totalDelayMs = 0;
       for (let i = 0; i < steps.length; i++) {
         const step = steps[i]!;
         const r = groundResults[i]!;
-        // ground errors filtered above — r.x / r.y safe here
-        const screenX = r.x + offsetX;
-        const screenY = r.y + offsetY;
+        // ground errors filtered above — r.x / r.y safe here.
+        // When `crop` was applied (batch path only — the parallel-
+        // fallback ignores crop because single ground() has no such
+        // arg), the returned coords are in CROPPED-image space. Add
+        // the crop offset to translate back into the captured frame,
+        // then add the display offset to translate into screen space.
+        const xInFrame = crop && groundPath === "batch" ? r.x + crop.x : r.x;
+        const yInFrame = crop && groundPath === "batch" ? r.y + crop.y : r.y;
+        const screenX = xInFrame + offsetX;
+        const screenY = yInFrame + offsetY;
         const clickMode = step.mode ?? "single";
         const bridgedClick = await tryBridgeScreenCall<{ ok: boolean }>(
           "/screen/click",
           { x: screenX, y: screenY, mode: clickMode },
         );
         if (!bridgedClick?.ok) {
+          allBridgeSoFar = false;
           try {
             await screen.click(screenX, screenY, {
               double: clickMode === "double",
@@ -2218,16 +2364,29 @@ export function registerTools(server: McpServer): void {
           viaBridge: !!bridgedClick?.ok,
         });
         // Don't delay after the LAST click — we go straight to the post-shot
-        // settle, no point doubling the wait.
-        if (i < steps.length - 1 && delayMs > 0) {
-          await screen.sleep(delayMs);
+        // settle, no point doubling the wait. Per-step override beats the
+        // global default so callers can tune individual steps.
+        if (i < steps.length - 1) {
+          const stepDelay = step.delayMs ?? delayMs;
+          if (stepDelay > 0) {
+            await screen.sleep(stepDelay);
+            totalDelayMs += stepDelay;
+          }
         }
       }
       const tExec = Date.now() - tExecStart;
 
       // 5. ONE post-sequence screenshot for verification (vs. one per click).
-      //    Uses the same 300ms settle as agent_click for consistency.
-      await screen.sleep(300);
+      //    Settle duration is conditional on bridge mode:
+      //      - 80ms when every click took the bridge path. cliclick on
+      //        macOS posts CGEvents synchronously into the HID event tap;
+      //        80ms is one display-refresh frame plus margin, enough for
+      //        the destination app to paint the post-click state.
+      //      - 300ms otherwise. nut-js animates the OS cursor and the
+      //        click event lands AFTER the cursor arrives; 300ms covers
+      //        the worst-case 600px diagonal at the configured speed.
+      const postSettleMs = allBridgeSoFar ? 80 : 300;
+      await screen.sleep(postSettleMs);
       let postPng: Buffer | undefined;
       const postShot = await tryBridgeScreenCall<{
         pngBase64: string;
@@ -2255,13 +2414,20 @@ export function registerTools(server: McpServer): void {
         groundPath === "batch"
           ? `provider.groundBatch (1 HTTP, server-side fan-out)`
           : `Promise.all of ${steps.length} ground() calls`;
+      const cropTag =
+        crop && groundPath === "batch"
+          ? `(cropped to ${targetApp} window: ${crop.w}×${crop.h} at ${crop.x},${crop.y}) `
+          : targetApp && !crop
+            ? `(targetApp="${targetApp}" requested but crop unavailable — see stderr) `
+            : "";
       const summary =
         `Clicked ${clicked.length} targets in sequence, sharing one screenshot:\n` +
         perStepLines.join("\n") +
         `\nGround via ${groundLabel}: ${tGround}ms, ` +
-        `exec ${tExec}ms (incl. ${(steps.length - 1) * delayMs}ms inter-click delay), ` +
-        `total ${totalMs}ms. ` +
+        `exec ${tExec}ms (incl. ${totalDelayMs}ms inter-click delay), ` +
+        `post-settle ${postSettleMs}ms, total ${totalMs}ms. ` +
         (allViaBridge ? "(via Electron bridge) " : "") +
+        cropTag +
         "Post-sequence screenshot attached.";
       const responseContent: Array<
         | { type: "text"; text: string }
@@ -2275,6 +2441,46 @@ export function registerTools(server: McpServer): void {
         });
       }
       return { content: responseContent };
+    },
+  );
+
+  // ── DIAGNOSTIC: report which commit this MCP server is loaded from ──
+  //
+  // The "stale MCP server PID" failure mode: a Claude Code session is
+  // bound to a `tsx src/mcp/server.ts` PID spawned BEFORE the most
+  // recent deploy. Symptoms surface much later (a tool's new optional
+  // method shows up as undefined, a benchmark falls back to the slow
+  // path, etc.) — and the session has no obvious way to detect it.
+  //
+  // Calling this tool from inside the session returns the exact commit
+  // SHA + dirty bit + boot timestamp the loaded server module sees.
+  // Compare to `git rev-parse HEAD` on disk; if they differ, the
+  // session is stale — restart Claude Code (or run
+  // `bash scripts/kill-stale-mcp.sh` between sessions).
+  server.registerTool(
+    "holo3_version",
+    {
+      title: `${MCP_BRAND}: Report this MCP server's build identity`,
+      description:
+        "Diagnostic: returns the git commit SHA, dirty bit, boot timestamp, " +
+        "and tool list of the MCP server you're currently connected to. " +
+        "Use BEFORE running a benchmark or any test that depends on a recent " +
+        "deploy — if the returned `commit` doesn't match `git rev-parse HEAD` " +
+        "on disk, the session is bound to a stale server PID. Recovery: ask the " +
+        "user to run `bash scripts/kill-stale-mcp.sh` and restart Claude Code, " +
+        "then re-call this tool. Cheap (no side effects, no I/O — values are " +
+        "resolved once at server boot via src/mcp/build-info.ts and cached)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {},
+    },
+    async () => {
+      const text =
+        `commit:      ${BUILD_INFO.commit}\n` +
+        `commitShort: ${BUILD_INFO.commitShort}\n` +
+        `dirty:       ${BUILD_INFO.dirty}\n` +
+        `builtAt:     ${BUILD_INFO.builtAt}\n` +
+        `tools (${TOOL_NAMES.length}): ${TOOL_NAMES.join(", ")}`;
+      return { content: [{ type: "text", text }] };
     },
   );
 
@@ -2677,6 +2883,7 @@ export const TOOL_NAMES = [
   "browser_read",
   // OS-level vision-grounded primitives (Stagehand-style act/observe split)
   "agent_click",
+  "agent_click_sequence",
   "agent_drag",
   "agent_observe",
   // OS-level keyboard / scroll / inspection
@@ -2692,4 +2899,6 @@ export const TOOL_NAMES = [
   "screen_click",
   "screen_drag",
   "screen_observe",
+  // Diagnostic
+  "holo3_version",
 ] as const;

@@ -46,6 +46,7 @@ import http from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { registerTools, TOOL_NAMES, MCP_BRAND } from "./tools.js";
+import { BUILD_INFO, buildInfoLabel } from "./build-info.js";
 
 const stderrLog = (...args: unknown[]): void => {
   process.stderr.write(args.map(String).join(" ") + "\n");
@@ -126,9 +127,19 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Cheap health check — useful when verifying a tunnel is live.
+  // Cheap health check — useful when verifying a tunnel is live AND for
+  // a fresh Claude session to confirm it's connected to the post-deploy
+  // server (the `commit` field below is what nukes the stale-PID guess-
+  // work; see src/mcp/build-info.ts for why).
   if (req.method === "GET" && req.url === "/health") {
-    writeJson(res, 200, { ok: true, tools: TOOL_NAMES });
+    writeJson(res, 200, {
+      ok: true,
+      commit: BUILD_INFO.commit,
+      commitShort: BUILD_INFO.commitShort,
+      dirty: BUILD_INFO.dirty,
+      builtAt: BUILD_INFO.builtAt,
+      tools: TOOL_NAMES,
+    });
     return;
   }
 
@@ -205,7 +216,10 @@ ul { padding-left: 22px; }
   // per call — just a tiny McpServer construction (~ms).
   const server = new McpServer({
     name: MCP_BRAND.toLowerCase().replace(/\s+/g, "-"),
-    version: "0.1.0",
+    // Same commit-short stamp as the stdio server — so a session can
+    // surface the SHA either by reading /health or by calling the
+    // `holo3_version` tool, regardless of which transport it's on.
+    version: BUILD_INFO.commitShort,
   });
   registerTools(server);
 
@@ -244,7 +258,7 @@ ul { padding-left: 22px; }
 httpServer.listen(PORT, "127.0.0.1", () => {
   stderrLog(
     `[mcp:http] listening on http://127.0.0.1:${PORT}${PATH} ` +
-      `(auth=${TOKEN ? "bearer" : "off"})`,
+      `(auth=${TOKEN ? "bearer" : "off"}) — ${buildInfoLabel()}`,
   );
   stderrLog(`[mcp:http] tools: ${TOOL_NAMES.join(", ")}`);
   stderrLog(

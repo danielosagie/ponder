@@ -74,6 +74,10 @@ image = (
         "fastapi[standard]==0.115.5",
         "huggingface_hub==0.26.2",
         "httpx==0.27.2",
+        # For server-side cropping in /ground/batch when callers pass a
+        # `crop` rect (e.g. agent_click_sequence with targetApp). Tiny
+        # wheel, native via libjpeg/zlib already in the CUDA image.
+        "Pillow==11.0.0",
     )
 )
 
@@ -464,6 +468,7 @@ class Holo3:
         screenshot_b64: str,
         screen_w: int,
         screen_h: int,
+        crop: dict[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         """Ground N instructions against ONE screenshot.
 
@@ -479,15 +484,68 @@ class Holo3:
         vs. N × per-request-time for sequential single calls. For N=6
         on an L4 that typically lands at ~5s vs. ~15s.
 
+        When `crop` is set ({"x", "y", "w", "h"} in screenshot-pixel
+        space), the screenshot is decoded with PIL, cropped to that
+        rect, and re-encoded before grounding. The grounded coords
+        come back in CROPPED-image space — the client must translate
+        back with `actual_x = result.x + crop.x`. Used to defend the
+        "embedded-screenshot decoy": when the chat is showing the
+        same app's screenshot on the same display as the real app,
+        cropping to just the real app's window deletes the decoy
+        from the model's input. Adds ~10-30ms PIL cost for typical
+        screen sizes — negligible vs. inference.
+
         Returns a list of N dicts in the SAME order as `instructions`.
         Each dict is either `{"x":int,"y":int,"raw":[...],"usage":{...}}`
         on success or `{"error": str, ...}` on per-target failure —
         callers handle partial success.
         """
         import asyncio
+
+        # Crop happens ONCE, then every grounding call shares the cropped
+        # image. Bail-on-error: if PIL crop fails (truncated PNG, OOB
+        # rect), fall through to the un-cropped path so the sequence
+        # still has a chance to land. Caller's bounds validation will
+        # catch any decoy mis-grounding either way.
+        effective_b64 = screenshot_b64
+        effective_w = screen_w
+        effective_h = screen_h
+        if crop:
+            try:
+                from PIL import Image
+                import io
+
+                cx = int(crop.get("x", 0))
+                cy = int(crop.get("y", 0))
+                cw = int(crop.get("w", 0))
+                ch = int(crop.get("h", 0))
+                if cw > 0 and ch > 0:
+                    raw = base64.b64decode(screenshot_b64)
+                    img = Image.open(io.BytesIO(raw))
+                    # Clamp the rect to the image so a bounds-off crop
+                    # (caller's screen-space math was wrong) returns SOME
+                    # image instead of throwing.
+                    iw, ih = img.size
+                    left = max(0, min(iw, cx))
+                    upper = max(0, min(ih, cy))
+                    right = max(left, min(iw, cx + cw))
+                    lower = max(upper, min(ih, cy + ch))
+                    if right > left and lower > upper:
+                        cropped = img.crop((left, upper, right, lower))
+                        buf = io.BytesIO()
+                        cropped.save(buf, format="PNG")
+                        effective_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        effective_w = right - left
+                        effective_h = lower - upper
+            except Exception as e:
+                # Log to stderr so the failure is visible in modal logs,
+                # but don't fail the request — un-cropped grounding is
+                # still useful, just lacks the decoy defense.
+                print(f"[ground_batch] crop failed: {e}; using uncropped")
+
         return await asyncio.gather(
             *[
-                self._ground_one_async(instr, screenshot_b64, screen_w, screen_h)
+                self._ground_one_async(instr, effective_b64, effective_w, effective_h)
                 for instr in instructions
             ]
         )
@@ -641,11 +699,29 @@ def ground_batch_endpoint(
                 "screen state-change that should split anyway."
             )
         }
+    # Optional `crop` rect. When set, the server crops the screenshot
+    # to that rect before grounding (defense against the embedded-
+    # screenshot decoy used by `agent_click_sequence` with `targetApp`).
+    # Coords come back in CROPPED-image space; client translates.
+    crop = body.get("crop")
+    if crop is not None:
+        if not isinstance(crop, dict):
+            return {"error": "crop must be an object {x, y, w, h}"}
+        try:
+            crop = {k: int(crop[k]) for k in ("x", "y", "w", "h")}
+        except (KeyError, TypeError, ValueError):
+            return {
+                "error": "crop must contain integer x, y, w, h",
+            }
+        if crop["w"] <= 0 or crop["h"] <= 0:
+            return {"error": "crop w and h must be positive"}
+
     holo3 = Holo3()
     results = holo3.ground_batch.remote(
         instructions,
         body["screenshot_b64"],
         int(body.get("screen", [0, 0])[0]),
         int(body.get("screen", [0, 0])[1]),
+        crop,
     )
     return {"results": results}

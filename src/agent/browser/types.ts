@@ -99,6 +99,58 @@ export interface BrowserClient {
   /** Navigate the active tab. */
   navigate(url: string): Promise<void>;
 
+  /**
+   * Enumerate every Chrome tab the user has attached the Playwriter
+   * extension to (i.e., every tab in the relay's primary context).
+   * Welcome tabs (auto-created chrome-extension://…/src/welcome.html
+   * pages) are filtered out — they're never the user's intent.
+   *
+   * Used by the orchestrator when `browser_snapshot` returns an
+   * unexpected URL: list the attached tabs, then `switchTab(...)` to
+   * the right one. Multi-tab attachment is normal whenever the user
+   * has clicked the green Playwriter icon on more than one tab.
+   */
+  listTabs(): Promise<TabInfo[]>;
+
+  /**
+   * Switch the "active" tab — the one that subsequent snapshot/click/
+   * type/etc. operations target. Match by absolute index from
+   * `listTabs()`, by URL substring (`urlIncludes`), or by case-
+   * insensitive regex pattern. Calls `bringToFront()` on the matched
+   * page so it's visually focused too.
+   *
+   * Throws if no tab matches; the orchestrator should call
+   * `listTabs()` first to see what's available.
+   */
+  switchTab(opts: SwitchTabOptions): Promise<TabInfo>;
+
   /** Tear down the relay + Playwright connection on app shutdown. */
   close(): Promise<void>;
+}
+
+/** One row of `listTabs()` output. Index is stable for the duration of
+ *  the current Chrome process — pass it to `switchTab({ index })` for an
+ *  unambiguous match when URL/title might be identical (two listings
+ *  with the same name, etc.). */
+export interface TabInfo {
+  /** Position in `ctx.pages()` — 0-based. */
+  index: number;
+  url: string;
+  title: string;
+  /** True when this is the tab the next snapshot/click/type/etc. will
+   *  target. Typically exactly one tab is current at a time. */
+  isCurrent: boolean;
+}
+
+/** Match a tab to switch to. Provide ONE of these (validated in the
+ *  implementation; if multiple are passed, `index` wins). */
+export interface SwitchTabOptions {
+  /** Exact zero-based index from `listTabs()`. */
+  index?: number;
+  /** Case-insensitive substring of the tab's URL. Most common shape:
+   *  `{ urlIncludes: "edit" }` to find a listing edit page. */
+  urlIncludes?: string;
+  /** Case-insensitive regex pattern, matched against the URL. Use only
+   *  when `urlIncludes` isn't expressive enough. */
+  pattern?: string;
 }

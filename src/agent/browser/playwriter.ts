@@ -28,7 +28,12 @@
  * doesn't care whether Chrome is reachable on a given step or not.
  */
 
-import type { BrowserClient, BrowserSnapshot } from "./types";
+import type {
+  BrowserClient,
+  BrowserSnapshot,
+  TabInfo,
+  SwitchTabOptions,
+} from "./types";
 
 // PLAYWRITER_AUTO_ENABLE: documented in Playwriter's MCP.md as
 //   "Auto-create a tab when Playwright connects (no manual extension click needed)."
@@ -157,6 +162,23 @@ interface PWPage {
 interface PWBrowser {
   contexts(): Array<{ pages(): PWPage[]; newPage(): Promise<PWPage> }>;
   close(): Promise<void>;
+}
+
+// Module-scope helper: distinguish auto-spawned welcome tabs (created by
+// PLAYWRITER_AUTO_ENABLE on every connection where no other targets
+// exist) from real user tabs. The welcome page is at
+// `chrome-extension://<id>/src/welcome.html` and is functionally a
+// drivable about:blank — the agent CAN navigate from it, but the user
+// rarely intends to operate ON it. Filtering welcome tabs out of
+// `listTabs()` keeps the result list focused on actual work.
+//
+// Lifted out of `connectIfPossible()`'s closure (where it was
+// originally defined) so `listTabs()` / `switchTab()` can use the same
+// detection without duplicating the regex.
+function isWelcomeTab(p: PWPage): boolean {
+  return /^chrome-extension:\/\/[a-z]+\/src\/welcome\.html(?:[?#]|$)/i.test(
+    p.url(),
+  );
 }
 
 async function tryLoadModules(): Promise<{
@@ -570,11 +592,9 @@ export async function createPlaywriterClient(
       // can use `browser.navigate <url>` to jump to where the task lives.
       // No scary status — silent zero-click experience.
       const pages = ctx.pages();
-      const isWelcome = (p: PWPage): boolean =>
-        /^chrome-extension:\/\/[a-z]+\/src\/welcome\.html(?:[?#]|$)/i.test(
-          p.url(),
-        );
-      const realPages = pages.filter((p) => !isWelcome(p) && !p.isClosed());
+      const realPages = pages.filter(
+        (p) => !isWelcomeTab(p) && !p.isClosed(),
+      );
       let page: PWPage;
       if (realPages.length > 0) {
         page = realPages[0]!;
@@ -846,6 +866,156 @@ export async function createPlaywriterClient(
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
       await page.goto(url);
+    },
+
+    async listTabs(): Promise<TabInfo[]> {
+      // Force connect-if-needed via activePage(); we don't actually use
+      // the returned page here (we want ALL pages), but ensureChrome()
+      // is what populates state.browser.
+      const ensured = await activePage();
+      if (!ensured || !state.browser) return [];
+      const ctx = state.browser.contexts()[0];
+      if (!ctx) return [];
+      const allPages = ctx.pages();
+
+      // Title fetches are async and cheap individually but not free in
+      // bulk — run them concurrently. Failures fall back to empty
+      // string rather than dropping the tab from the listing.
+      const titles = await Promise.all(
+        allPages.map((p) =>
+          p.isClosed()
+            ? Promise.resolve("")
+            : p.title().catch(() => ""),
+        ),
+      );
+
+      const tabs: TabInfo[] = [];
+      for (let i = 0; i < allPages.length; i++) {
+        const p = allPages[i]!;
+        if (p.isClosed()) continue;
+        if (isWelcomeTab(p)) continue;
+        tabs.push({
+          index: i,
+          url: p.url(),
+          title: titles[i] ?? "",
+          isCurrent: p === state.page,
+        });
+      }
+      return tabs;
+    },
+
+    async switchTab(opts: SwitchTabOptions): Promise<TabInfo> {
+      const ensured = await activePage();
+      if (!ensured || !state.browser) {
+        throw new Error("[browser] not connected to Chrome");
+      }
+      const ctx = state.browser.contexts()[0];
+      if (!ctx) throw new Error("[browser] no active Chrome context");
+      const allPages = ctx.pages();
+
+      // Resolve the target page. `index` wins over the others; otherwise
+      // urlIncludes (substring, case-insensitive) wins over pattern
+      // (regex). Welcome tabs are always excluded — the orchestrator
+      // never wants to switch ONTO a welcome page.
+      let target: PWPage | null = null;
+      let targetIndex = -1;
+      let matchReason = "";
+
+      if (typeof opts.index === "number") {
+        if (opts.index < 0 || opts.index >= allPages.length) {
+          throw new Error(
+            `[browser] no tab at index ${opts.index} (have ${allPages.length} tabs total)`,
+          );
+        }
+        const p = allPages[opts.index]!;
+        if (p.isClosed()) {
+          throw new Error(
+            `[browser] tab at index ${opts.index} is closed`,
+          );
+        }
+        if (isWelcomeTab(p)) {
+          throw new Error(
+            `[browser] tab at index ${opts.index} is a welcome tab; pick a real tab`,
+          );
+        }
+        target = p;
+        targetIndex = opts.index;
+        matchReason = `index ${opts.index}`;
+      } else if (opts.urlIncludes) {
+        const needle = opts.urlIncludes.toLowerCase();
+        for (let i = 0; i < allPages.length; i++) {
+          const p = allPages[i]!;
+          if (p.isClosed() || isWelcomeTab(p)) continue;
+          if (p.url().toLowerCase().includes(needle)) {
+            target = p;
+            targetIndex = i;
+            matchReason = `urlIncludes "${opts.urlIncludes}"`;
+            break;
+          }
+        }
+      } else if (opts.pattern) {
+        let regex: RegExp;
+        try {
+          regex = new RegExp(opts.pattern, "i");
+        } catch (e) {
+          throw new Error(
+            `[browser] invalid regex pattern: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        for (let i = 0; i < allPages.length; i++) {
+          const p = allPages[i]!;
+          if (p.isClosed() || isWelcomeTab(p)) continue;
+          if (regex.test(p.url())) {
+            target = p;
+            targetIndex = i;
+            matchReason = `pattern /${opts.pattern}/i`;
+            break;
+          }
+        }
+      } else {
+        throw new Error(
+          "[browser] switchTab requires one of: index, urlIncludes, pattern",
+        );
+      }
+
+      if (!target) {
+        // Build a useful error: list what IS attached so the orchestrator
+        // can pick from it on the next call without a separate listTabs.
+        const attached = allPages
+          .map((p, i) =>
+            p.isClosed() || isWelcomeTab(p) ? null : `  [${i}] ${p.url()}`,
+          )
+          .filter(Boolean)
+          .join("\n");
+        throw new Error(
+          `[browser] no attached tab matched (criterion: ${matchReason || JSON.stringify(opts)}).\n` +
+            `Currently attached:\n${attached || "  (none)"}`,
+        );
+      }
+
+      state.page = target;
+      try {
+        await target.bringToFront();
+      } catch {
+        // best-effort — bringToFront can fail if the user manually
+        // disabled the extension on this tab between listTabs and
+        // switchTab. The page is still controllable for snapshot/click.
+      }
+      let title = "";
+      try {
+        title = await target.title();
+      } catch {
+        /* best-effort */
+      }
+      console.log(
+        `[browser] switched to tab ${targetIndex} (${matchReason}): ${target.url()}`,
+      );
+      return {
+        index: targetIndex,
+        url: target.url(),
+        title,
+        isCurrent: true,
+      };
     },
 
     async close(): Promise<void> {

@@ -1072,10 +1072,15 @@ export function registerTools(server: McpServer): void {
       title: `${MCP_BRAND}: Browser status`,
       description:
         "Check whether the user's Chrome browser is connected and ready to be controlled. " +
-        "Returns the current URL/title when attached, or instructions to attach when not. " +
-        "ALWAYS call this first when starting any web task — posting a listing, scraping a " +
-        "page, filling a form, navigating a site, automating a flow in Chrome — to confirm " +
-        "the browser is reachable before issuing other browser_* calls." +
+        "Returns the current URL/title + the count of attached tabs when attached, or " +
+        "instructions to attach when not. ALWAYS call this first when starting any web " +
+        "task — posting a listing, scraping a page, filling a form, navigating a site, " +
+        "automating a flow in Chrome — to confirm the browser is reachable before issuing " +
+        "other browser_* calls. " +
+        "If multiple tabs are attached, the response notes how to switch via " +
+        "browser_list_tabs / browser_switch_tab — useful when the user has the green " +
+        "Playwriter icon clicked on more than one tab and the snapshot URL doesn't match " +
+        "what they're looking at." +
         BRAND_TAG_SUFFIX,
       inputSchema: {},
     },
@@ -1083,14 +1088,160 @@ export function registerTools(server: McpServer): void {
       const not = await ensureAttached();
       if (not) return ok(not);
       try {
-        const snap = await (await getBrowser()).snapshot();
+        const browser = await getBrowser();
+        const snap = await browser.snapshot();
+        // listTabs() returns only "real" tabs (welcome tabs filtered out)
+        // — same set the orchestrator can switch between.
+        let tabCount = 1;
+        let multiTabSuffix = "";
+        try {
+          const tabs = await browser.listTabs();
+          tabCount = Math.max(tabs.length, 1);
+          if (tabs.length > 1) {
+            // Build a compact list with index + URL so the orchestrator
+            // can switchTab without a separate listTabs call.
+            const tabList = tabs
+              .map(
+                (t) =>
+                  `  [${t.index}] ${t.isCurrent ? "* " : "  "}${t.url}`,
+              )
+              .join("\n");
+            multiTabSuffix =
+              `\n\n${tabs.length} tabs attached:\n${tabList}\n` +
+              `If this URL doesn't match what the user described, call ` +
+              `browser_switch_tab({urlIncludes: "<substring>"}) or ` +
+              `browser_switch_tab({index: N}) to switch. The snapshot/click/` +
+              `type tools target the * tab.`;
+          }
+        } catch {
+          // listTabs failure is non-fatal — fall back to single-tab text.
+        }
         return ok(
           `Attached.\nURL: ${snap.url}\nTitle: ${snap.title}\n` +
-            `(${snap.ax.split("\n").length} interactive elements visible)`,
+            `(${snap.ax.split("\n").length} interactive elements visible, ${tabCount} ${tabCount === 1 ? "tab" : "tabs"} attached)` +
+            multiTabSuffix,
         );
       } catch (e) {
         return fail(
           `Snapshot failed after available()=true: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_list_tabs",
+    {
+      title: `${MCP_BRAND}: List attached tabs`,
+      description:
+        "Enumerate every Chrome tab the user has attached the Playwriter extension to " +
+        "(every tab where the green icon is clicked). Returns each tab's index, URL, " +
+        "title, and whether it's the CURRENT tab — the one snapshot/click/type/etc. will " +
+        "target. Welcome tabs (auto-spawned chrome-extension://…/welcome.html pages) are " +
+        "filtered out — they're never the user's intent. " +
+        "Use this when browser_snapshot returns an unexpected URL: you'll see all tabs, " +
+        "then call browser_switch_tab to change the active one. Multi-tab attachment is " +
+        "the normal case whenever the user has clicked the extension on more than one tab." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {},
+    },
+    async () => {
+      const not = await ensureAttached();
+      if (not) return fail(not);
+      try {
+        const tabs = await (await getBrowser()).listTabs();
+        if (tabs.length === 0) {
+          return ok(
+            "No real tabs attached (only welcome tabs visible). Click the green " +
+              "Playwriter icon on the Chrome tab you want to control.",
+          );
+        }
+        const lines = tabs.map((t) => {
+          const star = t.isCurrent ? "* " : "  ";
+          const titleText = t.title ? ` — "${t.title.slice(0, 60)}"` : "";
+          return `[${t.index}] ${star}${t.url}${titleText}`;
+        });
+        return ok(
+          `${tabs.length} attached ${tabs.length === 1 ? "tab" : "tabs"} ` +
+            `(* = current — that's the one snapshot/click/type targets):\n` +
+            lines.join("\n") +
+            "\n\nSwitch with browser_switch_tab({urlIncludes: '<substring>'}) " +
+            "or browser_switch_tab({index: N}).",
+        );
+      } catch (e) {
+        return fail(
+          `List tabs failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_switch_tab",
+    {
+      title: `${MCP_BRAND}: Switch active tab`,
+      description:
+        "Change which attached Chrome tab subsequent browser_* calls target. Match by " +
+        "absolute index from browser_list_tabs (`{index: 2}`), by case-insensitive URL " +
+        "substring (`{urlIncludes: 'edit'}`), or by case-insensitive regex (`{pattern: " +
+        "'/listing_id=\\\\d+/'}`). The matched tab is also brought to the front in Chrome " +
+        "so the user can see it. " +
+        "Use this when browser_snapshot returns a different URL than the user described " +
+        "— typically because they have the Playwriter icon clicked on multiple tabs and " +
+        "we picked the wrong one first. Errors include the list of currently attached " +
+        "tabs so the orchestrator can re-call without a separate browser_list_tabs." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        index: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Zero-based index from browser_list_tabs. Wins over the other match params " +
+              "if multiple are passed — use this when URLs/titles might be ambiguous.",
+          ),
+        urlIncludes: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Case-insensitive substring to find in the tab URL. Most common shape: " +
+              "`{urlIncludes: 'edit'}` for a Marketplace listing edit page.",
+          ),
+        pattern: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Case-insensitive regex (JS syntax) matched against the tab URL. Use only " +
+              "when urlIncludes isn't expressive enough.",
+          ),
+      },
+    },
+    async ({ index, urlIncludes, pattern }) => {
+      const not = await ensureAttached();
+      if (not) return fail(not);
+      if (index === undefined && !urlIncludes && !pattern) {
+        return fail(
+          "browser_switch_tab requires one of: index, urlIncludes, pattern. " +
+            "Call browser_list_tabs first if you don't know what's attached.",
+        );
+      }
+      try {
+        const result = await (await getBrowser()).switchTab({
+          ...(index !== undefined ? { index } : {}),
+          ...(urlIncludes ? { urlIncludes } : {}),
+          ...(pattern ? { pattern } : {}),
+        });
+        return ok(
+          `Switched to tab [${result.index}]: ${result.url}` +
+            (result.title ? ` — "${result.title.slice(0, 60)}"` : "") +
+            "\nCall browser_snapshot now to see this tab's interactive elements.",
+        );
+      } catch (e) {
+        return fail(
+          `Switch tab failed: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     },
@@ -2110,6 +2261,8 @@ export const TOOL_NAMES = [
   "agent_do",
   // In-page browser control (Playwriter / Chrome accessibility refs)
   "browser_status",
+  "browser_list_tabs",
+  "browser_switch_tab",
   "browser_navigate",
   "browser_snapshot",
   "browser_click",

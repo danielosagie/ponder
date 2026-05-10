@@ -732,8 +732,9 @@ export async function createPlaywriterClient(
   ): Promise<void> {
     const sel = refToSelector(ref);
     try {
-      await page.evaluate(
-        (args: { sel: string; label: string | null }) => {
+      await page.evaluate<unknown>(
+        (rawArg: unknown) => {
+          const args = rawArg as { sel: string; label: string | null };
           const findVisible = (start: Element | null): Element | null => {
             let cur: Element | null = start;
             for (let i = 0; cur && i < 6; i++) {

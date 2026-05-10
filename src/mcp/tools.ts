@@ -1981,6 +1981,257 @@ export function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "agent_click_sequence",
+    {
+      title: `${MCP_BRAND}: Click N elements in order, sharing one screenshot + parallel grounding`,
+      description:
+        "Drop-in replacement for N sequential agent_click calls when the UI is STATIC " +
+        "across the whole sequence (calculator buttons, a series of toggles, picking " +
+        "items from a fixed list, multi-step forms where every target is visible from " +
+        "the start). Captures ONE screenshot, grounds all N targets IN PARALLEL via " +
+        "Promise.all, then clicks them serially in the order given. " +
+        "For 6 clicks on remote providers (H Company / Modal): typically 18s → ~5s — " +
+        "you pay max(grounding) once instead of sum(grounding) N times. " +
+        "Local Ollama benefits less: parallel requests there serialize on the GPU, so " +
+        "the win is mostly the saved screenshot captures (~150ms each). " +
+        "DO NOT use when the screen layout changes between clicks (a wizard with " +
+        "N pages, dropdowns that close after click, a list that re-orders on selection) " +
+        "— each later target won't exist on the initial screenshot. Use individual " +
+        "agent_click calls in those cases so each grounding sees the fresh state. " +
+        "Returns a summary of each click's grounded coords + ONE final post-sequence " +
+        "screenshot (NOT one per click — saves ~N × 300ms of settle+capture)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        steps: z
+          .array(
+            z.object({
+              target: z
+                .string()
+                .min(1)
+                .describe(
+                  "Plain-English description of the element to click for THIS step. " +
+                    "Same shape as agent_click's target. Be specific.",
+                ),
+              mode: z
+                .enum(["single", "double", "right", "triple"])
+                .optional()
+                .describe("Click mode for THIS step. Default 'single'."),
+            }),
+          )
+          .min(2)
+          .max(12)
+          .describe(
+            "Ordered list of clicks. Min 2 (otherwise just use agent_click). Max 12 " +
+              "(sanity cap — long sequences usually hide a state-change you missed; " +
+              "split into multiple agent_click_sequence calls).",
+          ),
+        stepDelayMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(2000)
+          .optional()
+          .describe(
+            "Delay between clicks within the sequence, in ms. Default 150ms — enough " +
+              "for fast UIs like Calculator. Bump to 300-500ms for animation-heavy UIs " +
+              "or when the post-click effect needs time before the next click registers.",
+          ),
+      },
+    },
+    async ({ steps, stepDelayMs }) => {
+      const t0 = Date.now();
+      const delayMs = stepDelayMs ?? 150;
+
+      // 1. Single screenshot — every grounding shares this frame.
+      const bridgeShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+        width: number;
+        height: number;
+        offsetX: number;
+        offsetY: number;
+      }>("/screen/screenshot", {});
+      let png: Buffer;
+      let width: number;
+      let height: number;
+      let offsetX: number;
+      let offsetY: number;
+      if (bridgeShot) {
+        png = Buffer.from(bridgeShot.pngBase64, "base64");
+        width = bridgeShot.width;
+        height = bridgeShot.height;
+        offsetX = bridgeShot.offsetX;
+        offsetY = bridgeShot.offsetY;
+      } else {
+        try {
+          const shot = await screen.screenshot();
+          png = shot.png;
+          width = shot.width;
+          height = shot.height;
+          offsetX = shot.offsetX;
+          offsetY = shot.offsetY;
+        } catch (e) {
+          return fail(
+            `Screenshot failed: ${e instanceof Error ? e.message : String(e)}. ` +
+              "Tip: start the Holo3 Electron app — its bridge has macOS Screen " +
+              "Recording perms granted.",
+          );
+        }
+      }
+      const screenshotB64 = png.toString("base64");
+
+      let provider: ProviderClient;
+      try {
+        ({ provider } = await getProviderWarmed());
+      } catch (e) {
+        return fail(
+          `Provider not configured: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+
+      // 2. Parallel grounding — all targets fire simultaneously against the
+      //    same screenshot bytes. Total wall time ≈ max(per-call grounding)
+      //    instead of sum, which is the whole point of this tool.
+      const tGroundStart = Date.now();
+      const groundResults = await Promise.all(
+        steps.map((s) =>
+          provider.ground({
+            instruction: s.target,
+            screenshotB64,
+            screen: [width, height],
+          }),
+        ),
+      );
+      const tGround = Date.now() - tGroundStart;
+
+      // 3. Fail-fast if ANY ground failed. The orchestrator gets a clear
+      //    per-step list so it can re-run individual agent_click calls
+      //    against a refined description, or re-screenshot and try again.
+      const failures = groundResults
+        .map((r, i) => ({ r, i }))
+        .filter((x) => x.r.error);
+      if (failures.length > 0) {
+        const lines = groundResults.map((r, i) =>
+          r.error
+            ? `  step ${i + 1} "${steps[i]!.target}" → FAILED (${r.error})`
+            : `  step ${i + 1} "${steps[i]!.target}" → (${r.x}, ${r.y})`,
+        );
+        return fail(
+          `Couldn't ground ${failures.length}/${steps.length} target(s) on the current ` +
+            `screen. No clicks were performed. Per-step results:\n${lines.join("\n")}\n` +
+            "Refine the failed descriptions and re-run, or split into individual " +
+            "agent_click calls so each grounding sees the freshest state.",
+        );
+      }
+
+      // 4. Sequential click execution. Bridge per click for perms; small
+      //    delay between clicks so each press registers before the next.
+      const tExecStart = Date.now();
+      const clicked: Array<{
+        target: string;
+        mode: string;
+        screenX: number;
+        screenY: number;
+        viaBridge: boolean;
+      }> = [];
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i]!;
+        const r = groundResults[i]!;
+        // ground errors filtered above — r.x / r.y safe here
+        const screenX = r.x + offsetX;
+        const screenY = r.y + offsetY;
+        const clickMode = step.mode ?? "single";
+        const bridgedClick = await tryBridgeScreenCall<{ ok: boolean }>(
+          "/screen/click",
+          { x: screenX, y: screenY, mode: clickMode },
+        );
+        if (!bridgedClick?.ok) {
+          try {
+            await screen.click(screenX, screenY, {
+              double: clickMode === "double",
+              triple: clickMode === "triple",
+              button: clickMode === "right" ? "right" : "left",
+            });
+          } catch (e) {
+            // Mid-sequence failure: report what landed + which step broke,
+            // so the orchestrator can pick up from there with agent_click.
+            const partial = clicked
+              .map(
+                (c, idx) =>
+                  `  step ${idx + 1} "${c.target}" → clicked at (${c.screenX}, ${c.screenY})`,
+              )
+              .join("\n");
+            return fail(
+              `Click failed at step ${i + 1} "${step.target}" (${screenX}, ${screenY}): ` +
+                `${e instanceof Error ? e.message : String(e)}.\n` +
+                `Completed ${clicked.length}/${steps.length} clicks before failure:\n${partial}`,
+            );
+          }
+        }
+        clicked.push({
+          target: step.target,
+          mode: clickMode,
+          screenX,
+          screenY,
+          viaBridge: !!bridgedClick?.ok,
+        });
+        // Don't delay after the LAST click — we go straight to the post-shot
+        // settle, no point doubling the wait.
+        if (i < steps.length - 1 && delayMs > 0) {
+          await screen.sleep(delayMs);
+        }
+      }
+      const tExec = Date.now() - tExecStart;
+
+      // 5. ONE post-sequence screenshot for verification (vs. one per click).
+      //    Uses the same 300ms settle as agent_click for consistency.
+      await screen.sleep(300);
+      let postPng: Buffer | undefined;
+      const postShot = await tryBridgeScreenCall<{
+        pngBase64: string;
+      }>("/screen/screenshot", {});
+      if (postShot) {
+        postPng = Buffer.from(postShot.pngBase64, "base64");
+      } else {
+        try {
+          const s = await screen.screenshot();
+          postPng = s.png;
+        } catch {
+          /* skip post-shot if we can't get it */
+        }
+      }
+
+      const totalMs = Date.now() - t0;
+      const allViaBridge = clicked.every((c) => c.viaBridge);
+      const perStepLines = clicked.map(
+        (c, i) =>
+          `  ${i + 1}. "${c.target}" → (${c.screenX}, ${c.screenY})${
+            c.mode !== "single" ? ` [${c.mode}]` : ""
+          }`,
+      );
+      const summary =
+        `Clicked ${clicked.length} targets in sequence, sharing one screenshot:\n` +
+        perStepLines.join("\n") +
+        `\nGround (parallel, ${steps.length} targets) ${tGround}ms, ` +
+        `exec ${tExec}ms (incl. ${(steps.length - 1) * delayMs}ms inter-click delay), ` +
+        `total ${totalMs}ms. ` +
+        (allViaBridge ? "(via Electron bridge) " : "") +
+        "Post-sequence screenshot attached.";
+      const responseContent: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [{ type: "text" as const, text: summary }];
+      if (postPng) {
+        responseContent.push({
+          type: "image" as const,
+          data: postPng.toString("base64"),
+          mimeType: "image/png",
+        });
+      }
+      return { content: responseContent };
+    },
+  );
+
+  server.registerTool(
     "agent_observe",
     {
       title: `${MCP_BRAND}: Preview where a click would land (no execute)`,

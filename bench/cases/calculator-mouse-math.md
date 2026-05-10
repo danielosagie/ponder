@@ -57,3 +57,38 @@ When Cursor IDE / Claude Code is showing a screenshot of Calculator in its chat 
 ## Tool budget
 
 - 12 calls. Anything more is a failure.
+
+## Batched variant
+
+> Variant id: `calculator-mouse-math-batched`
+> Tool budget: **4 calls** (down from 12; happy path is exactly 4).
+
+Once `agent_click_sequence` is wired up (commit 52505bb and the matching Modal-side `/ground/batch` shim), the six button clicks collapse into a single tool call. The static-UI assumption holds for Calculator: the keypad layout doesn't reflow between presses, so all six targets are visible from one shared screenshot.
+
+### Happy-path sequence (4 calls)
+
+1. `screen_hotkey("cmd+space")` — open Spotlight
+2. `screen_type("Calculator", thenPress: "enter")` — launch
+3. `screen_screenshot` — confirm Calculator is foregrounded on the cursor's display (catches the embedded-screenshot decoy from the gotcha section above)
+4. `agent_click_sequence({ steps: [AC, 4, 7, ×, 8, =], stepDelayMs: 150 })` — one screenshot capture, six grounded coords (server-side fan-out via `provider.groundBatch` when available, else `Promise.all` of N parallel `ground()` calls), six serial clicks, ONE post-sequence screenshot returned in the tool response
+
+That's it. No separate post-verification `screen_screenshot` — the sequence tool's response already includes the post-sequence screenshot.
+
+### Verification
+
+The tool's text summary line tells you which ground path fired:
+
+- `Ground via provider.groundBatch (1 HTTP, server-side fan-out)` → headline path. Target wall time ~5s (curl benchmark: 6-target `/ground/batch` in 2.0s vs 6 sequential `/ground` in 9s, a 4.5× HTTP-layer win with `--parallel 4` + `-c 16384` continuous batching on the Modal-side llama-server).
+- `Ground via Promise.all of 6 ground() calls` → parallel-fallback. Still ~2.4× faster than 6 individual `agent_click` calls because the screenshot is shared, but missing the single-HTTP-fan-out win.
+
+If you see the fallback path on a freshly-deployed Modal: check (a) the running `src/mcp/server.ts` PID — if it predates commit 52505bb, restart it; (b) `curl /health` against `$MODAL_BASE_URL` returns 200.
+
+### Result JSONs
+
+- Pre-sequence-tool baseline (6 individual `agent_click` calls + recovery): `bench/results/calculator-mouse-math-opus-2026-05-10T07-32-00Z.json` — 10 calls, 240s wall.
+- Batched variant: `bench/results/calculator-mouse-math-batched-opus-<ISO-Z>.json` — 4 calls. Naming: `calculator-mouse-math-batched-<model>-<ISO-Z>.json`.
+
+### Constraint deltas vs. parent case
+
+- Constraint 3 ("One agent_click per button") is REPLACED by: "One `agent_click_sequence` for the whole compute. Don't fall back to per-button `agent_click` calls — that's the parent case, not this variant."
+- Constraints 1 ("no keyboard input for the math") and 2 ("AC first") are unchanged.

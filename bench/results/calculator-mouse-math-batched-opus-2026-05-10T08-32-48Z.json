@@ -1,0 +1,47 @@
+{
+  "id": "calculator-mouse-math-batched-opus-2026-05-10T08-32-48Z",
+  "case": "calculator-mouse-math-batched",
+  "model": "opus (orchestrator-driven)",
+  "started_at": "2026-05-10T08:32:48Z",
+  "ended_at": "2026-05-10T08:34:31Z",
+  "elapsed_ms": 103000,
+  "outcome": "fallback_path",
+  "tool_call_count": 4,
+  "tool_calls": [
+    "screen_hotkey (cmd+space)",
+    "screen_type (Calculator + enter)",
+    "screen_screenshot (confirmed Calculator foregrounded; menu bar reads 'Calculator', cursor on same display)",
+    "agent_click_sequence (6 steps: AC, 4, 7, ×, 8, =, stepDelayMs=150)"
+  ],
+  "ground_path": "parallel-fallback",
+  "ground_ms": 2647,
+  "exec_ms": 1354,
+  "total_ms_sequence_call": 7562,
+  "verification": "Calculator display read '47×8' (expression line) and '376' (result line) in the post-sequence screenshot. Green-arrow OS cursor marker visible adjacent to the equals button — the last-clicked target — confirming the click physically executed. All 6 grounded coords landed on Calculator buttons: AC (777,491), 4 (721,599), 7 (723,544), × (885,544), 8 (779,545), = (886,707). 47 × 8 = 376 computed correctly.",
+  "comparison_to_prior_runs": {
+    "calculator-mouse-math-opus-2026-05-10T07-32-00Z": "10 calls including recovery, 240s wall, individual agent_click — pre-sequence-tool baseline (avg agent_click_total_ms 3050, avg grounding_ms 2440 per click)",
+    "this_run": "4 calls, 103s wall (includes orchestrator narration + diagnostic time between launch and verification screenshot); the agent_click_sequence call itself completed in 7.56s with the parallel-fallback ground_path. Tool-budget improvement: 10 → 4 calls. Sequence-call wall: 6×3.05s ≈ 18s baseline → 7.56s actual (~2.4× speedup). Headline batch path NOT exercised — see modal_deploy notes."
+  },
+  "modal_deploy": "Deployed today (~07:25Z) via npm run modal:deploy. /warm returned ready in 27.93s on first hit (L4 cold boot with --parallel 4 + -c 16384). Curl benchmark beforehand: 6-target /ground/batch in 2.0s vs 6 sequential /ground in 9s — 4.5× HTTP-layer speedup confirmed. NOTE: this run did NOT hit /ground/batch — see ground_path_diagnostic below.",
+  "ground_path_diagnostic": {
+    "expected": "Ground via provider.groundBatch (1 HTTP, server-side fan-out)",
+    "actual": "Ground via Promise.all of 6 ground() calls",
+    "root_cause": "Stale MCP server PID — the running src/mcp/server.ts child process predates commit 52505bb and does not have provider.groundBatch on its Holo3RemoteProvider. Source verification: groundBatch is present in src/agent/providers/remote.ts:124, src/agent/types.ts:60, src/mcp/tools.ts:2108. The fallback summary string carries no 'groundBatch failed; falling back' preamble, which means typeof provider.groundBatch === 'function' returned false at runtime — i.e., the method literally wasn't on the loaded provider object. If groundBatch had been called and thrown a network/Modal error, the warn-and-fall-back path in tools.ts:2122 would have logged it.",
+    "evidence": "ps aux showed 6 stale tsx src/mcp/server.ts processes spawned at 02:54, 03:43, and 04:32 local time — all before commit 52505bb's deploy at 07:25Z. The current Claude Code session is connected to one of those.",
+    "recovery": "User-side: kill the stale tsx src/mcp/server.ts PIDs and restart Claude Code so a fresh MCP server is spawned from post-52505bb code. Cannot be performed mid-session — restarting Claude kills this conversation. Re-run this benchmark afterwards to confirm ground_path flips to 'batch'.",
+    "non_root_cause_ruled_out": "Modal endpoint health: not directly probed from this sandbox shell ($MODAL_BASE_URL/$MODAL_BEARER_TOKEN not exported into the Claude Code sandbox env, so curl returned HTTP 000 against an empty URL). However, the per-ground latency in this run (2647ms for 6 parallel grounds) is consistent with a healthy warm Modal endpoint with --parallel 4 + continuous batching — if Modal were unreachable, every ground() would have thrown and the click sequence would have crashed."
+  },
+  "secondary_findings": [
+    {
+      "id": "parallel-fallback-already-helps",
+      "description": "Even on the parallel-fallback path (Promise.all of N ground() calls, single shared screenshot), the new agent_click_sequence tool delivers ~2.4× speedup vs. the per-click baseline (7.56s vs ~18s). The shared-screenshot win is real on its own, before any /ground/batch involvement.",
+      "implication": "The agent_click_sequence MCP tool surface is correctly designed: even with the slower fallback wired underneath, calling it is strictly better than 6 individual agent_click calls for static UI sequences. The /ground/batch path is incremental on top, not load-bearing for the MCP-layer tool to be useful."
+    },
+    {
+      "id": "embedded-screenshot-decoy-not-triggered",
+      "description": "Despite the orchestrator chat (Cursor IDE / Claude Code) being visible on the same display as Calculator and showing thumbnail screenshots of Calculator, the grounding model picked the real Calculator window for all 6 targets. The known gotcha from the prior baseline did not recur in this run.",
+      "implication": "Likely because the real Calculator is far larger and more centered in the screenshot than the chat thumbnails, so the vision model's spatial bias favored the real target. Not a fix — still recommend cmd+tab recovery if the decoy ever wins."
+    }
+  ],
+  "narration_in_chat": "Each of the 4 tool calls was preceded by a one-line plain-English narration ('Step 1 — Opening Spotlight', 'Step 4 — Firing the headline batch call', etc.) per SKILL.md guidance."
+}

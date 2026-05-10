@@ -22,16 +22,18 @@ You're better at planning than the inner brain. Don't hand it multi-step goals �
 ## The five hard rules
 
 1. **ref present → `browser_click` / `browser_type`** — never `agent_*`. Even if the click *opens* a native dialog, the click itself is in-Chrome.
-2. **File upload from disk → `browser_set_input_files`** — never `agent_*`, never `browser_click` on the styled "Add photo" button as the upload step. The MCP surfaces hidden `<input type=file>` refs flagged `(use browser_set_input_files, accepts=…)`. If you don't see one, click the styled button first, then re-snapshot. **Don't know the exact path?** Use a Bash tool (`ls -t ~/Desktop/Screenshot*.png | head -1`, `find ~/Documents -name "report.pdf"`, `mdfind …`) to read it from disk — NEVER open Finder via `agent_do(surface: "finder")` to "find" a file; that burns ~30s of vision clicks when one Bash call gives you the path instantly.
+2. **File upload from disk → `browser_set_input_files`** — never `agent_*`, never `browser_click` on the styled "Add photo" button as the upload step. The MCP surfaces hidden `<input type=file>` refs flagged `(use browser_set_input_files, accepts=…)`. If you don't see one, click the styled button first, then re-snapshot. **Don't know the exact path?** Use a Bash tool (`ls -t ~/Desktop/Screenshot*.png | head -1`, `find ~/Documents -name "report.pdf"`, `mdfind …`) to read it from disk — NEVER open Finder via `agent_do(surface: "finder")` to "find" a file; that burns ~30s of vision clicks when one Bash call gives you the path instantly. **Native picker is open AND you know the absolute path?** `screen_hotkey("cmd+shift+g")` → `screen_type(path, thenPress: "enter")` → `screen_hotkey("enter")`. Three calls, ~1-2s, no vision. Works on every macOS file picker.
 3. **OS-level click you can describe → `agent_click(target, mode?)`. OS-level drag → `agent_drag(from, to)`.** These are the FAST primitives — ~2-3s per call, same shape as `browser_click` but vision-grounded for things outside Chrome (file picker rows, Open buttons, Finder items, Spotlight results, dock icons, menu-bar items). They return a post-action screenshot so you can verify in the same reply. Use these whenever you already know the verb AND the target.
 4. **agent_do is the AUTONOMOUS loop, not the default OS-click tool.** Reach for it ONLY when the brain has to decide verb AND target as it goes (open-ended exploration, multi-step OS dance with unknown surfaces). For atomic actions, agent_click is 5× faster. agent_do still requires a `surface` declaration; capped at 8 inner steps.
 5. **After ANY tool call, observe before the next one.** agent_click and agent_drag include a post-action screenshot in their reply — look at it FIRST. agent_do replies include a final-frame screenshot — look at it FIRST. `exhausted` often means the goal already landed and the inner brain just couldn't recognize completion. NEVER chain another action without checking state.
 
-## The 17 tools
+## The 19 tools
 
 | Tool | Surface | Use for |
 |---|---|---|
-| `browser_status` | Chrome | Cold-start probe (call first) |
+| `browser_status` | Chrome | Cold-start probe (call first). Lists tab count + `*` marker; if >1 tabs attached, response shows them inline. |
+| `browser_list_tabs()` | Chrome | Enumerate every attached tab — call when `browser_snapshot` returned an unexpected URL. |
+| `browser_switch_tab({index?, urlIncludes?, pattern?})` | Chrome | Switch which tab subsequent browser_* targets. Common: `{urlIncludes: "edit"}`. |
 | `browser_navigate(url)` | Chrome | Open / jump to a URL |
 | `browser_snapshot()` | Chrome | List `[eN]` refs |
 | `browser_click(ref)` | Chrome | One in-page click |
@@ -48,6 +50,8 @@ You're better at planning than the inner brain. Don't hand it multi-step goals �
 | `screen_hotkey(combo)` | OS | Keyboard shortcut |
 | `screen_scroll_os(dir, amount?)` | OS | Scroll non-Chrome surface |
 | `screen_wait(ms)` | OS | Sleep (use sparingly) |
+
+> **`screen_click` / `screen_drag` / `screen_observe` are not real tools** — they return a redirect to `agent_click` / `agent_drag` / `agent_observe` (the `agent_*` namespace = vision-grounded; `screen_*` = keyboard / scroll / inspection). If you call them, you'll see the redirect; just re-call against `agent_*`.
 
 `agent_click` and `agent_drag` are the OS-layer equivalent of `browser_click` — fast, atomic, deterministic-feeling. Reserve `agent_do` for the cases where you genuinely don't know what to click yet.
 
@@ -97,6 +101,7 @@ Use `goal` to give the autonomous brain framing context: `agent_do(task: "naviga
 - **Same action failed twice** — STOP. Re-snapshot. Re-decide based on actual state.
 - **agent_do returned `exhausted`** — observe BOTH `browser_snapshot` AND `screen_screenshot`. Half the time the work is already done.
 - **`browser_status` says "not attached"** — Chrome's security requires a user gesture. Take ONE `screen_screenshot` to see Chrome's actual state, then give the user ONE concise instruction ("Click the green Playwriter icon on the <tab> tab" if Chrome is visible; "Open Chrome to <url> and click the green Playwriter icon" if it isn't). Do NOT relay the verbose error message verbatim. Do NOT call `agent_do` to "attach" — it can't.
+- **`browser_status` shows an unexpected URL** (or `>1` tabs attached and the `*` is on the wrong one) — call `browser_switch_tab({urlIncludes: "<substring>"})` to switch. Common when the user has the green icon clicked on multiple tabs. The response from `browser_status` already lists all tabs inline when there are multiple — pick from there.
 
 ## Reporting results
 

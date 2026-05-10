@@ -42,6 +42,35 @@ screen_hotkey("escape")       # dismiss the picker that's still on screen
 browser_snapshot              # verify
 ```
 
+### Native file picker is open AND you know the absolute path
+
+The fastest path is the macOS "Go to folder" shortcut. Skips visual targeting entirely — works on every native file picker.
+
+```
+screen_hotkey("cmd+shift+g")                            # opens Go-to-folder overlay
+screen_type("/abs/path/file.png", thenPress: "enter")   # path → file selected + previewed
+screen_hotkey("enter")                                  # commit (Open is the default button)
+```
+
+3 OS-level calls. ~1-2s wall time. **No vision grounding.** Use this whenever `browser_set_input_files` isn't available AND the picker is already open.
+
+If you DON'T know the absolute path: use Bash (`ls -t ~/Desktop/Screenshot*.png | head -1`, `find ~/Documents -name "report.pdf"`, `mdfind kMDItemDisplayName=…`) to read it from disk first, then run the recipe above.
+
+### `browser_snapshot` returns a URL that doesn't match what's on screen
+
+Playwriter is attached to a different tab than what the user is looking at. This is normal when the user has multiple tabs all "green" (extension clicked on each).
+
+```
+browser_status                                  # already shows tab list when >1 attached
+# … OR if you need a fresh enumeration:
+browser_list_tabs                               # see all attached tabs
+browser_switch_tab({urlIncludes: "edit"})       # switch by URL substring
+# or browser_switch_tab({index: 2})             # by absolute index
+browser_snapshot                                # now reflects the right page
+```
+
+`browser_status` lists all attached tabs inline when there are >1, so usually you don't need a separate `browser_list_tabs` — just read the tabs from the status response and pick the one you want.
+
 ### 2. Find 3 Marketplace listings under $3,000 (pure Chrome — no agent_do)
 
 ```
@@ -160,6 +189,8 @@ browser_snapshot       # new thumbnail in the photos row
 | `browser_type` did nothing | Click the field with `browser_click` first, then type. |
 | Same action repeated 2+ times | STOP. Re-snapshot. Re-decide based on actual state, not what you "would have done next". |
 | `agent_click` clicked the wrong thing | Run `agent_observe(<better description>)` to see where the model thinks it is, then refine the description and `agent_click` with the new wording. Mention surface ("in the file picker"), position ("in the bottom-right"), or visual cue ("the highlighted row"). |
+| `browser_snapshot` returns a URL that doesn't match what's visible | Multi-tab attachment. `browser_status` already lists all attached tabs when >1 — call `browser_switch_tab({urlIncludes: "..."})` to switch, then re-snapshot. |
+| Tool not found / "No such tool: screen_click" | The tool is `agent_click` (or `agent_drag`, `agent_observe`). The `screen_*` redirect-stubs return a fail with the right tool name + your args ready to paste — just re-call with `agent_*`. |
 | `agent_do exhausted` | OBSERVE FIRST (both `screen_screenshot` and `browser_snapshot`). Half the time the goal already landed. |
 
 ### Never call `screen_hotkey` to "see what's in another window"

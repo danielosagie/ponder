@@ -1137,12 +1137,13 @@ app.whenReady().then(() => {
 app.on("before-quit", () => {
   if (fleetHeartbeatTimer) clearInterval(fleetHeartbeatTimer);
   if (fleetClaimTimer) clearInterval(fleetClaimTimer);
-  // Best-effort: tell Convex we're going offline so the cron doesn't have to
-  // wait 45s before re-routing in-flight sessions.
+  // Tell Convex we're going offline AND release any in-flight session so a
+  // sibling worker can pick it up immediately. Without this, the orphaned
+  // session sits in "running" status until the reaper cron runs (~30s) and
+  // discovers our heartbeat is stale (~45s).
   if (convex && fleetWorkerId) {
-    void convex.mutation(convexApi.workers.heartbeat, {
+    void convex.mutation(convexApi.workers.goOffline, {
       workerId: fleetWorkerId,
-      status: "offline",
     });
   }
 });

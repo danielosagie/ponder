@@ -37,6 +37,13 @@ const STATUS = v.union(
  * Idempotent. Inserts a new workers row on first launch; updates hostname /
  * platform / capabilities / status if the worker is already known. Returns
  * the workers._id so the desktop can pass it to subsequent mutations.
+ *
+ * Also handles crash recovery: if the existing row was holding a
+ * currentSessionId that's still "running", we release the orphan back to
+ * "pending" so this newly-relaunched worker (or any other in the fleet) can
+ * claim it on the next claimNext tick. This closes the 30-45s gap before the
+ * reaper cron would do the same — important for "I just restarted Ponder.app"
+ * UX where the user expects to immediately resume.
  */
 export const register = mutation({
   args: {
@@ -53,15 +60,30 @@ export const register = mutation({
       .first();
     const now = Date.now();
     if (existing) {
+      // Crash recovery: if we were holding a session that's still running,
+      // release it. The desktop's in-process loop is dead (we're booting
+      // fresh), so the session is orphaned. Releasing back to "pending" lets
+      // the very next claimNext (this worker's or a sibling's) pick it up.
+      if (existing.currentSessionId) {
+        const orphan = await ctx.db.get(existing.currentSessionId);
+        if (orphan && orphan.status === "running") {
+          await ctx.db.patch(existing.currentSessionId, {
+            status: "pending",
+            claimedBy: undefined,
+            claimedAt: undefined,
+          });
+        }
+      }
       await ctx.db.patch(existing._id, {
         hostname: args.hostname,
         platform: args.platform,
         capabilities: args.capabilities,
         workspaceId: args.workspaceId,
         lastHeartbeatAt: now,
-        // Re-register clears any stale "offline" status so the worker is
-        // immediately eligible to claim again.
-        status: existing.status === "busy" ? "busy" : "idle",
+        // Always reset to "idle" on register — if we were "busy", that was a
+        // pre-crash state and the orphan release above just freed the slot.
+        status: "idle",
+        currentSessionId: undefined,
       });
       return existing._id;
     }
@@ -208,6 +230,39 @@ export const releaseSession = mutation({
       status: "idle",
       currentSessionId: undefined,
       lastHeartbeatAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Graceful shutdown. Marks the worker offline AND releases any in-flight
+ * session back to "pending" so a sibling worker can pick it up immediately.
+ * Called from electron/main.ts's before-quit handler. Idempotent — safe if
+ * the worker had already been reaped by the cron.
+ */
+export const goOffline = mutation({
+  args: {
+    workerId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const worker = await ctx.db
+      .query("workers")
+      .withIndex("by_workerId", (q) => q.eq("workerId", args.workerId))
+      .first();
+    if (!worker) return;
+    if (worker.currentSessionId) {
+      const session = await ctx.db.get(worker.currentSessionId);
+      if (session && session.status === "running") {
+        await ctx.db.patch(worker.currentSessionId, {
+          status: "pending",
+          claimedBy: undefined,
+          claimedAt: undefined,
+        });
+      }
+    }
+    await ctx.db.patch(worker._id, {
+      status: "offline",
+      currentSessionId: undefined,
     });
   },
 });

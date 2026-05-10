@@ -28,6 +28,8 @@
  * doesn't care whether Chrome is reachable on a given step or not.
  */
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type {
   BrowserClient,
   BrowserSnapshot,
@@ -179,6 +181,66 @@ function isWelcomeTab(p: PWPage): boolean {
   return /^chrome-extension:\/\/[a-z]+\/src\/welcome\.html(?:[?#]|$)/i.test(
     p.url(),
   );
+}
+
+/**
+ * Resolve a file path tolerantly. The fast path: if the literal path
+ * exists on disk, return it as-is. The slow path (only when the
+ * literal doesn't exist): scan the parent directory for an entry that
+ * matches the target basename UNDER WHITESPACE-AGNOSTIC + UNICODE-NFC
+ * + CASE-INSENSITIVE comparison.
+ *
+ * The motivating case is macOS Screenshot filenames. macOS inserts a
+ * NARROW NO-BREAK SPACE (U+202F) between the time and "AM"/"PM"
+ * (typographic convention), but the orchestrator routinely re-types
+ * paths with a regular ASCII space (U+0020) — they look identical to
+ * any reader, including the model itself. Without this resolver,
+ * `setInputFiles("/path/to/Screenshot 2026-05-08 at 1.59.53 PM.png")`
+ * fails with ENOENT even though the file is sitting RIGHT THERE on
+ * Desktop. The harness should solve this so the orchestrator doesn't
+ * have to know about U+202F to upload a screenshot.
+ *
+ * Match function uses three normalizations stacked in order:
+ *   1. Unicode NFC composition — handles combining characters.
+ *   2. /\\s+/g → " "  — collapses any Unicode whitespace runs to a
+ *      single ASCII space. Crucially, /\\s/ matches U+202F and other
+ *      Unicode space chars (per JS regex spec).
+ *   3. .toLowerCase() — macOS HFS+ / APFS default case-insensitive
+ *      mode treats "FILE.PNG" == "file.png".
+ *
+ * Returns { resolved, viaFuzz } so callers can log the fuzz-match for
+ * debugging when the literal path didn't exist.
+ *
+ * Best-effort: if the parent directory isn't readable, returns the
+ * original path unchanged so the caller's downstream error path
+ * (Playwright's setInputFiles → ENOENT) still fires with its native
+ * message. We don't swallow the error here.
+ */
+async function resolveFilePathTolerant(
+  p: string,
+): Promise<{ resolved: string; viaFuzz: boolean }> {
+  try {
+    await fs.access(p);
+    return { resolved: p, viaFuzz: false };
+  } catch {
+    const dir = path.dirname(p);
+    const base = path.basename(p);
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return { resolved: p, viaFuzz: false };
+    }
+    const norm = (s: string): string =>
+      s.normalize("NFC").replace(/\s+/g, " ").toLowerCase();
+    const target = norm(base);
+    for (const entry of entries) {
+      if (norm(entry) === target) {
+        return { resolved: path.join(dir, entry), viaFuzz: true };
+      }
+    }
+    return { resolved: p, viaFuzz: false };
+  }
 }
 
 async function tryLoadModules(): Promise<{
@@ -721,6 +783,28 @@ export async function createPlaywriterClient(
     async setInputFiles(ref: string, paths: string[]): Promise<void> {
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
+      // Resolve every path through the whitespace-tolerant resolver
+      // before handing them to Playwright. The motivating bug from the
+      // first Haiku benchmark run: macOS Screenshot filenames contain a
+      // NARROW NO-BREAK SPACE (U+202F) between the time and "AM"/"PM"
+      // — but the orchestrator re-types them with a regular ASCII space
+      // (U+0020). The strings look identical to any reader, but
+      // Playwright's setInputFiles failed with ENOENT because the
+      // literal byte sequence didn't match the on-disk name. The
+      // resolver scans the parent directory and matches under
+      // whitespace-agnostic + Unicode-NFC + case-insensitive comparison,
+      // so the upload Just Works without the orchestrator having to
+      // know about U+202F.
+      const resolved: string[] = [];
+      for (const p of paths) {
+        const r = await resolveFilePathTolerant(p);
+        if (r.viaFuzz) {
+          console.log(
+            `[browser] setInputFiles: literal path "${p}" not found; fuzz-matched to "${r.resolved}"`,
+          );
+        }
+        resolved.push(r.resolved);
+      }
       // Playwright's setInputFiles writes to the underlying <input
       // type="file"> element AND fires the synthetic `change` event
       // the page is listening for, so the styled UI (preview thumbnail,
@@ -736,7 +820,7 @@ export async function createPlaywriterClient(
       // The locator can target a hidden / display:none input — that's
       // why the snapshot now surfaces hidden file inputs and tags them
       // with (use browser_set_input_files).
-      await page.locator(refToSelector(ref)).setInputFiles(paths);
+      await page.locator(refToSelector(ref)).setInputFiles(resolved);
     },
 
     async scrollElement(

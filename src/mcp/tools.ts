@@ -1401,11 +1401,23 @@ export function registerTools(server: McpServer): void {
             "(thumbnail / progress UI should now be visible).",
         );
       } catch (e) {
-        return fail(
-          `Set input files on ${ref} failed: ${
-            e instanceof Error ? e.message.split("\n")[0] : String(e)
-          }`,
-        );
+        const msg = e instanceof Error ? e.message.split("\n")[0] : String(e);
+        // ENOENT despite our whitespace-tolerant resolver = the path is
+        // genuinely wrong (typo in dir, file deleted, etc.). Give the
+        // orchestrator a pointer to the right recovery instead of a
+        // bare error string.
+        if (/ENOENT|no such file/i.test(msg)) {
+          return fail(
+            `Set input files on ${ref} failed: ${msg}\n\n` +
+              `One of the paths doesn't exist on disk. The harness already auto-tolerates ` +
+              `whitespace mismatches (e.g., macOS Screenshot's U+202F vs ASCII space) and ` +
+              `case differences, so this isn't a typography issue — the file is genuinely ` +
+              `missing or in a different directory than the path you passed. ` +
+              `Run a Bash 'ls' or 'find' to confirm the actual location, then re-call ` +
+              `with the corrected absolute path.`,
+          );
+        }
+        return fail(`Set input files on ${ref} failed: ${msg}`);
       }
     },
   );

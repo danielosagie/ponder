@@ -1,0 +1,35 @@
+{
+  "id": "bulbasaur-photo-upload-haiku-2026-05-10T01-33-06Z",
+  "case": "bulbasaur-photo-upload",
+  "model": "haiku",
+  "started_at": "2026-05-10T01:33:06.404Z",
+  "ended_at": "2026-05-10T01:34:18.161Z",
+  "elapsed_ms": 71757,
+  "outcome": "exhausted",
+  "tool_call_count": 8,
+  "tool_calls": [
+    "browser_status",
+    "browser_snapshot",
+    "Bash",
+    "Bash",
+    "Bash",
+    "browser_set_input_files",
+    "browser_snapshot",
+    "screen_screenshot"
+  ],
+  "verification": "Did not complete: browser_set_input_files returned ENOENT on the path the subagent constructed; subagent then reported the file as missing.",
+  "errors": [
+    "browser_set_input_files: ENOENT (path passed had ASCII space U+0020 between time and 'PM'; actual filename has Unicode NARROW NO-BREAK SPACE U+202F that macOS Screenshot inserts)",
+    "Subagent also reported 'Playwriter extension disconnected' and 'ENOSPC disk space errors' — disk is 99.98% full (~156Mi free of 926Gi) which may have contributed to environment flakiness, but the primary blocker was the U+202F whitespace mismatch."
+  ],
+  "notes": "Subagent tool sequence was structurally correct (status → snapshot → ls → set_input_files → verify) and would have hit the 5-call happy path EXCEPT for the U+202F bug. The path Haiku passed looked identical to the real filename to any human reader, but the on-disk filename uses U+202F where Haiku used U+0020. Full path on disk: 'Screenshot 2026-05-08 at 1.59.53\\u202FPM.png'. The orchestrator cannot reliably round-trip this through its own output; the harness needs to resolve the path tolerantly.",
+  "haiku_subagent_summary": "Located the file and upload element but could not proceed due to system issues (disk space, file accessibility, extension disconnection). The zero-byte file sizes suggest sparse files or filesystem corruption on the test system.",
+  "ground_truth_correction": "Disk has 156Mi free (99.98% full but functional). File DOES exist at /Users/dosagie/Desktop/Screenshot 2026-05-08 at 1.59.53\\u202FPM.png with size 2114352 bytes. Subagent's diagnosis of 'sparse files / filesystem corruption' was a hallucination — the real cause is the U+202F whitespace mismatch.",
+  "duration_breakdown": {
+    "subagent_tool_uses_internal": 11,
+    "subagent_self_reported_calls": 8,
+    "subagent_total_tokens": 52045,
+    "subagent_duration_ms": 28395,
+    "wall_time_ms": 71757
+  }
+}

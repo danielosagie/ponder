@@ -191,6 +191,7 @@ browser_snapshot       # new thumbnail in the photos row
 | `agent_click` clicked the wrong thing | Run `agent_observe(<better description>)` to see where the model thinks it is, then refine the description and `agent_click` with the new wording. Mention surface ("in the file picker"), position ("in the bottom-right"), or visual cue ("the highlighted row"). |
 | `browser_snapshot` returns a URL that doesn't match what's visible | Multi-tab attachment. `browser_status` already lists all attached tabs when >1 — call `browser_switch_tab({urlIncludes: "..."})` to switch, then re-snapshot. |
 | Tool not found / "No such tool: screen_click" | The tool is `agent_click` (or `agent_drag`, `agent_observe`). The `screen_*` redirect-stubs return a fail with the right tool name + your args ready to paste — just re-call with `agent_*`. |
+| `browser_set_input_files: ENOENT` | The harness now auto-tolerates whitespace mismatches (macOS Screenshot's U+202F NARROW NO-BREAK SPACE vs the regular ASCII space the model can't visually distinguish) AND case differences. If ENOENT still fires, the file is GENUINELY missing or in a different directory — re-run Bash `ls` / `find` to confirm the location, don't just retry the same path. |
 | `agent_do exhausted` | OBSERVE FIRST (both `screen_screenshot` and `browser_snapshot`). Half the time the goal already landed. |
 
 ### Never call `screen_hotkey` to "see what's in another window"

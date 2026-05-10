@@ -22,7 +22,7 @@ loadDotenv({ path: join(process.cwd(), ".env") });
 loadDotenv({ path: join(process.cwd(), ".env.local"), override: false });
 
 import { runTask } from "../src/agent/loop";
-import { BACKGROUND_MODE } from "../src/screen";
+import { BACKGROUND_MODE } from "../src/agent/screen/nut";
 import { createOllamaNarrator } from "../src/agent/narrator";
 import { createExtractor } from "../src/agent/extractor";
 import type { AgentEvents, ProviderClient, ProviderName } from "../src/agent/types";
@@ -42,6 +42,7 @@ import {
   createBuddyWindow,
   startBuddyCursorBroadcast,
 } from "./windows";
+import { applyDeepLink, loadConvexUrl } from "./config";
 
 let tray: Tray | null = null;
 let appWin: BrowserWindow | null = null;
@@ -174,7 +175,7 @@ function dismissInputPill(): void {
   inputPillVisible = false;
 }
 
-const convexUrl = process.env.VITE_CONVEX_URL ?? process.env.CONVEX_URL;
+const convexUrl = loadConvexUrl();
 const convex = convexUrl ? new ConvexHttpClient(convexUrl) : null;
 
 function makeProvider(name: ProviderName): ProviderClient {
@@ -821,6 +822,48 @@ function toggleInputPill(): void {
   } else {
     showInputPill();
   }
+}
+
+// Register ponder:// as a custom protocol so dev-issued setup links can
+// configure a customer's app with one click. The link encodes the dev's
+// Convex deployment URL: ponder://configure?convex=https://foo.convex.cloud
+//
+// macOS routes the URL through `open-url`. Windows/Linux pass it as argv
+// after `setAsDefaultProtocolClient`; we surface that via second-instance.
+if (!app.isDefaultProtocolClient("ponder")) {
+  app.setAsDefaultProtocolClient("ponder");
+}
+
+// Single-instance lock so a second `open ponder://...` invocation reaches the
+// already-running window instead of spawning a duplicate process.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_e, argv) => {
+    const link = argv.find((a) => a.startsWith("ponder://"));
+    if (link) handleDeepLink(link);
+    if (appWin && !appWin.isDestroyed()) {
+      if (appWin.isMinimized()) appWin.restore();
+      appWin.focus();
+    }
+  });
+  app.on("open-url", (e, url) => {
+    e.preventDefault();
+    handleDeepLink(url);
+  });
+}
+
+function handleDeepLink(url: string): void {
+  const convexUrl = applyDeepLink(url);
+  if (!convexUrl) {
+    console.warn(`[deep-link] ignored malformed url: ${url}`);
+    return;
+  }
+  new Notification({
+    title: "Ponder configured",
+    body: "Restart Ponder to connect to the new deployment.",
+  }).show();
 }
 
 app.whenReady().then(() => {

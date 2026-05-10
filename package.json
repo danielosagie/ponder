@@ -1,28 +1,87 @@
 {
-  "name": "holo3-agent",
+  "name": "ponder",
   "version": "0.1.0",
-  "description": "Clicky-style computer-use agent backed by Holo3 on Modal",
-  "private": true,
-  "main": "out/main/index.js",
+  "description": "Computer-use agent SDK + CLI — dispatch tasks to the shared Ponder desktop app.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.18"
+  },
+  "bin": {
+    "ponder": "dist/cli/index.js"
+  },
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "import": "./dist/agent/index.js",
+      "require": "./dist/agent/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "convex/schema.ts",
+    "convex/sessions.ts",
+    "convex/steps.ts",
+    "convex/tsconfig.json",
+    "scripts/setup-local.sh",
+    "scripts/Holo3.Modelfile",
+    "modal_app.py",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "tsup",
+    "build:app": "electron-vite build",
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
     "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
     "modal:deploy": "modal deploy modal_app.py",
-    "typecheck": "tsc --noEmit"
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@nut-tree-fork/nut-js": "^4.2.2",
+    "@clack/prompts": "^0.7.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
     "convex": "^1.17.0",
     "dotenv": "^17.4.2",
-    "node-mac-permissions": "^2.5.0",
+    "execa": "^9.5.1",
     "ollama": "^0.5.10",
+    "ora": "^8.1.1",
     "playwright-core": "^1.49.0",
-    "playwriter": "^0.1.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "playwriter": "^0.1.0"
+  },
+  "optionalDependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.2",
+    "node-mac-permissions": "^2.5.0"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -31,6 +90,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
     "electron-vite": "^2.3.0",
+    "tsup": "^8.3.5",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }

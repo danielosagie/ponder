@@ -1,6 +1,6 @@
 import type { ProviderClient, PlanResult, GroundResult } from "../types";
 
-interface RemoteConfig {
+export interface RemoteConfig {
   baseUrl: string;
   token: string;
   fetchImpl?: typeof fetch;

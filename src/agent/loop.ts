@@ -10,7 +10,8 @@ import { findCoordinates } from "./eyes";
 import { createOllamaPlanner } from "./planner";
 import type { AgentEvents, ProviderClient } from "./types";
 import type { BrowserClient, BrowserSnapshot } from "./browser/types";
-import * as screen from "../screen";
+import type { Screenshot, ScreenAdapter } from "./screen/types";
+import { createNutScreenAdapter } from "./screen/nut";
 
 // Per-subtask cap. With hierarchical planning the inner loop only needs to
 // carry ONE focused phase to completion ("open Chrome", "search Google for
@@ -77,6 +78,13 @@ export interface RunOptions {
    * the model when no Chrome snapshot is available.
    */
   onScreenshotBuffer?: (png: Buffer) => void;
+  /**
+   * Optional screen automation adapter. When omitted the loop creates a
+   * default nut-js + cliclick adapter (the same behavior as before this
+   * abstraction landed). SDK consumers running headless or on non-mac
+   * platforms should pass their own implementation.
+   */
+  screen?: ScreenAdapter;
 }
 
 /**
@@ -211,6 +219,7 @@ async function runOneSubtask(
 ): Promise<"done" | "cancelled" | "exhausted"> {
   const { task, provider, events, overallGoal, maxSteps, onStep } = opts;
   const browser = opts.browser ?? null;
+  const screen = opts.screen ?? createNutScreenAdapter();
   const history: string[] = [];
   // For each typed text we've ever attempted in this run, the set of screen
   // hashes the screen had right before we tried it. Re-typing the SAME text
@@ -222,7 +231,7 @@ async function runOneSubtask(
   // Prefetched next screenshot. We kick this off ~250ms after each action so
   // it overlaps with the inter-step pause; by the time the next iteration
   // starts, the bytes are already in memory and we skip a 50-200ms grab+encode.
-  let prefetched: Promise<screen.Screenshot> | null = null;
+  let prefetched: Promise<Screenshot> | null = null;
   const stepPause =
     provider.name === "hcompany" ? STEP_PAUSE_MS_HCOMPANY : STEP_PAUSE_MS_DEFAULT;
 
@@ -269,7 +278,7 @@ async function runOneSubtask(
     // its pause — saves the grab+PNG-encode latency on every step after the
     // first. If prefetch failed (e.g. transient nut-js error), fall back to a
     // fresh capture so a single bad frame doesn't kill the whole run.
-    let shot: screen.Screenshot;
+    let shot: Screenshot;
     let prefetchUsed = false;
     if (prefetched) {
       try {
@@ -505,7 +514,7 @@ async function runOneSubtask(
     }
 
     const tExec = Date.now();
-    const executed = await executeAction(action, coords, dragTo, browser);
+    const executed = await executeAction(action, coords, dragTo, browser, screen);
     if (executed) {
       console.log(
         `[loop] ⚡ exec (${Date.now() - tExec}ms): ${executed.type} ${JSON.stringify(executed.payload)}`,
@@ -584,6 +593,7 @@ async function executeAction(
   coords: { x: number; y: number } | null,
   dragTo: { x: number; y: number } | null = null,
   browser: BrowserClient | null = null,
+  screen: ScreenAdapter = createNutScreenAdapter(),
 ): Promise<{ type: string; payload: Record<string, unknown> } | null> {
   const a = action.trim();
 

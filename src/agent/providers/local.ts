@@ -1,7 +1,7 @@
 import { Ollama } from "ollama";
 import type { ProviderClient, PlanResult, GroundResult } from "../types";
 
-interface LocalConfig {
+export interface LocalConfig {
   host?: string;
   model?: string;
 }

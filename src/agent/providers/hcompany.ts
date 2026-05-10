@@ -16,7 +16,7 @@
  */
 import type { ProviderClient, PlanResult, GroundResult } from "../types";
 
-interface HCompanyConfig {
+export interface HCompanyConfig {
   apiKey: string;
   model?: string; // default "holo3-35b-a3b"
   baseUrl?: string; // default "https://api.hcompany.ai/v1"

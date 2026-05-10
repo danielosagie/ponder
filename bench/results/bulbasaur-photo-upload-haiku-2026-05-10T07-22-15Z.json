@@ -1,0 +1,55 @@
+{
+  "id": "bulbasaur-photo-upload-haiku-2026-05-10T07-22-15Z",
+  "case": "bulbasaur-photo-upload",
+  "model": "haiku",
+  "started_at": "2026-05-10T07:22:15Z",
+  "ended_at": "2026-05-10T07:23:06Z",
+  "elapsed_ms": 12413,
+  "outcome": "success",
+  "tool_call_count": 5,
+  "tool_calls": [
+    "browser_status",
+    "browser_snapshot",
+    "Bash",
+    "browser_set_input_files",
+    "browser_snapshot"
+  ],
+  "verification": "Photo count increased from 3 to 4 remove buttons (e16-e19), confirming upload accepted. File 'Screenshot 2026-05-08 at 1.59.53 PM.png' successfully attached to listing.",
+  "errors": [],
+  "ground_truth_correction": null,
+  "orchestrator_post_run_snapshot": {
+    "remove_buttons": ["e16", "e17", "e18", "e19"],
+    "thumbnail_buttons": ["e39 (Thumbnail 0)", "e40 (Thumbnail 1)", "e41 (Thumbnail 2)", "e42 (Thumbnail 3)"],
+    "file_input_value": "C:\\fakepath\\Screenshot 2026-05-08 at 1.59.53 PM.png",
+    "url": "https://www.facebook.com/marketplace/edit/?listing_id=1000353466268362",
+    "interpretation": "Pre-run baseline (from run #2 ground truth check at 06:57:51Z): 3 remove buttons / 3 thumbnails. Post-run: 4 of each, with new Thumbnail 3 at e42. Upload genuinely succeeded."
+  },
+  "validated_fixes": [
+    {
+      "id": "u202f-tolerant-path",
+      "shipped_in": "b330fee",
+      "evidence": "browser_set_input_files succeeded with no error on the same U+202F filename that ENOENT'd in run #1."
+    },
+    {
+      "id": "snapshot-first-rule",
+      "shipped_in": "5077b04",
+      "evidence": "Haiku's first browser action was browser_snapshot (not a click). Sequence matched the prescribed 5-call shape exactly."
+    },
+    {
+      "id": "verification-mandate",
+      "shipped_in": "5077b04",
+      "evidence": "Haiku's last call was browser_snapshot. Verification text cited a real post-state observation (3 -> 4 remove buttons). outcome=success was earned, not claimed."
+    }
+  ],
+  "duration_breakdown": {
+    "subagent_total_tokens": 51213,
+    "subagent_tool_uses": 5,
+    "subagent_duration_ms": 12413,
+    "wall_time_ms": 51000
+  },
+  "comparison_to_prior_runs": {
+    "run_1_2026-05-10T01-33-06Z": "8/8 calls, exhausted, 71.7s, blocked by U+202F ENOENT",
+    "run_2_2026-05-10T06-56-07Z": "8/8 calls, success_with_caveats (orchestrator-verified), 33.4s, snapshot-last skipped, 3 wasted clicks before snapshot",
+    "run_3_2026-05-10T07-22-15Z": "5/5 calls, success, 12.4s, canonical happy path"
+  }
+}

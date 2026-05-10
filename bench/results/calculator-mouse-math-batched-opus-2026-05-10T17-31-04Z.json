@@ -1,0 +1,85 @@
+{
+  "id": "calculator-mouse-math-batched-opus-2026-05-10T17-31-04Z",
+  "case": "calculator-mouse-math-batched",
+  "model": "opus (orchestrator-driven)",
+  "started_at": "2026-05-10T17:31:04Z",
+  "ended_at": "2026-05-10T17:50:34Z",
+  "elapsed_ms": 1170000,
+  "outcome": "fallback_path",
+  "tool_call_count": 9,
+  "tool_calls": [
+    "holo3_version (preflight: confirmed MCP commit=20f428a64957)",
+    "screen_hotkey (cmd+space, cmd+space) + screen_type (Calculator) — relaunch attempts",
+    "agent_click_sequence (v11 first attempt — 88.7s wall, batch FAILED, parallel-fallback at 84.6s; targetApp crop fell back; click coords landed on Calculator buttons at first capture position but Calculator moved by post-shot)",
+    "screen_screenshot (captured Calculator state — display=0, expression empty)",
+    "(direct curl) /ground/batch — 60.7s for 6 targets, 4114 prompt_tokens each",
+    "(direct curl) /window/bounds — Calculator at (690,334) size 230×408",
+    "(direct curl) /ground/batch WITH crop — 9.5s for 6 targets, 175 prompt_tokens each (6.4× faster than uncropped)",
+    "mcp__ponder__agent_do (v10 baseline — cancelled at 195s, 5 of 6 actions, ~35s/step)"
+  ],
+  "ground_path": "parallel-fallback",
+  "ground_ms": 84651,
+  "exec_ms": 781,
+  "post_settle_ms": 80,
+  "total_ms_sequence_call": 88718,
+  "inter_click_delay_total_ms": 250,
+  "step_delay_ms": 50,
+  "all_via_bridge": true,
+  "crop_applied": false,
+  "verification": "Math NOT verified — post-sequence screenshot returned T3 Code window in front. Calculator was at (690,334) at the time of grounding (matches the click coords reported). A separate screenshot taken later showed Calculator at ~(920,470) with display=0 (cleared). Either Calculator moved between the click sequence and the post-shot, or focus changed and clicks landed on T3 Code instead of Calculator after the first one or two registered.",
+  "preflight": {
+    "mcp_commit": "20f428a64957bb01627d85728381969c1781ad17",
+    "head_commit_at_run_time": "0a18c9c",
+    "drift": "MCP server commit predates 0a18c9c (added bridge proxy in src/screen.ts and longer groundBatch timeout in src/agent/providers/remote.ts). Running tools.ts handler still resolves getMacWindowBounds via local osascript only (no bridge proxy) and still uses the 60s groundBatch timeout. To pick up those fixes the user needs `bash scripts/kill-stale-mcp.sh` + restart Claude Code.",
+    "bridge_window_bounds_endpoint": "live and working — `/window/bounds` returns clean integer bounds in <100ms (parser fix and the AppleScript-list workaround both verified)"
+  },
+  "comparison_to_prior_runs": {
+    "calculator-mouse-math-opus-2026-05-10T07-32-00Z": "10 calls, 240s wall, individual agent_click — pre-sequence-tool baseline",
+    "calculator-mouse-math-batched-opus-2026-05-10T08-32-48Z": "4 calls, 7.56s sequence-call wall, parallel-fallback (running MCP predated commit 52505bb so provider.groundBatch undefined). Math correct.",
+    "calculator-mouse-math-batched-opus-2026-05-10T16-48-14Z": "8 calls (decoy hit + recovery), 61.5s sequence-call wall, batch path lit but unpinned llama.cpp slow. Math correct.",
+    "this_run": "9 calls (mostly diagnostic curls), 88.7s sequence-call on agent_click_sequence (batch fell back due to TS timeout @60s when server returned in 60.7s). Direct curls confirmed batch endpoint works correctly on v11 — 60.7s uncropped, 9.5s with targetApp crop."
+  },
+  "ws1_verification": {
+    "claim": "MCP commit visibility (holo3_version)",
+    "result": "PASS — preflight returned matching SHA, validated server freshness end-to-end."
+  },
+  "ws2_verification": {
+    "claim": "Per-step delayMs + conditional 80ms post-settle",
+    "result": "PASS — `exec 781ms (incl. 250ms inter-click delay), post-settle 80ms` confirms both fired."
+  },
+  "ws3_verification": {
+    "claim": "targetApp crop via bridge proxy",
+    "result_in_bench_run": "BLOCKED — running MCP server has stale src/screen.ts (no bridge proxy yet). Crop fell back as before.",
+    "result_via_direct_curl": "VERIFIED — bridge `/window/bounds` returns clean bounds (`{x:690,y:334,w:230,h:408}` in 461ms via the salvage parser; will be ~50ms once Electron picks up the regex parser fix from 0a18c9c). Server-side crop in /ground/batch reduces prompt_tokens 4114→175 per target and wall 60.7s→9.5s for 6 targets — exactly the 23×/6× ratios the design predicts.",
+    "remaining": "Restart Claude Code so the MCP server loads commit 54ce64e's src/screen.ts (bridge-first getMacWindowBounds) AND src/agent/providers/remote.ts (110s groundBatch timeout). Without both, the bench keeps hitting the timeout-cliff fallback."
+  },
+  "ponder_baseline": {
+    "what_we_did": "Ran mcp__ponder__agent_do(task='compute 47×8 in Calculator') against v10 (unpinned llama.cpp, slow inference)",
+    "result": "cancelled at t=194.7s after 5 of 6 needed actions",
+    "per_step_timing_avg": {
+      "thought_ms": 17000,
+      "ground_action_ms": 18000,
+      "step_total_ms": 35000
+    },
+    "math_correct": false,
+    "click_coord_quality": "scattered chaos — clicks at (1258,956), (1167,100), (844,228), (1266,856) etc. None inside Calculator's window at (690,334)–(920,742). The embedded-screenshot decoy hit Ponder hard; no targetApp defense in agent_do's loop.",
+    "why_2s_target_unreachable_via_agent_do": [
+      "agent_do does plan→ground→click PER STEP, no batched grounding. 6 steps × (plan + ground + click + screenshot) = lots of round-trips.",
+      "Even on a fast llama.cpp build (pre-slowdown), expected per-step floor is ~1.5s plan + ~0.4s ground + ~0.1s click + ~0.15s screenshot = ~2s/step → ~12s for 6 steps. The 2s target is below the architecture's floor for a 6-action task done as 6 separate ground calls.",
+      "The path that CAN approach 2s is agent_click_sequence with targetApp crop on a fast llama.cpp build: 1 screenshot + 1 batch-ground (~1-2s with crop on a non-regressed build) + 6 bridge clicks (~0.6s) + delays + post-settle = ~3-4s achievable. ~2s would require either an even smaller image, a faster model, or removing the per-click-delay budget entirely."
+    ]
+  },
+  "modal_inference_diagnostic": {
+    "v11_pinned_b9082_still_slow": true,
+    "evidence": "b9082 was released 2026-05-08/09. Per-target inference latency on v11: ~10s for 4114 tokens (vs ~0.33s pre-regression). Pinning to a tag from 1-2 days BEFORE the regression manifested wasn't enough — the upstream change predates b9082.",
+    "next_pin_to_try": "b8821 (2026-04-17), b8688 (2026-04-07), or earlier — substantially before the slowdown window. Each pin requires a full Modal rebuild (~40min on the build executor we hit today). Not done in this session because the user decided to commit progress and proceed with what we have.",
+    "alternate_workaround": "The targetApp crop already gives a 6× speedup on the same b9082 build (60.7s → 9.5s). For the calculator-math case, that's enough to move from 'unusable' to 'usable'. Combined with batch-path-lit-up (after MCP restart picks up the timeout bump), expected steady-state wall on the math sequence is ~10.7s end-to-end."
+  },
+  "next_session_action_items": [
+    "1. Run `bash scripts/kill-stale-mcp.sh` to clear stale tsx PIDs.",
+    "2. Restart Claude Code (or the MCP harness) so the MCP server loads from commit 54ce64e — picks up bridge-first getMacWindowBounds AND the 110s groundBatch timeout.",
+    "3. Re-call holo3_version from a fresh session to confirm commit matches HEAD.",
+    "4. Re-run agent_click_sequence with stepDelayMs:50 + targetApp:'Calculator'. Expected: batch path fires (no fallback), crop applies (summary contains 'cropped to Calculator window: 230×408 at ...'), wall ~10.7s.",
+    "5. To chase the 2s target, pin llama.cpp to b8821 or earlier in modal_app.py and redeploy. Plan for a ~40min wait."
+  ]
+}

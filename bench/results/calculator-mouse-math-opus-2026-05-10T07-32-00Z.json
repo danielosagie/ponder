@@ -1,0 +1,52 @@
+{
+  "id": "calculator-mouse-math-opus-2026-05-10T07-32-00Z",
+  "case": "calculator-mouse-math",
+  "model": "opus (orchestrator-driven, not via subagent)",
+  "started_at": "2026-05-10T07:32:00Z",
+  "ended_at": "2026-05-10T07:36:00Z",
+  "elapsed_ms": 240000,
+  "outcome": "success_with_recovery",
+  "tool_call_count": 10,
+  "tool_calls": [
+    "screen_hotkey",
+    "screen_type",
+    "screen_screenshot",
+    "agent_click (AC, FAILED — grounded against embedded screenshot in Cursor chat)",
+    "screen_hotkey (cmd+tab — recovery)",
+    "screen_screenshot",
+    "agent_click (AC, succeeded)",
+    "agent_click (4)",
+    "agent_click (7)",
+    "agent_click (× multiply)",
+    "agent_click (8)",
+    "agent_click (=)"
+  ],
+  "verification": "Calculator display shows expression '47 × 8' and result '376'. Each agent_click moved the OS cursor to the targeted button — the post-action screenshot shows the green-triangle cursor marker adjacent to each clicked button.",
+  "errors": [
+    "First agent_click for AC grounded at (405, -384) on the SECONDARY monitor where the Cursor IDE chat was showing an embedded screenshot of Calculator. Click landed on the chat content, focusing Cursor and pushing the real Calculator behind. Recovery: cmd+tab to refocus Calculator, which also moved the cursor to the primary display where Calculator lives, eliminating the decoy."
+  ],
+  "primary_findings": [
+    {
+      "id": "agent-click-os-cursor-validated",
+      "description": "agent_click does move the real OS cursor — confirmed by the green-triangle cursor marker visible in each post-click screenshot at the target button's coordinates. The user can SEE the cursor zip between buttons.",
+      "validates": "the 'screen-layer click moves the real cursor' contract that distinguishes agent_click from browser_click."
+    },
+    {
+      "id": "embedded-screenshot-grounding-decoy",
+      "severity": "medium",
+      "description": "When the orchestrator's chat (Cursor IDE / Claude Code) is showing a screenshot of the same app the agent is targeting, and the chat's display + the app's display are the same monitor, the vision model may ground against the embedded picture instead of the real window. Manifests as click coords landing on chat pixels with the wrong app coming forward.",
+      "fix": "Documented in the new case spec under 'Known gotcha — embedded-screenshot grounding'. Recovery via cmd+tab is reliable. A code-level fix would require the harness to know which display the target app's window lives on and crop the screenshot to that display before grounding — non-trivial."
+    },
+    {
+      "id": "cursor-follows-app-display",
+      "description": "When focus switches between displays (cmd+tab), the OS cursor jumps to the new display. screen_screenshot then captures the new display. This is what made the recovery work — after cmd+tab, the screenshot captured the primary display where Calculator lives, with no embedded-Calculator decoy in view.",
+      "implication": "When debugging multi-monitor grounding issues, force-focus the target app first."
+    }
+  ],
+  "narration_in_chat": "Each tool call was preceded by a one-line plain-English narration in the orchestrator chat ('Clicking AC to clear', 'Clicking 4 — top of the second number row', etc.) per the new SKILL.md narration guidance. The user reported being able to follow the agent's reasoning without reading the raw tool calls.",
+  "duration_breakdown": {
+    "wall_time_ms": 240000,
+    "agent_click_grounding_ms_avg": 2440,
+    "agent_click_total_ms_avg": 3050
+  }
+}

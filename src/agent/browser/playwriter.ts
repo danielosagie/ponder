@@ -709,6 +709,110 @@ export async function createPlaywriterClient(
     return `[data-holo-ref="${ref}"]`;
   }
 
+  /**
+   * Visibly highlights the element with `ref` for ~600ms so the user can SEE
+   * which element the agent is acting on BEFORE the click/type/upload fires.
+   * Injects a position:fixed overlay with a green outline + glow + optional
+   * caption. Self-removes. Fire-and-forget; we await ~180ms after injection
+   * so the highlight is on screen by the time the action runs.
+   *
+   * Why this is a wrapper around page.evaluate (not a CSS class on the
+   * element itself): we don't own the page's stylesheet, can't assume a
+   * class won't conflict, and the bbox can change between snapshot and
+   * action — capturing it inside page.evaluate gives the freshest values.
+   *
+   * For zero-size refs (typical for hidden file-inputs), we walk up to a
+   * visible ancestor (label / button / role=button / parent) so the user
+   * still sees something meaningful when the upload kicks off.
+   */
+  async function highlightRef(
+    page: PWPage,
+    ref: string,
+    label?: string,
+  ): Promise<void> {
+    const sel = refToSelector(ref);
+    try {
+      await page.evaluate(
+        (args: { sel: string; label: string | null }) => {
+          const findVisible = (start: Element | null): Element | null => {
+            let cur: Element | null = start;
+            for (let i = 0; cur && i < 6; i++) {
+              const r = cur.getBoundingClientRect();
+              if (r.width > 4 && r.height > 4) return cur;
+              cur = cur.parentElement;
+            }
+            return start;
+          };
+          try {
+            const raw = document.querySelector(args.sel);
+            const el = findVisible(raw);
+            if (!el) return;
+            (el as HTMLElement).scrollIntoView({
+              block: "center",
+              inline: "center",
+              behavior: "instant" as ScrollBehavior,
+            });
+            const r = el.getBoundingClientRect();
+            const overlay = document.createElement("div");
+            overlay.setAttribute("data-holo-highlight", "1");
+            Object.assign(overlay.style, {
+              position: "fixed",
+              left: `${Math.max(0, r.left - 4)}px`,
+              top: `${Math.max(0, r.top - 4)}px`,
+              width: `${Math.max(8, r.width + 8)}px`,
+              height: `${Math.max(8, r.height + 8)}px`,
+              pointerEvents: "none",
+              border: "3px solid #00e676",
+              borderRadius: "6px",
+              boxShadow:
+                "0 0 0 2px rgba(0, 230, 118, 0.35), 0 0 14px rgba(0, 230, 118, 0.55)",
+              zIndex: "2147483647",
+              transition: "opacity 200ms ease-out",
+              opacity: "0",
+              background: "rgba(0, 230, 118, 0.08)",
+            } as Partial<CSSStyleDeclaration>);
+            document.documentElement.appendChild(overlay);
+            requestAnimationFrame(() => {
+              overlay.style.opacity = "1";
+            });
+            if (args.label) {
+              const cap = document.createElement("div");
+              Object.assign(cap.style, {
+                position: "absolute",
+                left: "0px",
+                top: r.top < 28 ? `${r.height + 6}px` : "-22px",
+                background: "#00c853",
+                color: "white",
+                font: "12px/1 -apple-system, BlinkMacSystemFont, sans-serif",
+                padding: "4px 6px",
+                borderRadius: "4px",
+                whiteSpace: "nowrap",
+                maxWidth: "320px",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              } as Partial<CSSStyleDeclaration>);
+              cap.textContent = args.label.slice(0, 80);
+              overlay.appendChild(cap);
+            }
+            window.setTimeout(() => {
+              overlay.style.opacity = "0";
+              window.setTimeout(() => overlay.remove(), 220);
+            }, 550);
+          } catch {
+            // best-effort — never break the action over a highlight
+          }
+        },
+        { sel, label: label ?? null },
+      );
+      // Brief on-screen latency so the highlight is visible BEFORE the
+      // action fires. ~180ms is short enough not to feel sluggish, long
+      // enough to register visually for the user.
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    } catch {
+      // never block the real action over a highlight failure
+    }
+  }
+
   async function activePage(): Promise<PWPage | null> {
     if (!(await ensureChrome())) return null;
     return state.page;
@@ -753,6 +857,11 @@ export async function createPlaywriterClient(
     async click(ref: string): Promise<void> {
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
+      // Brief green-outline highlight so the user can SEE which element the
+      // agent is acting on — fire-and-forget overlay with ~180ms lead-in
+      // before the click. Never blocks the action if the highlight injection
+      // fails. See highlightRef() above for the full rationale.
+      await highlightRef(page, ref, `click ${ref}`);
       // 2000ms timeout (was 5000ms): the most common reason a click hangs is
       // that the page repainted between snapshot capture and click execution
       // and the ref is gone from the DOM (Facebook Marketplace's price-range
@@ -774,6 +883,10 @@ export async function createPlaywriterClient(
     ): Promise<void> {
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
+      // Highlight before typing — same UX rationale as click. Truncated label
+      // prevents leaking long values (passwords, paragraphs) into the page.
+      const labelText = text.length > 24 ? text.slice(0, 24) + "…" : text;
+      await highlightRef(page, ref, `type "${labelText}" → ${ref}`);
       const loc = page.locator(refToSelector(ref));
       await loc.click({ timeout: 2000 });
       await loc.fill(text);
@@ -820,6 +933,15 @@ export async function createPlaywriterClient(
       // The locator can target a hidden / display:none input — that's
       // why the snapshot now surfaces hidden file inputs and tags them
       // with (use browser_set_input_files).
+      // Highlight BEFORE the input change fires. The file-input itself is
+      // typically zero-size (hidden under a styled "Add photo" button);
+      // highlightRef walks up to the nearest visible ancestor so the user
+      // sees the actual button glow green when the upload kicks off.
+      const fileLabel =
+        resolved.length === 1
+          ? `upload ${path.basename(resolved[0]!)} → ${ref}`
+          : `upload ${resolved.length} files → ${ref}`;
+      await highlightRef(page, ref, fileLabel);
       await page.locator(refToSelector(ref)).setInputFiles(resolved);
     },
 

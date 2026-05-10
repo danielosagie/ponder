@@ -103,6 +103,23 @@ Use `goal` to give the autonomous brain framing context: `agent_do(task: "naviga
 - **`browser_status` says "not attached"** — Chrome's security requires a user gesture. Take ONE `screen_screenshot` to see Chrome's actual state, then give the user ONE concise instruction ("Click the green Playwriter icon on the <tab> tab" if Chrome is visible; "Open Chrome to <url> and click the green Playwriter icon" if it isn't). Do NOT relay the verbose error message verbatim. Do NOT call `agent_do` to "attach" — it can't.
 - **`browser_status` shows an unexpected URL** (or `>1` tabs attached and the `*` is on the wrong one) — call `browser_switch_tab({urlIncludes: "<substring>"})` to switch. Common when the user has the green icon clicked on multiple tabs. The response from `browser_status` already lists all tabs inline when there are multiple — pick from there.
 
+## Narrating decisions to the user
+
+The user is watching the chat AND the screen. Two channels they should see in sync:
+
+1. **Plain-English narration in the chat** — one short line BEFORE each tool call explaining *what* you're about to do and *why*, in present tense. Examples:
+   - "Snapshotting the page first to find the search box ref."
+   - "Clicking the suggestion at e91 to un-disable Apply."
+   - "Uploading `~/Desktop/Screenshot 2026-05-08 at 1.59.53 PM.png` to the file-input at e14."
+   - "Opening Calculator via Spotlight."
+   This is NOT the final report — just a one-liner per action so the user can follow along. Keep it under 15 words.
+
+2. **Visual feedback on the page** — `browser_click`, `browser_type`, and `browser_set_input_files` automatically draw a green outline + glow on the targeted element for ~600ms before the action fires (see `highlightRef` in `src/agent/browser/playwriter.ts`). Hidden file-inputs highlight their nearest visible ancestor (typically the styled "Add photo" button). For OS-level work, `agent_click` and `agent_drag` move the real OS cursor to the target.
+
+Together these tell the user "this is what I'm doing, and that green glow is the element I picked." If the user sees the glow on the wrong thing, they can interrupt before the action commits.
+
+The narration rule does NOT replace the past-tense reporting rule below — narrate AS YOU GO, then summarize WHEN DONE.
+
 ## Reporting results
 
 Past tense, lead with the answer. Informational request → answer + bulleted list with title/price/URL. Procedural task → one short past-tense confirmation. Got stuck → what blocked you, what's currently on screen, one concrete next step. NEVER start with "I will…" / "Let me…".

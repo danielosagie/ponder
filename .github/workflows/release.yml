@@ -1,0 +1,81 @@
+# Release pipeline for the Ponder desktop app.
+#
+# Triggered by pushing a `v*.*.*` tag (`git tag v0.1.1 && git push --tags`).
+# Builds, code-signs, and notarizes a macOS DMG, then publishes it as a
+# GitHub Release. Customers download the DMG, drag-install, and click the
+# `ponder://configure?convex=…` link from their dev to wire it up.
+#
+# Required GitHub repo secrets (Settings → Secrets and variables → Actions):
+#   APPLE_ID                       — your Apple Developer email
+#   APPLE_APP_SPECIFIC_PASSWORD    — generate at appleid.apple.com (NOT your
+#                                     login password)
+#   APPLE_TEAM_ID                  — 10-char string from
+#                                     developer.apple.com/account
+#   CSC_LINK                       — base64-encoded .p12 cert export.
+#                                     `base64 -i DeveloperID.p12 | pbcopy`
+#   CSC_KEY_PASSWORD               — the password used when exporting the .p12
+#
+# GITHUB_TOKEN is auto-provided. electron-builder uses it to upload artifacts
+# to the Release this tag triggers.
+name: Release Desktop App
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Manual trigger for one-off releases / dry-runs without tagging.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build without publishing (no GH Release upload)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # required to publish the GH Release
+
+jobs:
+  release-mac:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build npm package (tsup)
+        run: npm run build
+
+      - name: Build Electron renderer + main (electron-vite)
+        run: npm run build:app
+
+      - name: Build, sign & notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "Dry run — skipping --publish"
+            npx electron-builder --mac
+          else
+            npx electron-builder --mac --publish always
+          fi
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponder-dmg-${{ github.sha }}
+          path: |
+            release/*.dmg
+            release/*.dmg.blockmap
+          retention-days: 14

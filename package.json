@@ -60,6 +60,9 @@
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
     "modal:deploy": "modal deploy modal_app.py",
+    "release:dir": "npm run build && npm run build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir",
+    "release:local": "npm run build && npm run build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
+    "release": "npm run build && npm run build:app && electron-builder --mac --publish always",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
@@ -96,6 +99,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "tsup": "^8.3.5",
     "typescript": "^5.6.3",

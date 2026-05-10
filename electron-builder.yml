@@ -1,0 +1,94 @@
+# electron-builder config for the Ponder desktop app.
+#
+# Notes:
+# - `main` in package.json points at the SDK entry (dist/index.cjs) so npm
+#   consumers can `import { PonderClient } from "ponder"`. We override it to
+#   the electron-vite output via `extraMetadata.main` so the packaged DMG
+#   boots the right entry.
+# - Output goes to `release/` so it doesn't collide with `dist/` (tsup) or
+#   `out/` (electron-vite intermediate).
+# - The `mac.notarize` block is enabled by default for tagged CI releases;
+#   `npm run release:local` flips it off via env override (see .yml below).
+appId: dev.ponder.desktop
+productName: Ponder
+copyright: Copyright © 2026 Daniel Osagie
+
+extraMetadata:
+  # Override the SDK-facing `main` so the desktop binary loads the Electron
+  # entry instead of the tsup CJS bundle.
+  main: out/main/index.js
+
+# Files included in the asar bundle. Everything the desktop runtime needs at
+# launch — `out/` (compiled main + preload + renderers), `convex/_generated`
+# (the typed API the app calls), and node_modules production deps. Source TS
+# is excluded — we ship compiled output only.
+files:
+  - "out/**/*"
+  - "convex/_generated/**/*"
+  - "package.json"
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+  - "!**/node_modules/*.d.ts"
+  - "!**/node_modules/.bin"
+  - "!**/{.DS_Store,.git,.idea,.vscode,thumbs.db}"
+
+# Native deps (nut-js, node-mac-permissions) need to be unpacked from asar so
+# the native .node files can be loaded at runtime — asar can't dlopen.
+asarUnpack:
+  - "node_modules/@nut-tree-fork/**/*"
+  - "node_modules/node-mac-permissions/**/*"
+
+directories:
+  buildResources: build
+  output: release
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarization: electron-builder reads APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD,
+  # APPLE_TEAM_ID from the env when this block is present. The local-build
+  # script (release:local) sets `CSC_IDENTITY_AUTO_DISCOVERY=false` to skip
+  # signing entirely; tagged CI releases supply the secrets.
+  notarize: true
+  extendInfo:
+    # The strings macOS shows in the perm prompts. These don't grant the perm,
+    # they just explain the request. The user still has to approve in System
+    # Settings → Privacy & Security.
+    NSAccessibilityUsageDescription: >-
+      Ponder synthesizes clicks, keystrokes, and scrolls to drive other apps
+      on your behalf when running an agent task.
+    NSScreenCaptureUsageDescription: >-
+      Ponder captures screenshots so the agent can see what's on your screen
+      and decide what to click.
+    NSAppleEventsUsageDescription: >-
+      Ponder sends Apple Events to control other apps when an agent task
+      requires it.
+
+# Custom URL scheme so dev-issued setup links (`ponder://configure?convex=…`)
+# route into the running app via macOS's URL handler. Mirrors the runtime
+# call in electron/main.ts: app.setAsDefaultProtocolClient("ponder").
+protocols:
+  - name: Ponder
+    schemes:
+      - ponder
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+publish:
+  provider: github
+  releaseType: release

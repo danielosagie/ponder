@@ -2247,6 +2247,101 @@ export function registerTools(server: McpServer): void {
       return ok(`waited ${ms}ms`);
     },
   );
+
+  // ── Redirect-stubs: catch the orchestrator's most-common naming mistakes
+  //
+  // The orchestrator (Claude / etc.) pattern-matches the screen_* group
+  // and sometimes invents `screen_click` / `screen_drag` / `screen_observe`
+  // — those don't exist. The real OS-level vision-grounded tools live in
+  // the agent_* namespace (agent_click / agent_drag / agent_observe)
+  // because the agent_* prefix means "uses vision grounding" while screen_*
+  // means "no grounding — keyboard or scroll".
+  //
+  // These stubs ALWAYS return a friendly redirect. They never execute.
+  // The orchestrator pays one wasted ~10ms call but learns the right tool
+  // name, and the next call lands on agent_*. Cheaper than renaming the
+  // Phase 9 tools (breaking change) and more discoverable than docs alone
+  // (the redirect fires at the moment of the mistake).
+  //
+  // Schemas mirror the agent_* equivalents so the orchestrator can re-run
+  // the same JSON args verbatim against agent_click / agent_drag /
+  // agent_observe — copy-paste recovery.
+
+  const screenClickRedirect =
+    "screen_click is not a real tool — the OS-level vision-grounded click " +
+    "primitive is `agent_click`. The agent_* namespace = vision-grounded; " +
+    "screen_* = keyboard / scroll / inspection. Re-call the same args " +
+    "against agent_click(target: '<description>', mode?: 'single'|'double'|'right'|'triple').";
+  server.registerTool(
+    "screen_click",
+    {
+      title: `${MCP_BRAND}: (use agent_click)`,
+      description:
+        "REDIRECT: this tool does not exist as a primitive. The OS-level " +
+        "vision-grounded click is `agent_click(target, mode?)`. Re-call there." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        target: z.string().optional(),
+        mode: z.enum(["single", "double", "right", "triple"]).optional(),
+      },
+    },
+    async ({ target, mode }) => {
+      const example = target
+        ? `agent_click(target: ${JSON.stringify(target)}${mode ? `, mode: ${JSON.stringify(mode)}` : ""})`
+        : `agent_click(target: '<description>', mode?: 'single'|'double'|'right'|'triple')`;
+      return fail(`${screenClickRedirect}\n\nExample: ${example}`);
+    },
+  );
+
+  const screenDragRedirect =
+    "screen_drag is not a real tool — the OS-level vision-grounded drag-and-drop " +
+    "primitive is `agent_drag`. Re-call the same args against " +
+    "agent_drag(from: '<source description>', to: '<target description>').";
+  server.registerTool(
+    "screen_drag",
+    {
+      title: `${MCP_BRAND}: (use agent_drag)`,
+      description:
+        "REDIRECT: this tool does not exist as a primitive. The OS-level " +
+        "vision-grounded drag-and-drop is `agent_drag(from, to)`. Re-call there." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        from: z.string().optional(),
+        to: z.string().optional(),
+      },
+    },
+    async ({ from, to }) => {
+      const example =
+        from && to
+          ? `agent_drag(from: ${JSON.stringify(from)}, to: ${JSON.stringify(to)})`
+          : `agent_drag(from: '<source description>', to: '<target description>')`;
+      return fail(`${screenDragRedirect}\n\nExample: ${example}`);
+    },
+  );
+
+  const screenObserveRedirect =
+    "screen_observe is not a real tool — the OS-level vision-grounded preview " +
+    "primitive is `agent_observe`. Re-call the same args against " +
+    "agent_observe(target: '<description>').";
+  server.registerTool(
+    "screen_observe",
+    {
+      title: `${MCP_BRAND}: (use agent_observe)`,
+      description:
+        "REDIRECT: this tool does not exist as a primitive. The OS-level " +
+        "vision-grounded preview is `agent_observe(target)`. Re-call there." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        target: z.string().optional(),
+      },
+    },
+    async ({ target }) => {
+      const example = target
+        ? `agent_observe(target: ${JSON.stringify(target)})`
+        : `agent_observe(target: '<description>')`;
+      return fail(`${screenObserveRedirect}\n\nExample: ${example}`);
+    },
+  );
 }
 
 /** List of tool names the server exposes. Used in the boot log so it's
@@ -2280,4 +2375,11 @@ export const TOOL_NAMES = [
   "screen_hotkey",
   "screen_scroll_os",
   "screen_wait",
+  // Redirect stubs — registered so the orchestrator's hallucinated
+  // tool names hit a friendly handler instead of "tool not found".
+  // They never execute; they return a redirect to the real agent_*
+  // primitive with the same args.
+  "screen_click",
+  "screen_drag",
+  "screen_observe",
 ] as const;

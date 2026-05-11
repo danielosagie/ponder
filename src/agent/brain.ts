@@ -45,6 +45,55 @@ export async function think(
   },
 ): Promise<string> {
   let task = args.task;
+
+  // ── TASK PRIORITY preamble ────────────────────────────────────────
+  // Always prepended to every brain call. Addresses two failure modes
+  // surfaced by the t4-honda-crv-spreadsheet-research bench (Runs 1
+  // and 2, 2026-05-11):
+  //
+  //   Run 1: Brain hallucinated a "Facebook password reminder dialog"
+  //   on a screen that was a FB photo viewer. Grounder fabricated
+  //   coords for the imaginary button (413,838 → 708,598 → 419,838),
+  //   coord-scatter guard bailed at step 3. Never reached Excel.
+  //
+  //   Run 2: Setup put Chrome on about:blank but there was a stale
+  //   "Little Amps Coffee Roaster" tab. Brain decided to clean up
+  //   tabs instead of opening Excel as the task's first instruction
+  //   said. Same coord 3 times → same-action guard bailed at step 3.
+  //   Never reached Excel.
+  //
+  // Both runs share a root cause: brain reacted to VISIBLE screen
+  // state instead of following the TASK TEXT ordering. The preamble
+  // below tells the brain: task text is authoritative; ignore
+  // unrelated visible state; if step 1 of the task isn't visible,
+  // OPEN/SWITCH to it before doing anything else.
+  //
+  // Kept tight (~20 lines) because the small model loses focus on
+  // long preambles. The two rules are the bench-evidenced ones; no
+  // speculative additions.
+  const TASK_PRIORITY_PREAMBLE =
+    `[TASK PRIORITY — read before looking at the screenshot]\n` +
+    `Your TASK TEXT below is the authority. The screenshot shows what's\n` +
+    `visible right now — these can differ. Two rules:\n` +
+    `\n` +
+    `1. FOLLOW TASK ORDER. If the task says "first do X, then Y", do X\n` +
+    `   before Y — even if Y looks easier from the current screen. If\n` +
+    `   the task says "Open <App>" and <App> isn't visible: your FIRST\n` +
+    `   action is to open it (cmd+space → type <App> → enter via\n` +
+    `   Spotlight). Don't tidy up unrelated apps/tabs/dialogs you see —\n` +
+    `   ignore them.\n` +
+    `\n` +
+    `2. DON'T CLICK IMAGINARY UI. If you describe a button/dialog/icon\n` +
+    `   and your prior action with the same description produced NO\n` +
+    `   screen change, that element is NOT on screen — your description\n` +
+    `   is a hallucination. STOP, re-observe, change strategy (try a\n` +
+    `   keyboard shortcut, press escape, or describe a different\n` +
+    `   visible element). Never emit the same hallucinated description\n` +
+    `   a third time.\n` +
+    `\n` +
+    `[TASK TEXT]\n`;
+  task = TASK_PRIORITY_PREAMBLE + task;
+
   // Always-prepend browser state when we have a URL but no Playwriter
   // snapshot — gives the brain at least the page identity even without
   // an AX tree. When BOTH are available, the browserSnapshot block
@@ -111,11 +160,13 @@ export async function think(
       ax.length > SNAPSHOT_LIMIT
         ? ax.slice(0, SNAPSHOT_LIMIT) + "\n…(truncated)"
         : ax;
-    // Append, don't replace. The original task stays the user's intent;
-    // the snapshot is supporting context. Surrounding markers help the
-    // planner see this as auxiliary data rather than a new instruction.
+    // Append, don't replace. The original task (with TASK_PRIORITY
+    // preamble already prepended at the top of this function) stays
+    // the user's intent; the snapshot is supporting context. Note we
+    // use `task` here (which carries the preamble), not `args.task`
+    // (which would silently drop it).
     task =
-      `${args.task}\n\n` +
+      `${task}\n\n` +
       `[CHROME ACTIVE — you may use browser.* actions]\n` +
       `Page: ${args.browserSnapshot.title} (${args.browserSnapshot.url})\n` +
       `Interactive elements (refs in [eN]):\n${trimmed}\n` +

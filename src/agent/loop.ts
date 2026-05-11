@@ -221,8 +221,56 @@ async function maybeCropToTargetApp(
   // the cursor sits on the secondary display, shot.offsetX/Y carry that
   // display's screen-space origin and we subtract to get a rect inside
   // the captured PNG.
-  const cropX = bounds.x - shot.offsetX;
-  const cropY = bounds.y - shot.offsetY;
+  let cropX = bounds.x - shot.offsetX;
+  let cropY = bounds.y - shot.offsetY;
+  const fitsInCurrentShot =
+    cropX >= 0 &&
+    cropY >= 0 &&
+    cropX + bounds.width <= shot.width &&
+    cropY + bounds.height <= shot.height;
+  if (!fitsInCurrentShot) {
+    // Multi-monitor recovery: the cursor was on a different display
+    // than `targetApp`'s window, so screen.screenshot() captured the
+    // wrong frame and the target isn't in our pixels at all. Without
+    // recapture, the brain would ground hallucinations against the
+    // wrong display's UI (this is what produced the mathway.com
+    // 11-click disaster). Recapture on the display containing the
+    // target window.
+    const tRecapture = Date.now();
+    const targetDisplay = screen.findDisplayForRect({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    });
+    if (
+      targetDisplay &&
+      (targetDisplay.bounds.x !== shot.offsetX ||
+        targetDisplay.bounds.y !== shot.offsetY)
+    ) {
+      const newShot = await screen.captureViaDesktopCapturer(targetDisplay);
+      if (newShot) {
+        console.log(
+          `[loop] 🪟 multi-monitor recapture: target on display @(${targetDisplay.bounds.x},${targetDisplay.bounds.y}) ${targetDisplay.bounds.width}×${targetDisplay.bounds.height}, captured frame was @(${shot.offsetX},${shot.offsetY}) ${shot.width}×${shot.height} — re-captured in ${Date.now() - tRecapture}ms.`,
+        );
+        shot = newShot;
+        cropX = bounds.x - shot.offsetX;
+        cropY = bounds.y - shot.offsetY;
+      } else {
+        console.log(
+          `[loop] 🪟 crop skipped: multi-monitor recapture failed (desktopCapturer returned null) — running uncropped this step.`,
+        );
+        return shot;
+      }
+    } else {
+      console.log(
+        `[loop] 🪟 crop skipped: window rect ${bounds.width}×${bounds.height}@(${cropX},${cropY}) doesn't fit inside captured frame ${shot.width}×${shot.height} (window may be partially off-screen, or the target display isn't capturable).`,
+      );
+      return shot;
+    }
+  }
+  // After possible recapture: bail if the window STILL doesn't fit
+  // (e.g. partially off-screen even on its own display).
   if (
     cropX < 0 ||
     cropY < 0 ||
@@ -230,7 +278,7 @@ async function maybeCropToTargetApp(
     cropY + bounds.height > shot.height
   ) {
     console.log(
-      `[loop] 🪟 crop skipped: window rect ${bounds.width}×${bounds.height}@(${cropX},${cropY}) doesn't fit inside captured frame ${shot.width}×${shot.height} (window may be partially off-screen).`,
+      `[loop] 🪟 crop skipped after recapture: window rect ${bounds.width}×${bounds.height}@(${cropX},${cropY}) still doesn't fit ${shot.width}×${shot.height}.`,
     );
     return shot;
   }

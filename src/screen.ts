@@ -335,6 +335,42 @@ function getElectron(): ElectronModule | null {
   return cachedElectron;
 }
 
+/**
+ * Find the display whose bounds contain (or best match) the given
+ * screen-space rectangle. Used by the loop's targetApp crop path:
+ * when the target app's window is on a DIFFERENT display than the
+ * cursor (so `screen.screenshot()` captured the wrong frame), we
+ * call this to find the right display and re-capture there via
+ * `captureViaDesktopCapturer`.
+ *
+ * Returns null in non-Electron contexts or when the Electron screen
+ * API is unavailable.
+ */
+export function findDisplayForRect(rect: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): ElectronDisplay | null {
+  const e = getElectron();
+  if (!e?.screen) return null;
+  try {
+    type ScreenWithMatching = {
+      getDisplayMatching?: (rect: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+      }) => ElectronDisplay;
+    };
+    const screen = e.screen as typeof e.screen & ScreenWithMatching;
+    const match = screen.getDisplayMatching?.(rect);
+    return match ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function getFocusedDisplay(): ElectronDisplay | null {
   const e = getElectron();
   if (!e?.screen) return null;
@@ -346,7 +382,7 @@ function getFocusedDisplay(): ElectronDisplay | null {
   }
 }
 
-async function captureViaDesktopCapturer(
+export async function captureViaDesktopCapturer(
   d: ElectronDisplay,
 ): Promise<Screenshot | null> {
   const e = getElectron();

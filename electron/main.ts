@@ -709,6 +709,37 @@ function startBridgeServer(): void {
     const url = req.url ?? "";
     const method = req.method ?? "GET";
     res.setHeader("Content-Type", "application/json");
+    // GET /version → { commit, commitShort, dirty, builtAt }
+    //
+    // Same shape as the MCP server's holo3_version tool. Lets a
+    // session verify that the running Electron bridge has the
+    // expected commit loaded — critical when bridge changes are
+    // shipped but the user might not have restarted the Electron
+    // process. Without this endpoint there's no programmatic way
+    // to tell whether new electron/main.ts or src/agent/loop.ts
+    // code is actually in memory.
+    if (method === "GET" && url === "/version") {
+      void (async () => {
+        try {
+          const { BUILD_INFO } = await import("../src/mcp/build-info");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(BUILD_INFO));
+        } catch (e) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              commit: "unknown",
+              commitShort: "unknown",
+              dirty: false,
+              builtAt: new Date(0).toISOString(),
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      })();
+      return;
+    }
+
     if (method === "GET" && url === "/health") {
       res.writeHead(200);
       res.end(

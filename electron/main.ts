@@ -1075,46 +1075,112 @@ function startBridgeServer(): void {
           res.end(JSON.stringify({ error: "non-darwin platform" }));
           return;
         }
-        // Different AppleScript dialects per browser. Chrome uses
-        // "active tab of front window"; Safari uses "current tab of
-        // front window". Firefox doesn't expose AppleScript URL
-        // access reliably — fall through to error.
+        // Two-tier strategy:
+        //   1) Try `tell application "<browser>"` for full URL + title.
+        //      Requires macOS Automation permission (Electron → Chrome).
+        //   2) If that fails (perms denied is the common case — Automation
+        //      and Accessibility are separate TCC grants), fall back to
+        //      reading the window title via System Events. Only needs
+        //      Accessibility (which we already have for /window/bounds).
+        //      Window titles like "Search results for bulbasaur -
+        //      Facebook Marketplace" carry enough info for the verifier
+        //      to compare against task expectations.
         const lower = processName.toLowerCase();
-        let script: string;
+        let appScript: string | null = null;
         if (lower === "google chrome" || lower === "chrome") {
-          script = `tell application "Google Chrome"\nreturn (URL of active tab of front window) & "\\t" & (title of active tab of front window)\nend tell`;
+          appScript = `tell application "Google Chrome"\nreturn (URL of active tab of front window) & "\\t" & (title of active tab of front window)\nend tell`;
         } else if (lower === "safari") {
-          script = `tell application "Safari"\nreturn (URL of current tab of front window) & "\\t" & (name of current tab of front window)\nend tell`;
-        } else {
-          res.writeHead(200);
-          res.end(JSON.stringify({ error: `unsupported browser: ${processName} (only Google Chrome and Safari supported)` }));
-          return;
+          appScript = `tell application "Safari"\nreturn (URL of current tab of front window) & "\\t" & (name of current tab of front window)\nend tell`;
         }
-        execFile(
-          "/usr/bin/osascript",
-          ["-e", script],
-          { timeout: 1500, encoding: "utf-8" },
-          (e, stdout, stderr) => {
-            if (e) {
+
+        const fallbackScript = `tell application "System Events"\ntell process "${processName}"\nreturn name of front window\nend tell\nend tell`;
+
+        const runAndParse = (
+          script: string,
+          isFallback: boolean,
+          done: (resp: object) => void,
+        ): void => {
+          execFile(
+            "/usr/bin/osascript",
+            ["-e", script],
+            { timeout: 1500, encoding: "utf-8" },
+            (e, stdout, stderr) => {
+              if (e) {
+                done({
+                  ok: false,
+                  detail:
+                    (stderr && String(stderr).trim()) ||
+                    (e instanceof Error ? e.message : String(e)),
+                });
+                return;
+              }
+              const out = String(stdout).trim();
+              if (isFallback) {
+                // Title-only fallback. Set url to empty so callers
+                // know to compare against title only.
+                done({ ok: true, url: "", title: out });
+              } else {
+                const sep = out.indexOf("\t");
+                done({
+                  ok: true,
+                  url: sep >= 0 ? out.slice(0, sep) : out,
+                  title: sep >= 0 ? out.slice(sep + 1) : "",
+                });
+              }
+            },
+          );
+        };
+
+        const tryAppScript = appScript;
+        if (tryAppScript) {
+          runAndParse(tryAppScript, false, (first) => {
+            const r = first as { ok: boolean; url?: string; title?: string; detail?: string };
+            if (r.ok && r.url) {
+              res.writeHead(200);
+              res.end(JSON.stringify({ url: r.url, title: r.title ?? "" }));
+              return;
+            }
+            // App-script failed (typically Automation perm denied).
+            // Fall back to title-via-System-Events.
+            runAndParse(fallbackScript, true, (second) => {
+              const r2 = second as { ok: boolean; url?: string; title?: string; detail?: string };
+              if (r2.ok && r2.title) {
+                res.writeHead(200);
+                res.end(
+                  JSON.stringify({
+                    url: "",
+                    title: r2.title,
+                    fallback: "title-only (Automation perm denied; granting Electron → Google Chrome in System Settings → Privacy → Automation unlocks full URL)",
+                  }),
+                );
+                return;
+              }
               res.writeHead(200);
               res.end(
                 JSON.stringify({
                   error: "osascript_failed",
-                  detail:
-                    (stderr && String(stderr).trim()) ||
-                    (e instanceof Error ? e.message : String(e)),
+                  detail: r.detail ?? r2.detail ?? "both AppleScript paths failed",
                 }),
+              );
+            });
+          });
+        } else {
+          // Unsupported browser — try title-only fallback as a best effort.
+          runAndParse(fallbackScript, true, (resp) => {
+            const r = resp as { ok: boolean; title?: string; detail?: string };
+            if (r.ok && r.title) {
+              res.writeHead(200);
+              res.end(
+                JSON.stringify({ url: "", title: r.title, fallback: "title-only (unsupported browser)" }),
               );
               return;
             }
-            const out = String(stdout).trim();
-            const sep = out.indexOf("\t");
-            const url = sep >= 0 ? out.slice(0, sep) : out;
-            const title = sep >= 0 ? out.slice(sep + 1) : "";
             res.writeHead(200);
-            res.end(JSON.stringify({ url, title }));
-          },
-        );
+            res.end(
+              JSON.stringify({ error: "osascript_failed", detail: r.detail ?? "title fallback failed" }),
+            );
+          });
+        }
       });
       return;
     }

@@ -180,11 +180,16 @@ export async function getBrowserUrl(
       );
       if (res.ok) {
         const j = (await res.json()) as
-          | { url: string; title: string }
+          | { url: string; title: string; fallback?: string }
           | { error: string };
         if ("error" in j) return null;
-        if (typeof j.url === "string" && j.url.length > 0) {
-          return { url: j.url, title: j.title ?? "" };
+        // Accept BOTH the full-URL response (Automation perm granted)
+        // AND the title-only fallback (only Accessibility perm). The
+        // verifier and brain prompts use whatever fields are present.
+        const hasUrl = typeof j.url === "string" && j.url.length > 0;
+        const hasTitle = typeof j.title === "string" && j.title.length > 0;
+        if (hasUrl || hasTitle) {
+          return { url: j.url ?? "", title: j.title ?? "" };
         }
       }
     } finally {

@@ -457,6 +457,17 @@ const NATIVE_APP_PATTERNS: Array<{ name: string; re: RegExp }> = [
     re: /\bsystem settings\b|\bsystem preferences\b/i,
   },
   { name: "Terminal", re: /\bterminal app\b|\bin Terminal\b/i },
+  // Browsers: matches when the task explicitly names the app. We
+  // require the word "Chrome" / "Safari" / "Firefox" as a noun (so
+  // generic verbs like "browse" don't false-positive). Validated
+  // on the May-11 FB Marketplace bench: cropping Chrome's 1053×893
+  // window vs the full 1512×982 screen dropped per-step latency
+  // from 32s → 6s (~5×) AND removed adjacent-window distractors
+  // (Cursor IDE chat to the right of Chrome) that had been pulling
+  // the model's grounding off-target.
+  { name: "Google Chrome", re: /\bchrome\b|\bgoogle chrome\b/i },
+  { name: "Safari", re: /\bsafari\b/i },
+  { name: "Firefox", re: /\bfirefox\b/i },
 ];
 
 function inferTargetApp(task: string): string | null {
@@ -1361,6 +1372,39 @@ async function runOneSubtask(
     // the SAME screen hash (no pixel change). If the screen's moving,
     // we let it ride.
     const normNow = normalizeAction(action);
+
+    // Anti-loop guard #0: WAIT-SPAM detection.
+    //
+    // The May-11 Chrome+crop bench showed the brain emitting "wait 1s"
+    // 8 times in a row when its prior click/type didn't produce the
+    // expected screen change. The standard same-action+screen-unchanged
+    // guard takes 8 steps to bail (4 to fire recovery, 4 more to bail).
+    // For "wait" specifically, that's all pure dead time — no work
+    // happens during a wait.
+    //
+    // New rule: if the action starts with `wait` AND the last 2 history
+    // entries ALSO start with `wait`, bail immediately. 3 consecutive
+    // waits = the brain has given up on figuring out what to do next
+    // and is just hoping the screen will change on its own. Tell it
+    // explicitly to stop waiting and try a different verb.
+    const isWaitAction = /^wait\b/i.test(normNow);
+    if (isWaitAction && history.length >= 2) {
+      const prev1 = normalizeAction(history[history.length - 1]!);
+      const prev2 = normalizeAction(history[history.length - 2]!);
+      if (/^wait\b/i.test(prev1) && /^wait\b/i.test(prev2)) {
+        console.warn(
+          `[loop] 🛑 anti-loop (wait-spam): 3 consecutive 'wait' actions emitted. The brain has stalled. Bailing instead of paying more dead time.`,
+        );
+        await events.onError(
+          `Brain emitted 'wait' 3 times in a row — it's stalled, not making progress. ` +
+            `Whatever action you wanted to fire (click/type/key) didn't produce the expected screen change. ` +
+            `Look at the current screenshot, identify what's actually on screen, and pick a non-wait verb. ` +
+            `If you're waiting for a page to load, observe the URL bar or page title instead of blindly waiting.`,
+        );
+        return "exhausted";
+      }
+    }
+
     const last4 = history.slice(-3).map(normalizeAction).concat(normNow);
     const same = last4.filter((h) => h === normNow).length;
     if (last4.length === 4 && same >= 3) {

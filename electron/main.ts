@@ -1037,6 +1037,88 @@ function startBridgeServer(): void {
       return;
     }
 
+    // POST /browser/url → { processName } → { url, title } | { error }
+    //
+    // Get the URL + title of the front tab of the named browser
+    // (Google Chrome, Safari, Firefox). Uses AppleScript via the
+    // bridge's existing Accessibility / Automation grant — the MCP
+    // server's tsx process can't run this directly. Required for
+    // the loop's verifier to compare task expectations against
+    // actual page state (the May-11 bench's false-positive DONE
+    // happened because the verifier couldn't see that the URL was
+    // facebook.com/marketplace/you instead of /marketplace/search).
+    //
+    // Returns:
+    //   { url: "https://...", title: "Page Title" } on success
+    //   { error: "..." } on any failure (browser not running, no
+    //     active tab, Automation perms denied, parse failure)
+    if (method === "POST" && url === "/browser/url") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { processName } = (parsed as { processName?: unknown }) ?? {};
+        if (typeof processName !== "string" || processName.trim().length === 0) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "processName required" }));
+          return;
+        }
+        if (/["\\\n\r]/.test(processName)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "processName contains invalid characters" }));
+          return;
+        }
+        if (process.platform !== "darwin") {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: "non-darwin platform" }));
+          return;
+        }
+        // Different AppleScript dialects per browser. Chrome uses
+        // "active tab of front window"; Safari uses "current tab of
+        // front window". Firefox doesn't expose AppleScript URL
+        // access reliably — fall through to error.
+        const lower = processName.toLowerCase();
+        let script: string;
+        if (lower === "google chrome" || lower === "chrome") {
+          script = `tell application "Google Chrome"\nreturn (URL of active tab of front window) & "\\t" & (title of active tab of front window)\nend tell`;
+        } else if (lower === "safari") {
+          script = `tell application "Safari"\nreturn (URL of current tab of front window) & "\\t" & (name of current tab of front window)\nend tell`;
+        } else {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: `unsupported browser: ${processName} (only Google Chrome and Safari supported)` }));
+          return;
+        }
+        execFile(
+          "/usr/bin/osascript",
+          ["-e", script],
+          { timeout: 1500, encoding: "utf-8" },
+          (e, stdout, stderr) => {
+            if (e) {
+              res.writeHead(200);
+              res.end(
+                JSON.stringify({
+                  error: "osascript_failed",
+                  detail:
+                    (stderr && String(stderr).trim()) ||
+                    (e instanceof Error ? e.message : String(e)),
+                }),
+              );
+              return;
+            }
+            const out = String(stdout).trim();
+            const sep = out.indexOf("\t");
+            const url = sep >= 0 ? out.slice(0, sep) : out;
+            const title = sep >= 0 ? out.slice(sep + 1) : "";
+            res.writeHead(200);
+            res.end(JSON.stringify({ url, title }));
+          },
+        );
+      });
+      return;
+    }
+
     // POST /window/raise → { processName } → { ok: true } | { error }
     //
     // Bring the named macOS process to the front BEFORE we screenshot.

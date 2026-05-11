@@ -877,6 +877,31 @@ async function runOneSubtask(
     // image-patch tokens scale with pixel count and a typical app
     // window is ~16× smaller than the full display.
     shot = await maybeCropToTargetApp(shot, opts.targetApp);
+    // Probe the current browser URL whenever targetApp is a browser
+    // we support (Chrome, Safari). Cheap (~30-80ms via the bridge),
+    // and a critical state signal for the brain — without it the
+    // brain doesn't know "did my click navigate?". The May-11 false-
+    // positive DONE happened because the brain emitted DONE after a
+    // misclicked sidebar nav landed on facebook.com/marketplace/you;
+    // the verifier had no way to compare that URL against the goal's
+    // expected "search results" URL pattern.
+    //
+    // Fetched AFTER maybeCropToTargetApp's raise+recapture so the
+    // browser is guaranteed frontmost and AppleScript "front window"
+    // returns the real Chrome window (not whatever was occluding it).
+    let currentUrl: { url: string; title: string } | undefined;
+    if (
+      opts.targetApp &&
+      /^(Google Chrome|Safari)$/i.test(opts.targetApp)
+    ) {
+      currentUrl =
+        (await screen.getBrowserUrl(opts.targetApp)) ?? undefined;
+      if (currentUrl) {
+        console.log(
+          `[loop] 🌐 browser url (${opts.targetApp}): ${currentUrl.url} — "${currentUrl.title.slice(0, 60)}${currentUrl.title.length > 60 ? "..." : ""}"`,
+        );
+      }
+    }
     const screenHash = hashScreen(shot.png);
     console.log(
       `[loop] 📸 screenshot ${shot.width}x${shot.height} (${shot.png.length} bytes, ${Date.now() - t0}ms${prefetchUsed ? " prefetched" : ""}) hash=${screenHash}`,
@@ -1033,6 +1058,7 @@ async function runOneSubtask(
                 screenshotB64: shot.png.toString("base64"),
                 screen: screenSize,
                 browserSnapshot,
+                currentUrl,
                 signal: ctrl.signal,
               });
               if (cancelled()) return "cancelled";
@@ -1100,6 +1126,7 @@ async function runOneSubtask(
           signal: ctrl.signal,
           browserSnapshot,
           routerHint: pendingRouterHint,
+          currentUrl,
         });
       } catch (e: unknown) {
         if (cancelled()) return "cancelled";
@@ -1126,6 +1153,7 @@ async function runOneSubtask(
           screenshotB64: shot.png.toString("base64"),
           screen: screenSize,
           browserSnapshot,
+          currentUrl,
           signal: ctrl.signal,
         });
         if (cancelled()) return "cancelled";

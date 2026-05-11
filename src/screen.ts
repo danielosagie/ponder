@@ -144,6 +144,58 @@ export interface WindowBounds {
  * Fast (~30ms when bridge is healthy + perms granted). Worth calling
  * before each maybeCropToTargetApp run.
  */
+/**
+ * Get the URL + title of the front tab of a macOS browser. Routes
+ * through the Holo3 bridge's /browser/url endpoint (which has the
+ * Accessibility / Automation grant). Returns null on any failure —
+ * caller treats null as "no browser state available" and the loop
+ * proceeds without URL context.
+ *
+ * Supports "Google Chrome" and "Safari" (Firefox lacks reliable
+ * AppleScript URL access). Browsers not in that list return null.
+ *
+ * Used by the loop's per-step think() and verify() calls so the
+ * brain sees what page it's actually on — closes the May-11 false-
+ * positive DONE class where the verifier rubber-stamped a wrong-
+ * page state because it couldn't see the URL.
+ */
+export async function getBrowserUrl(
+  processName: string,
+): Promise<{ url: string; title: string } | null> {
+  if (process.platform !== "darwin") return null;
+  if (/["\\\n\r]/.test(processName)) return null;
+  const bridgePort = Number(process.env.PONDER_BRIDGE_PORT ?? 7900);
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${bridgePort}/browser/url`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ processName }),
+          signal: ctrl.signal,
+        },
+      );
+      if (res.ok) {
+        const j = (await res.json()) as
+          | { url: string; title: string }
+          | { error: string };
+        if ("error" in j) return null;
+        if (typeof j.url === "string" && j.url.length > 0) {
+          return { url: j.url, title: j.title ?? "" };
+        }
+      }
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    // Bridge unreachable
+  }
+  return null;
+}
+
 export async function raiseMacApp(processName: string): Promise<boolean> {
   if (process.platform !== "darwin") return false;
   if (/["\\\n\r]/.test(processName)) return false;

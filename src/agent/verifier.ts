@@ -29,6 +29,15 @@ export interface VerifyArgs {
   screen: [number, number];
   /** Optional Chrome AX snapshot for verifier context. */
   browserSnapshot?: BrowserSnapshot;
+  /** Optional current browser URL+title from AppleScript probe
+   *  (src/screen.ts getBrowserUrl). Verifier uses this to compare
+   *  expected URL pattern (extracted from `task`) against actual
+   *  page state — the May-11 false-positive DONE happened because
+   *  the verifier rubber-stamped a screenshot of facebook.com/
+   *  marketplace/you when the goal was to search for "bulbasaur"
+   *  (expected URL contains "search?q=bulbasaur"). With this field
+   *  the verifier can explicitly assert URL-pattern match. */
+  currentUrl?: { url: string; title: string };
   /** Abort signal. */
   signal?: AbortSignal;
 }
@@ -67,20 +76,41 @@ export async function verify(
           "\n…(truncated for verifier)"
         : args.browserSnapshot.ax)
     : "";
+  // Always include the URL when we have it — even without an AX
+  // snapshot. This is THE single most important signal for
+  // verification on web tasks: if the goal says "search for X" and
+  // the URL doesn't contain "search" and "X", we are NOT done.
+  const urlBlock = args.currentUrl
+    ? `\n\nCurrent browser URL: ${args.currentUrl.url}\n` +
+      `Current browser title: ${args.currentUrl.title}\n`
+    : "";
 
   const verificationTask =
     `VERIFICATION CHECK — DO NOT EMIT AN ACTION VERB.\n` +
     `\n` +
     `Original goal: ${args.task}\n` +
+    `${urlBlock}${snapshotBlock}\n` +
     `\n` +
-    `The agent has just claimed this goal is achieved. Compare the goal ` +
-    `to what's visibly on the screenshot. Be skeptical but fair: if the ` +
-    `goal is partially achieved or the UI is mid-animation, lean toward ` +
-    `VERIFIED unless something is clearly missing or wrong.${snapshotBlock}\n` +
+    `The agent has just claimed this goal is achieved. Default answer is RETRY.\n` +
+    `Only respond VERIFIED if you can identify a CONCRETE, SPECIFIC signal in ` +
+    `the screenshot or browser state that the goal LITERALLY landed. Examples:\n` +
+    `  • Goal "search for X" → URL must contain "search" or the page must show a ` +
+    `results-list / results-header / "Search results for X" text. URL ending in ` +
+    `the home page or "/you" or a category page is NOT verified.\n` +
+    `  • Goal "open the listing for Y" → page must show the listing's title, ` +
+    `price, or description. A search results page or category index is NOT verified.\n` +
+    `  • Goal "compute X" → the calculator's display must show the exact numeric ` +
+    `answer. Showing a partial expression or wrong number is NOT verified.\n` +
+    `  • Goal "send a message" → the conversation/post must show the sent message ` +
+    `appearing as a new entry. Just having the compose box focused is NOT verified.\n` +
+    `\n` +
+    `Be SKEPTICAL. If the action LIKELY landed but you can't confirm it from\n` +
+    `the screenshot or URL, RETRY is the safer answer — the orchestrator will\n` +
+    `re-check; verifying a wrong state is worse than retrying a correct one.\n` +
     `\n` +
     `Reply with EXACTLY ONE LINE:\n` +
-    `  VERIFIED                       (the screen confirms the goal landed)\n` +
-    `  RETRY: <one-sentence reason>   (the screen contradicts the claim)\n` +
+    `  VERIFIED                       (concrete proof of completion present)\n` +
+    `  RETRY: <one-sentence reason>   (no concrete proof, or contradiction)\n` +
     `\n` +
     `No other output. No verbs. No prose. Just one of those two shapes.`;
 

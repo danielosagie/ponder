@@ -33,9 +33,33 @@ export async function think(
      *  still be loading"). Spliced into the user message so Holo3 isn't
      *  starting cold — it knows what the team's other half tried. */
     routerHint?: string;
+    /** Optional browser URL + title from the AppleScript probe
+     *  (src/screen.ts getBrowserUrl). Surfaced even when
+     *  `browserSnapshot` is null (which is the case for Ponder MCP-
+     *  forwarded calls where Playwriter isn't wired). Lets the brain
+     *  see "where am I" before deciding the next step — closes the
+     *  May-11 misframe class where agent_do clicked the wrong
+     *  sidebar item and falsely declared DONE because it couldn't
+     *  see the URL was wrong. */
+    currentUrl?: { url: string; title: string };
   },
 ): Promise<string> {
   let task = args.task;
+  // Always-prepend browser state when we have a URL but no Playwriter
+  // snapshot — gives the brain at least the page identity even without
+  // an AX tree. When BOTH are available, the browserSnapshot block
+  // below carries the same URL more verbosely; we skip the dup.
+  if (args.currentUrl && !args.browserSnapshot) {
+    task =
+      `[Browser state — for state-awareness only, do NOT emit actions about this:]\n` +
+      `  URL:   ${args.currentUrl.url}\n` +
+      `  Title: ${args.currentUrl.title}\n` +
+      `Use this to decide if your prior action LANDED — if the URL changed to ` +
+      `a results / detail / success page, emit DONE. If the URL didn't change ` +
+      `after a click/type/key action, the action didn't fire — pick a different ` +
+      `target.\n\n` +
+      task;
+  }
   if (args.browserSnapshot) {
     const ax = args.browserSnapshot.ax;
     const trimmed =

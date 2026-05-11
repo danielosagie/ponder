@@ -66,16 +66,34 @@ export async function think(
     // bridge's /screen/hotkey + /screen/type which DO work.
     let constructableHint = "";
     if (onFacebookMarketplace) {
+      // Worked example with CONCRETE URL — earlier softer phrasing
+      // ("type the URL <pattern> replacing <term>") produced wrong
+      // behavior: brain typed just "bulbasaur" into the URL bar
+      // which Chrome interpreted as a Google search. Brain needs
+      // a fully-formed example string to copy. Always cite the
+      // FULL constructed URL with the user's literal query already
+      // substituted in.
       constructableHint =
-        `\n\n[FAST PATH AVAILABLE — keyboard nav]\n` +
-        `You're on Facebook Marketplace. For searches you can SKIP\n` +
-        `clicking the sidebar search bar by using the keyboard:\n` +
-        `  Step 1: press cmd+l         (focuses the URL bar)\n` +
-        `  Step 2: type the URL "https://www.facebook.com/marketplace/search?query=<term>" and press enter\n` +
-        `Replace <term> with the user's query. This is faster than\n` +
-        `click-find-search-bar + click-then-type AND immune to\n` +
-        `grounding-precision misses. Use it for any search-style task\n` +
-        `on a site you know the URL pattern for.\n`;
+        `\n\n[FAST PATH AVAILABLE — keyboard nav to constructed URL]\n` +
+        `You're on Facebook Marketplace. SEARCH TASKS can be done\n` +
+        `in 2 actions WITHOUT clicking a search bar:\n` +
+        `\n` +
+        `  Step A: press cmd+l\n` +
+        `          (this focuses the URL bar)\n` +
+        `  Step B: type the EXACT TEXT below (it is a complete URL):\n` +
+        `          https://www.facebook.com/marketplace/search?query=YOUR_QUERY_HERE\n` +
+        `          and press enter\n` +
+        `\n` +
+        `For step B, REPLACE 'YOUR_QUERY_HERE' with the search term\n` +
+        `from the user's task (URL-encode spaces as +). For example,\n` +
+        `to search for "bulbasaur", type the COMPLETE string:\n` +
+        `  https://www.facebook.com/marketplace/search?query=bulbasaur\n` +
+        `\n` +
+        `DO NOT type just the search term alone — that goes to Google.\n` +
+        `Type the FULL URL beginning with "https://".\n` +
+        `\n` +
+        `This is faster than the click-the-sidebar approach AND\n` +
+        `immune to vision grounding misses (no coords needed).\n`;
     }
     task =
       `[Browser state — for state-awareness only, do NOT emit actions about this:]\n` +

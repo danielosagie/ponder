@@ -420,19 +420,52 @@ function inferTargetApp(task: string): string | null {
 export async function runTask(
   opts: RunOptions,
 ): Promise<"done" | "cancelled" | "exhausted"> {
-  const { task, events } = opts;
+  // Destructure events early — task is left mutable because the
+  // auto-targetApp detection below may prepend a framing line.
+  const { events } = opts;
+  let task = opts.task;
 
-  // Auto-targetApp / auto-flat: detect native-app intent in the task
-  // text. Only kicks in when the caller hasn't set targetApp already
-  // (so explicit MCP calls override) AND flat wasn't already passed
-  // (so existing flat-mode contract is unchanged).
-  const inferredApp =
-    !opts.targetApp && !opts.flat ? inferTargetApp(task) : null;
+  // Auto-targetApp: detect native-app intent in the task text. Fires
+  // whenever targetApp isn't already explicitly set — INDEPENDENT of
+  // flat-mode, because the bridge's /agent_do handler always sets
+  // flat:true (see electron/main.ts runAgentTaskForBridge), so the
+  // previous `!opts.flat` gate locked auto-detect out of every MCP-
+  // forwarded call. Bug caught in the May-11 RUN 4 trace where a
+  // task containing "Calculator's keypad" ran uncropped at 1512×982
+  // for 26+ steps at ~20s/step because inferTargetApp never ran.
+  //
+  // ALSO forces flat:true. For non-flat paths (Electron UI invocation
+  // with hierarchical planning), flipping flat ensures the planner
+  // doesn't get a shot at decomposing "calculate on the calculator"
+  // into "Open Chrome → web calculator". For already-flat paths, this
+  // is a no-op.
+  const inferredApp = !opts.targetApp ? inferTargetApp(task) : null;
   if (inferredApp) {
     console.log(
-      `[loop] 🪟 inferred targetApp="${inferredApp}" from task text → forcing flat mode and enabling crop (skips the hierarchical planner that would otherwise decompose into wrong subtasks like "Open Chrome → web calculator")`,
+      `[loop] 🪟 inferred targetApp="${inferredApp}" from task text → enabling crop${opts.flat ? "" : " and forcing flat mode (skips the hierarchical planner that would otherwise decompose into wrong subtasks)"}`,
     );
-    opts = { ...opts, targetApp: inferredApp, flat: true };
+    // Prepend a framing line so the small Holo3 brain understands
+    // it's looking at a CROPPED view of the app's window, not the
+    // desktop. Empirically (May-11 RUN 3 trace), the brain on a
+    // 458×408 cropped Calculator image said "click on the calculator
+    // app icon" 6 times before the anti-loop bailed — it interpreted
+    // the cropped window as an icon. The framing line below tells
+    // the brain explicitly: this image IS the app's UI, click the
+    // labeled buttons in it. Cheap (~30 tokens) and only fires for
+    // auto-detected runs (explicit targetApp callers know the shape).
+    const framedTask =
+      `[You are looking at a cropped screenshot showing ONLY ${inferredApp}.app's window — the app is open and frontmost. The image you see IS the app's UI. Click the labeled buttons you see in the image. DO NOT click any 'app icon' — there are no icons in this view, just the app's own buttons/controls.]\n\n` +
+      task;
+    opts = {
+      ...opts,
+      task: framedTask,
+      targetApp: inferredApp,
+      flat: true,
+    };
+    // Also update the local `task` so the flat-mode branch below
+    // (which forwards `task` explicitly, not `opts.task`) picks up
+    // the framing line.
+    task = framedTask;
   }
 
   // Flat mode (agent_do) — skip the hierarchical planner entirely.

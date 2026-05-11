@@ -1373,33 +1373,41 @@ async function runOneSubtask(
     // we let it ride.
     const normNow = normalizeAction(action);
 
-    // Anti-loop guard #0: WAIT-SPAM detection.
+    // Anti-loop guard #0: NO-OP-SPAM detection.
     //
-    // The May-11 Chrome+crop bench showed the brain emitting "wait 1s"
-    // 8 times in a row when its prior click/type didn't produce the
-    // expected screen change. The standard same-action+screen-unchanged
-    // guard takes 8 steps to bail (4 to fire recovery, 4 more to bail).
-    // For "wait" specifically, that's all pure dead time — no work
-    // happens during a wait.
+    // The May-11 bench showed two failure modes the legacy same-action
+    // guard handles slowly:
+    //   (a) Wait spam — "wait 1s" emitted 8 times after a failed action.
+    //       The brain hopes the screen will change on its own.
+    //   (b) Enter spam — "press enter" / "key enter" emitted 6 times
+    //       after the page already navigated successfully. The brain
+    //       doesn't recognize that the goal LANDED and keeps poking.
     //
-    // New rule: if the action starts with `wait` AND the last 2 history
-    // entries ALSO start with `wait`, bail immediately. 3 consecutive
-    // waits = the brain has given up on figuring out what to do next
-    // and is just hoping the screen will change on its own. Tell it
-    // explicitly to stop waiting and try a different verb.
-    const isWaitAction = /^wait\b/i.test(normNow);
-    if (isWaitAction && history.length >= 2) {
+    // Both are "no-op-like" verbs that shouldn't realistically repeat
+    // 3+ times in a row in a healthy run. Press-enter chains do happen
+    // legitimately (submit form A, then form B) but those bring screen
+    // changes between hits — the same-action guard would fire on the
+    // screen-hash check. THIS guard's job is to catch the case where
+    // the brain keeps emitting a keyboard no-op while ALSO not learning
+    // anything (no useful state to observe).
+    //
+    // Pattern: classify the action as `wait`/`press enter`/`press
+    // escape`/`key enter`/`key escape` (the "I'm just hoping" verbs)
+    // and bail after 3 in a row, regardless of screen-hash. Saves 5
+    // dead-time steps vs the legacy 8-step grind.
+    const NO_OP_ISH = /^(wait\b|press\s+(enter|escape|esc)\b|key\s+\{?\s*"?combo"?\s*:?\s*"?(enter|escape|esc)\b)/i;
+    const isNoOpAction = NO_OP_ISH.test(normNow);
+    if (isNoOpAction && history.length >= 2) {
       const prev1 = normalizeAction(history[history.length - 1]!);
       const prev2 = normalizeAction(history[history.length - 2]!);
-      if (/^wait\b/i.test(prev1) && /^wait\b/i.test(prev2)) {
+      if (NO_OP_ISH.test(prev1) && NO_OP_ISH.test(prev2)) {
         console.warn(
-          `[loop] 🛑 anti-loop (wait-spam): 3 consecutive 'wait' actions emitted. The brain has stalled. Bailing instead of paying more dead time.`,
+          `[loop] 🛑 anti-loop (no-op-spam): 3 consecutive no-op-like actions (wait / press enter / press escape). The brain has stalled or doesn't realize the goal already landed. Bailing instead of paying more dead time.`,
         );
         await events.onError(
-          `Brain emitted 'wait' 3 times in a row — it's stalled, not making progress. ` +
-            `Whatever action you wanted to fire (click/type/key) didn't produce the expected screen change. ` +
-            `Look at the current screenshot, identify what's actually on screen, and pick a non-wait verb. ` +
-            `If you're waiting for a page to load, observe the URL bar or page title instead of blindly waiting.`,
+          `Brain emitted no-op-like actions (wait / press enter / press escape) 3 times in a row — either it's stalled, OR the goal already landed and it didn't notice. ` +
+            `Look at the current screenshot AND the URL — has the page navigated? Has a result/dialog appeared? If yes, emit DONE. ` +
+            `If no, the prior action didn't fire — pick a different verb (click on a specific labeled element instead of blindly pressing keys).`,
         );
         return "exhausted";
       }

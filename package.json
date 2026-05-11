@@ -11,10 +11,13 @@
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
     "modal:deploy": "modal deploy modal_app.py",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:native": "electron-rebuild -f -w @ponder/mac-ax",
+    "postinstall": "electron-rebuild -f -w @ponder/mac-ax || true"
   },
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.2",
+    "@ponder/mac-ax": "file:native/mac-ax",
     "convex": "^1.17.0",
     "dotenv": "^17.4.2",
     "node-mac-permissions": "^2.5.0",
@@ -25,6 +28,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
@@ -33,5 +37,6 @@
     "electron-vite": "^2.3.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
-  }
+  },
+  "optionalDependencies": {}
 }

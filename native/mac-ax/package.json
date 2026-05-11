@@ -1,0 +1,24 @@
+{
+  "name": "@ponder/mac-ax",
+  "version": "0.1.0",
+  "description": "macOS AXUIElement walker as a Node N-API addon. Loaded by Electron main process — runs inside Electron's bundle so the user's existing Accessibility grant applies.",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.2.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  },
+  "os": ["darwin"],
+  "engines": {
+    "node": ">=18"
+  }
+}

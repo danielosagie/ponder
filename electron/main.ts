@@ -58,6 +58,7 @@ import {
   createBuddyWindow,
   startBuddyCursorBroadcast,
 } from "./windows";
+import macAx from "@ponder/mac-ax";
 
 let tray: Tray | null = null;
 let appWin: BrowserWindow | null = null;
@@ -1083,6 +1084,140 @@ function startBridgeServer(): void {
             res.end(JSON.stringify({ x, y, width: w, height: h }));
           },
         );
+      });
+      return;
+    }
+
+    // POST /os/snapshot → { app, window, pid, tree } | { error }
+    //
+    // Walk the macOS Accessibility tree of the frontmost window via the
+    // @ponder/mac-ax native addon. The addon runs IN this Electron
+    // process, so the user's existing Accessibility grant on the Holo3
+    // app covers the AX calls — no separate sidecar perms prompt. tsx-
+    // hosted MCP children forward here via tryBridgeScreenCall.
+    //
+    // Returns the raw tree; the caller (src/agent/os/providers/mac.ts)
+    // serializes to Vimium-style text and assigns [eN] refs. Keeping
+    // serialization on the TS side keeps the bridge surface stable
+    // while ref-text format evolves.
+    if (method === "POST" && url === "/os/snapshot") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        if (process.platform !== "darwin") {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: "non-darwin platform" }));
+          return;
+        }
+        if (macAx == null) {
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              error:
+                "native-addon-missing: run `npm run build:native` and restart the app",
+            }),
+          );
+          return;
+        }
+        const p = (parsed as { pid?: unknown; maxDepth?: unknown }) ?? {};
+        const opts: { pid?: number; maxDepth?: number } = {};
+        if (typeof p.pid === "number") opts.pid = p.pid;
+        if (typeof p.maxDepth === "number") opts.maxDepth = p.maxDepth;
+        try {
+          const result = macAx.dump(opts);
+          res.writeHead(200);
+          res.end(JSON.stringify(result));
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // permission-denied: well-known prefix from the addon. Surface
+          // it verbatim so the MCP layer can detect and steer the user
+          // to the System Settings checkbox.
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: msg }));
+        }
+      });
+      return;
+    }
+
+    // POST /os/perform → { handle, action } → { ok: true } | { error }
+    //
+    // Invoke an AX action (AXPress / AXShowMenu / AXCancel / …) on an
+    // element from the last /os/snapshot. Avoids cursor movement — the
+    // app receives an action event as if the user clicked, but the
+    // user's mouse never moves. Useful when /screen/click would be too
+    // intrusive or when the element has no stable bounding box.
+    if (method === "POST" && url === "/os/perform") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        if (macAx == null) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: "native-addon-missing" }));
+          return;
+        }
+        const p = (parsed as { handle?: unknown; action?: unknown }) ?? {};
+        if (typeof p.handle !== "string" || typeof p.action !== "string") {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "expected { handle, action }" }));
+          return;
+        }
+        try {
+          macAx.perform({ handle: p.handle, action: p.action });
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      });
+      return;
+    }
+
+    // POST /os/set-value → { handle, value } → { ok: true } | { error }
+    //
+    // Set AXValue on an editable element. Replaces focus + keystrokes —
+    // no field-clear race, no key event dropouts. Falls back at the
+    // call site if the role can't accept AXValue.
+    if (method === "POST" && url === "/os/set-value") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        if (macAx == null) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ error: "native-addon-missing" }));
+          return;
+        }
+        const p = (parsed as { handle?: unknown; value?: unknown }) ?? {};
+        if (typeof p.handle !== "string" || typeof p.value !== "string") {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "expected { handle, value }" }));
+          return;
+        }
+        try {
+          macAx.setValue({ handle: p.handle, value: p.value });
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
       });
       return;
     }

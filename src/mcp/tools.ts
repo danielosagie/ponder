@@ -202,10 +202,13 @@ async function ensureAttached(): Promise<string | null> {
 
 // ── OS-level a11y client (Playwright-for-the-OS prototype) ─────────────
 //
-// Lazy-resolved, one per Node process. The factory picks a provider
-// (mac via ax-bridge Swift helper, win/linux are null stubs in v1) and
-// caches it; the tool handlers gate on `osClient.available()` the same
-// way browser tools gate on `ensureAttached()`.
+// Lazy-resolved, one per Node process. The mac provider routes through
+// the Electron bridge at :7900 (same plumbing as /screen/click etc.) —
+// the bridge loads the @ponder/mac-ax native addon, which walks
+// AXUIElement inside the Electron process so the user's existing
+// Accessibility grant covers AX calls. Win/Linux are null stubs in v1.
+// Tool handlers gate on `osClient.available()` the same way browser
+// tools gate on `ensureAttached()`.
 
 let _osClient: OsClient | null = null;
 function getOsClient(): OsClient {
@@ -222,11 +225,14 @@ async function ensureOsAvailable(): Promise<string | null> {
     : "";
   return (
     `OS a11y provider (${status.platform}) not available.${reasonText}\n\n` +
-    "Setup: on macOS run `bash src/agent/os/helpers/mac-axdump/build.sh` " +
-    "once, then grant Accessibility permission to Claude Code / Electron / " +
-    "tsx (System Settings → Privacy & Security → Accessibility). On other " +
-    "platforms, fall back to agent_click / agent_observe (vision-grounded) " +
-    "or browser_* if the target is in Chrome."
+    "Setup on macOS: 1) make sure the Holo3 Electron app is running " +
+    "(`npm run dev`) so the bridge at 127.0.0.1:7900 is alive. 2) Build " +
+    "the AX addon for Electron's ABI: `npm run build:native`. 3) Grant " +
+    "Accessibility permission to the Holo3 app in System Settings → " +
+    "Privacy & Security → Accessibility (same checkbox the screen tools " +
+    "already need). On other platforms, fall back to agent_click / " +
+    "agent_observe (vision-grounded) or browser_* if the target is in " +
+    "Chrome."
   );
 }
 
@@ -2899,7 +2905,8 @@ export function registerTools(server: McpServer): void {
   // can target without paying a vision round-trip per click.
   //
   // Falls back cleanly when the provider isn't available: ensureOsAvailable
-  // returns a setup hint pointing at build.sh and the perms checkbox.
+  // returns a setup hint pointing at the build:native script and the
+  // perms checkbox.
 
   const osSelectorSchema = z.object({
     ref: z.string().optional().describe("Stable ref like 'e12' from os_snapshot."),

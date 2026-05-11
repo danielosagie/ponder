@@ -5,9 +5,10 @@ A comparison prototype for the "OS-level Playwright" idea: mirror the
 for native windows, so the agent can pick refs out of an accessibility
 tree instead of paying a vision-grounding round-trip per click.
 
-**Status:** Commit 1 of a multi-step plan
-(`/root/.claude/plans/i-ve-been-thinking-one-sorted-babbage.md`). macOS
-provider scaffolded; Windows + benchmark land in later commits.
+**Status:** Commit 2 of a multi-step plan
+(`/root/.claude/plans/i-ve-been-thinking-one-sorted-babbage.md`).
+macOS provider routes through the Electron bridge via a native node
+addon (`native/mac-ax/`). Windows + benchmark land later.
 
 ## Architecture
 
@@ -19,41 +20,59 @@ src/agent/os/
   client.ts             pickOsClient() factory, lazy mac import
   providers/
     null.ts             unsupported-platform fallback
-    mac.ts              AXUIElement bridge via Swift helper
-  helpers/mac-axdump/
-    ax-bridge.swift     dump | perform | set-value | resolve subcommands
-    build.sh            swiftc invocation; run once on macOS
+    mac.ts              routes through Electron bridge (POST /os/snapshot)
+
+native/mac-ax/          # N-API addon loaded by electron/main.ts
+  binding.gyp           # node-gyp config with framework links
+  src/ax_bridge.mm      # AXUIElement walker (dump | perform | set-value | resolve)
+  index.js / index.d.ts # CJS loader + types
 ```
 
-Mirrors `src/agent/browser/` shape exactly. `OsSnapshot { app, window, ax }`
-parallels `BrowserSnapshot { url, title, ax }`.
+Mirrors `src/agent/browser/` shape. `OsSnapshot { app, window, ax }`
+parallels `BrowserSnapshot { url, title, ax }`. The TS provider is a
+thin client over the bridge — no spawned child processes, no separate
+perms grants.
 
-## macOS setup
+## Why through the Electron bridge?
+
+macOS Accessibility permission is granted per-bundle-ID. The Holo3
+Electron app already has it (the user ticked the checkbox once for
+`/screen/screenshot`, `/screen/click`, `/window/bounds`). The tsx-
+hosted MCP child does not. By loading the native addon inside Electron
+and exposing `/os/snapshot` on the existing bridge, all AX calls run
+in the Electron process and "inherit" its perms — no second prompt,
+no sidecar binary to sign.
+
+This is the same pattern `tryBridgeScreenCall` already uses for the
+other screen primitives (see `src/screen.ts:139–147` and
+`src/mcp/tools.ts:331`).
+
+## Setup on macOS
 
 ```sh
-cd src/agent/os/helpers/mac-axdump
-bash build.sh
+# 1. Install deps (the native addon's gyp install hook may fail on first
+#    run because Electron's ABI isn't matched yet — that's expected).
+npm install
+
+# 2. Build the addon against Electron's ABI.
+npm run build:native
+
+# 3. Start the app so the bridge is alive.
+npm run dev
 ```
 
-Then grant **Accessibility** permission to the process that invokes the
-binary (Claude Code / Electron / `tsx`), NOT to `ax-bridge` itself:
-
-> System Settings → Privacy & Security → Accessibility → enable the
-> app spawning the MCP child.
-
-On first call you'll get `ax-bridge permission-denied`; grant perms and
-retry.
+Then grant Accessibility permission to the Holo3 app (System Settings
+→ Privacy & Security → Accessibility). Same checkbox the screen tools
+already need.
 
 ## Enabling the tools
 
-The MCP tools are registered behind a feature flag so they only appear
-when explicitly enabled (and only on supported platforms):
+The MCP tools (`os_snapshot`, `os_click`) are always registered. They
+gate at action time on `pickOsClient().status().available` — if the
+bridge is down OR the native addon failed to load OR perms aren't
+granted, the tools surface a clear setup hint instead of executing.
 
-```sh
-OS_TOOLS_ENABLED=1 npm run dev
-```
-
-You can also force a specific provider:
+Force a specific provider during development:
 
 ```sh
 HOLO3_OS_PROVIDER=null   # always-unavailable, for testing error paths
@@ -70,23 +89,41 @@ HOLO3_OS_PROVIDER=mac    # force mac even on Linux (will fail cleanly)
 Selector shape: `{ ref: "e12" } \| { text: "Save" } \| { coords: [x, y] }`.
 Resolution order: ref → text → coords.
 
+Click currently uses the existing `/screen/click` route (mouse click at
+resolved coords). Future commits will add a `mode: "axpress"` shortcut
+that posts `/os/perform { handle, action: "AXPress" }` — no cursor
+movement, no focus changes.
+
+## Bridge routes added in this commit
+
+| Route | Body | Returns |
+|-------|------|---------|
+| `POST /os/snapshot` | `{ pid?, maxDepth? }` | raw tree (caller serializes) |
+| `POST /os/perform` | `{ handle, action }` | `{ ok: true }` |
+| `POST /os/set-value` | `{ handle, value }` | `{ ok: true }` |
+
 ## What's not here yet
 
-- `os_type`, `os_hover`, `os_drag` (commit 2)
-- Windows provider via PowerShell + UIAutomationClient (commit 2)
-- `scripts/bench-os-vs-browser.ts` end-to-end comparison (commit 3)
+- `os_type`, `os_hover`, `os_drag` MCP tools (provider methods exist — just need MCP registration)
+- Windows provider via PowerShell + UIAutomationClient
+- `scripts/bench-os-vs-browser.ts` end-to-end comparison
 - Linux AT-SPI (stretch)
 
 See the plan file for the full sequencing.
 
 ## Known limitations
 
+- **Bridge must be running.** When the Holo3 app isn't open, `os_*`
+  tools return a setup hint. They never auto-fall-back to vision —
+  that decision is the planner's, via `agent_observe` / `agent_click`.
 - **Electron apps** (Slack, Discord, VS Code) often have empty AX trees.
-  Detect by `ax` length / `[eN]` count; fall back to `agent_observe`.
+  `os_snapshot` detects this (empty `ax`) and surfaces a hint pointing
+  at `agent_observe`.
 - **Background-mode hover impossible** — `screen.move()` is a no-op
-  under cliclick. `os_hover` will surface `noop: true`.
-- **Helper binary unsigned** for dev — `build.sh` strips the quarantine
-  xattr; production needs proper codesigning.
+  under cliclick. `os_hover` always returns `noop: true` for now.
 - **Refs invalidate on every snapshot.** Same staleness model as
   `browser_*`. `os_click` returns a clear "call os_snapshot first"
   error on stale refs.
+- **Native addon must match Electron's ABI.** `npm run build:native`
+  invokes `electron-rebuild`. If you upgrade Electron, rebuild the
+  addon.

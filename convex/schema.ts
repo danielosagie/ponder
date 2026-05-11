@@ -43,6 +43,12 @@ export default defineSchema({
     // will claim this session (round-robin within a single dev's fleet —
     // e.g. "always run customer X's tasks on customer X's Mac").
     targetWorkerId: v.optional(v.string()),
+    // ---- v1.2 Cloud auth (Week 1) ----
+    // Set on every Ponder Cloud dispatch (via requireCustomer); left
+    // undefined on self-host deployments where there's no `customers` table.
+    // Every public Cloud query/mutation filters by this so customers never
+    // see another customer's data.
+    customerId: v.optional(v.id("customers")),
   })
     .index("by_created", ["createdAt"])
     // Drives the claimNext query. Worker filters by (workspaceId, status,
@@ -52,7 +58,10 @@ export default defineSchema({
       "status",
       "runtime",
       "createdAt",
-    ]),
+    ])
+    // v1.2 Cloud: customer-scoped listings ("show me my sessions"). Ordered
+    // by createdAt for dashboard reverse-chronological scroll.
+    .index("by_customer", ["customerId", "createdAt"]),
 
   steps: defineTable({
     sessionId: v.id("sessions"),
@@ -106,11 +115,63 @@ export default defineSchema({
       v.literal("offline"),
     ),
     currentSessionId: v.optional(v.id("sessions")),
+    // ---- v1.2 Cloud auth (Week 1) ----
+    // For BYO workers on Ponder Cloud: set when the worker registers under
+    // a Cloud `apiKey`. For self-host deployments and hosted workers
+    // (which we spawn directly via the IWorkerHost interface), this is
+    // also populated by the spawner. Undefined only on self-host.
+    customerId: v.optional(v.id("customers")),
   })
     .index("by_workerId", ["workerId"])
     .index("by_workspace_status", [
       "workspaceId",
       "status",
       "lastHeartbeatAt",
-    ]),
+    ])
+    // v1.2 Cloud: list-my-workers query for the dashboard.
+    .index("by_customer", ["customerId"]),
+
+  // ---- v1.2 Cloud auth (Week 1) ----
+  // One row per Ponder Cloud tenant. Self-host deployments leave this
+  // table empty and queries fall through to the un-scoped legacy path.
+  // The clerkOrgId is the source of truth — multiple Clerk users may
+  // share an org and therefore a `customers` row.
+  customers: defineTable({
+    clerkOrgId: v.string(),
+    email: v.string(), // billing contact
+    planTier: v.union(
+      v.literal("free"),
+      v.literal("pro"),
+      v.literal("enterprise"),
+    ),
+    // Stripe linkage (populated by §5's webhook handler in Week 4).
+    stripeCustomerId: v.optional(v.string()),
+    stripeSubscriptionId: v.optional(v.string()),
+    // Max concurrent hosted workers this customer can spawn. Computed
+    // from planTier at sign-up + plan-change webhook; cached here so
+    // the spawn endpoint doesn't have to re-derive on every call.
+    hostedQuota: v.number(),
+    // Hard quota for free-tier action enforcement; null = unlimited
+    // (Pro overage; Enterprise volume-tiered separately).
+    actionQuotaMonthly: v.optional(v.number()),
+    createdAt: v.number(),
+  }).index("by_clerkOrg", ["clerkOrgId"]),
+
+  // ---- v1.2 Cloud auth (Week 1) ----
+  // SDK auth keys. Distinct from Clerk JWTs: Clerk is for dashboard
+  // sessions, apiKeys are for `new PonderClient({ apiKey })`. Stored
+  // as SHA-256 hashes — the plaintext key is shown to the user exactly
+  // once at creation time. Prefix (first 8 chars + last 4) is kept for
+  // display in the dashboard ("pk_live_abcd…wxyz").
+  apiKeys: defineTable({
+    customerId: v.id("customers"),
+    hashedKey: v.string(),
+    displayPrefix: v.string(),
+    name: v.string(), // user-given label, e.g. "production server"
+    createdAt: v.number(),
+    lastUsedAt: v.optional(v.number()),
+    revokedAt: v.optional(v.number()),
+  })
+    .index("by_customer", ["customerId"])
+    .index("by_hashedKey", ["hashedKey"]),
 });

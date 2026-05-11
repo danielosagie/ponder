@@ -1,0 +1,100 @@
+{
+  "id": "calculator-speed-vs-accuracy-2026-05-11T03-30-00Z",
+  "case": "calculator-mouse-math (speed vs accuracy comparison across 3 paths)",
+  "model": "agent_click_sequence and agent_do via Electron bridge, hcompany provider, llama.cpp b9082 pinned",
+  "started_at": "2026-05-11T03:30:00Z",
+  "ended_at": "2026-05-11T03:40:00Z",
+  "elapsed_ms": 600000,
+  "outcome": "diagnostic",
+  "summary": "Quantified the crop-vs-uncrop speed/accuracy tradeoff on a tiny UI (Calculator 230×408). Cropping is 3.5× faster but destroys grounding accuracy at sub-60px buttons. Shipped padding-crop fix (Option B) as the proposed compromise.",
+  "test_results": [
+    {
+      "id": "test-c-cropped",
+      "tool": "agent_click_sequence",
+      "task": "47×8 via AC,4,7,×,8,=",
+      "targetApp": "Calculator",
+      "stepDelayMs": 50,
+      "result": {
+        "wall_ms": 17144,
+        "ground_ms": 9642,
+        "exec_ms": 820,
+        "post_settle_ms": 80,
+        "ground_path": "batch (provider.groundBatch, 1 HTTP round-trip)",
+        "cropped": "230×408 at 1226,457",
+        "tokens_per_target_approx": 175,
+        "clicks_inside_window": 6,
+        "clicks_outside_window": 0,
+        "buttons_correctly_identified": 1,
+        "math_result_displayed": "0%15 / 0",
+        "math_correct": false,
+        "click_to_button_mapping": {
+          "AC_request": "(1347, 629) → col 3 row 2 → hit '9'",
+          "4_request": "(1249, 776) → col 1 row 4 → hit '1'",
+          "7_request": "(1312, 733) → col 2 row 3 → hit '5'",
+          "x_request": "(1450, 572) → col 4 row 1 → hit '÷'",
+          "8_request": "(1341, 649) → col 2/3 row 2 → hit '8' or '9'",
+          "equals_request": "(1442, 839) → col 4 row 5 → hit '=' ✓"
+        }
+      },
+      "verdict": "FAST but INACCURATE. 1/6 buttons. At 230×408, the model picks regions but can't distinguish individual 57px buttons. Crop only useful for large UIs."
+    },
+    {
+      "id": "test-c-uncropped",
+      "tool": "agent_click_sequence",
+      "task": "47×8 via AC,4,7,×,8,=",
+      "targetApp": null,
+      "stepDelayMs": 50,
+      "result": {
+        "wall_ms": 60523,
+        "ground_ms": 58246,
+        "exec_ms": 769,
+        "post_settle_ms": 80,
+        "ground_path": "batch (provider.groundBatch)",
+        "cropped": null,
+        "tokens_per_target_approx": 4114,
+        "clicks_inside_window": 6,
+        "clicks_outside_window": 0,
+        "buttons_correctly_identified": 6,
+        "math_result_displayed": "47×8 = 376",
+        "math_correct": true,
+        "comment": "At full 1512×982 resolution the model has ~6× more pixels per button and grounds correctly on all 6."
+      },
+      "verdict": "ACCURATE but SLOW. 6/6 math correct. 60s wall is dominated by 4114-token prompt processing per target × 6 targets in parallel."
+    }
+  ],
+  "tradeoff_quantified": {
+    "speed_ratio_cropped_vs_uncropped": "3.5× faster",
+    "accuracy_ratio_cropped_vs_uncropped": "1/6 vs 6/6",
+    "tokens_ratio_cropped_vs_uncropped": "23× fewer (175 vs 4114)",
+    "wall_ratio": "60.5 / 17.1 = 3.5× (not 23× — there's a per-call fixed overhead that doesn't shrink with tokens)",
+    "interpretation": "For tiny UIs (Calculator-class, < 300px window), cropping makes inference fast but the model can't resolve individual UI elements. The grounding model's effective spatial resolution is ~4 pixels per normalized unit, so a 57px button gets ~14 normalized-unit-wide target — comparable to typical model jitter. Big UIs (Chrome window-class, > 800px) shouldn't have this problem."
+  },
+  "implementations_shipped": [
+    {
+      "commit": "1976d6c",
+      "name": "raise-then-recapture",
+      "what": "/window/raise bridge endpoint + raiseMacApp helper + loop calls raise+sleep+recapture before crop. Prevents Z-order occlusion where crop captures the WRONG app's pixels at the target's coords (May-11 false-positive DONE where Ponder's session UI was visible at Calculator's bounds because Calculator was buried)."
+    },
+    {
+      "commit": "f75b00f",
+      "name": "bounds-validate clicks",
+      "what": "When targetApp set, refuse to execute clicks whose post-translation coords fall outside the target window. Pushes a [note: …] to history so the brain re-grounds instead of focusing whatever's underneath."
+    },
+    {
+      "commit": "73dc680",
+      "name": "Option B — window-padding crop",
+      "what": "Pad the cropped region by 25% of window's min-dim (clamped [100, 250]px). For Calculator 230×408 → padded ~430×608 (~3.5× more pixels for the model). For Chrome 1200×800 → padded ~1600×1200 (adaptive, large windows get smaller relative padding). Click bounds-validation still uses the RAW window bounds — padding only widens the model's visual context."
+    }
+  ],
+  "not_tested_due_to_time": [
+    "bulbasaur upload via agent_do — Chrome navigation kept failing (URL bar typing not sticking, Chrome bounds query returning menu-bar only). Setup overhead exceeded the bench budget; deferred.",
+    "Option A (upscale crop 2×) — would require client-side image scaling before sending to grounder, OR a `scale` param on the Modal endpoint. Not yet implemented.",
+    "Padding effect on Calculator math accuracy — requires Electron restart to load 73dc680."
+  ],
+  "next_action_items": [
+    "1. User restart Electron — loads commit 73dc680 (padding) + f75b00f (bounds-validation, which the bridge at 1976d6c also doesn't have). All three fixes from today's session land in one restart.",
+    "2. Re-run Calculator 47×8 via agent_do (same task as the May-11 user-supplied log). Expected: padded ~430×608 crop fires; grounding ~25-40s for 6 targets (between cropped 9.6s and uncropped 58s); math = 376; verifier verifies.",
+    "3. If accuracy is still poor on Calculator: drop to uncropped for sub-300px windows (heuristic: only crop windows >= 400px in either dimension).",
+    "4. Bulbasaur bench: pre-position Chrome with a real listing open (manual setup), then run agent_do with targetApp:\"Google Chrome\". Chrome's UI elements are much larger than Calculator's buttons (>= 30px text, > 50px buttons) so accuracy should be fine even uncropped."
+  ]
+}

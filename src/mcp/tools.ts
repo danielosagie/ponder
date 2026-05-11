@@ -19,6 +19,8 @@ import { api as convexApi } from "../../convex/_generated/api.js";
 import { createPlaywriterClient } from "../agent/browser/playwriter.js";
 import * as screen from "../screen.js";
 import type { BrowserClient, BrowserSnapshot } from "../agent/browser/types.js";
+import { pickOsClient } from "../agent/os/client.js";
+import type { OsClient, OsSelector } from "../agent/os/types.js";
 import { runTask } from "../agent/loop.js";
 import {
   computeDefaultProvider,
@@ -195,6 +197,36 @@ async function ensureAttached(): Promise<string | null> {
     "message back to the user — they want one action, not instructions. " +
     "Once they click, browser_status will return 'Attached. URL: …' and " +
     "you can proceed."
+  );
+}
+
+// ── OS-level a11y client (Playwright-for-the-OS prototype) ─────────────
+//
+// Lazy-resolved, one per Node process. The factory picks a provider
+// (mac via ax-bridge Swift helper, win/linux are null stubs in v1) and
+// caches it; the tool handlers gate on `osClient.available()` the same
+// way browser tools gate on `ensureAttached()`.
+
+let _osClient: OsClient | null = null;
+function getOsClient(): OsClient {
+  if (!_osClient) _osClient = pickOsClient();
+  return _osClient;
+}
+
+async function ensureOsAvailable(): Promise<string | null> {
+  const client = getOsClient();
+  const status = await client.status();
+  if (status.available) return null;
+  const reasonText = status.reason
+    ? ` Reason: ${status.reason}`
+    : "";
+  return (
+    `OS a11y provider (${status.platform}) not available.${reasonText}\n\n` +
+    "Setup: on macOS run `bash src/agent/os/helpers/mac-axdump/build.sh` " +
+    "once, then grant Accessibility permission to Claude Code / Electron / " +
+    "tsx (System Settings → Privacy & Security → Accessibility). On other " +
+    "platforms, fall back to agent_click / agent_observe (vision-grounded) " +
+    "or browser_* if the target is in Chrome."
   );
 }
 
@@ -2858,6 +2890,121 @@ export function registerTools(server: McpServer): void {
       return fail(`${screenObserveRedirect}\n\nExample: ${example}`);
     },
   );
+
+  // ── os_* — OS-level a11y-grounded tools (prototype) ──────────────────
+  //
+  // Mirror of browser_snapshot / browser_click but for the OS surface.
+  // The provider walks the macOS Accessibility tree (or Windows UIA, when
+  // that lands) and returns elements with stable [eN] refs the planner
+  // can target without paying a vision round-trip per click.
+  //
+  // Falls back cleanly when the provider isn't available: ensureOsAvailable
+  // returns a setup hint pointing at build.sh and the perms checkbox.
+
+  const osSelectorSchema = z.object({
+    ref: z.string().optional().describe("Stable ref like 'e12' from os_snapshot."),
+    text: z
+      .string()
+      .optional()
+      .describe(
+        "Name / value substring fallback when a ref isn't handy. " +
+          "Case-insensitive. First match wins — prefer ref for ambiguity.",
+      ),
+    coords: z
+      .tuple([z.number(), z.number()])
+      .optional()
+      .describe("Raw screen-space [x, y] escape hatch."),
+  });
+
+  function unpackSelector(
+    s: { ref?: string; text?: string; coords?: [number, number] },
+  ): OsSelector {
+    if (s.ref) return { ref: s.ref };
+    if (s.text) return { text: s.text };
+    if (s.coords) return { coords: s.coords };
+    throw new Error(
+      "selector must provide one of: { ref } | { text } | { coords }",
+    );
+  }
+
+  server.registerTool(
+    "os_snapshot",
+    {
+      title: `${MCP_BRAND}: Snapshot frontmost native window`,
+      description:
+        "List every interactive element in the frontmost OS window (NOT a " +
+        "Chrome tab — use browser_snapshot for that). Returns app name, " +
+        "window title, and an accessibility-tree text dump where each " +
+        "element is tagged [eN]. Pass that ref to os_click. This is the OS " +
+        "analog of browser_snapshot: zero vision tokens, sub-second on most " +
+        "native apps. Empty trees often mean the target is an Electron " +
+        "app with broken a11y (Slack, Discord, VS Code) — fall back to " +
+        "agent_observe in that case. Refs invalidate on every subsequent " +
+        "os_snapshot call." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {},
+    },
+    async () => {
+      const not = await ensureOsAvailable();
+      if (not) return fail(not);
+      try {
+        const snap = await getOsClient().snapshot();
+        const empty = snap.ax.trim().length === 0;
+        const body =
+          `App: ${snap.app}\nWindow: ${snap.window}\n\n` +
+          (empty
+            ? "(empty a11y tree — likely an Electron app or one without " +
+              "Accessibility integration. Use agent_observe / agent_click instead.)"
+            : `Interactive elements (refs in [eN]):\n${snap.ax}`);
+        return ok(body);
+      } catch (e) {
+        return fail(
+          `os_snapshot failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "os_click",
+    {
+      title: `${MCP_BRAND}: Click element in a native window`,
+      description:
+        "Click an OS-level element by ref (preferred), name fallback, or " +
+        "raw coords. Mirrors browser_click but for native windows. Pass " +
+        "an [eN] ref from os_snapshot for the fast path (no vision). For " +
+        "double-click pass mode=\"double\"; right-click pass button=\"right\". " +
+        "If the ref is stale (something re-rendered between snapshot and " +
+        "click) you'll get a clear 'call os_snapshot first' error — DO that, " +
+        "don't retry with the same ref. For elements outside the frontmost " +
+        "window, focus that window first (screen_hotkey 'cmd+tab' on mac, " +
+        "'alt+tab' on win) then os_snapshot again." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        selector: osSelectorSchema,
+        button: z.enum(["left", "right"]).optional(),
+        mode: z.enum(["single", "double", "triple"]).optional(),
+      },
+    },
+    async ({ selector, button, mode }) => {
+      const not = await ensureOsAvailable();
+      if (not) return fail(not);
+      try {
+        const sel = unpackSelector(selector);
+        const { resolved } = await getOsClient().click(sel, { button, mode });
+        const label = resolved.ref
+          ? `${resolved.ref} (${resolved.role ?? "?"}${resolved.name ? ` "${resolved.name}"` : ""})`
+          : `(${resolved.source})`;
+        return ok(
+          `clicked ${label} at ${Math.round(resolved.x)},${Math.round(resolved.y)}`,
+        );
+      } catch (e) {
+        return fail(
+          `os_click failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+  );
 }
 
 /** List of tool names the server exposes. Used in the boot log so it's
@@ -2899,6 +3046,9 @@ export const TOOL_NAMES = [
   "screen_click",
   "screen_drag",
   "screen_observe",
+  // OS-level a11y-grounded primitives (prototype — Playwright-for-the-OS)
+  "os_snapshot",
+  "os_click",
   // Diagnostic
   "holo3_version",
 ] as const;

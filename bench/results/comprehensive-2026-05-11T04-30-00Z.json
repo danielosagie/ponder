@@ -1,0 +1,139 @@
+{
+  "id": "comprehensive-2026-05-11T04-30-00Z",
+  "case": "Calculator (tiny-UI) + Bulbasaur web task (complex multi-state) — full bench",
+  "model": "agent_click_sequence and agent_do via Electron bridge + Modal /ground/batch (llama.cpp b9082)",
+  "started_at": "2026-05-11T03:30:00Z",
+  "ended_at": "2026-05-11T04:30:00Z",
+  "elapsed_ms": 3600000,
+  "summary": "Tested cropped, padded, upscaled, and uncropped paths on Calculator 47×8 + attempted bulbasaur web task. Definitive finding: for tiny UIs (sub-300px), no geometry trick (crop, pad, upscale) recovers accuracy — the model is out of training distribution at low effective resolution. For Calculator-class, only full-screen at 1512×982 produces 6/6 accuracy. Web tasks blocked by Facebook login wall in this session.",
+  "calculator_bench_47x8": {
+    "task": "Click AC, 4, 7, ×, 8, = to compute 47 × 8 in macOS Calculator",
+    "expected_display": "376",
+    "variants_tested": [
+      {
+        "name": "C cropped (agent_click_sequence + targetApp:Calculator, tight 230×408 crop)",
+        "wall_s": 17.1,
+        "ground_s": 9.6,
+        "tokens_per_target": 175,
+        "accuracy_of_6": 1,
+        "math_correct": false,
+        "math_displayed": "0%15 / 0",
+        "verdict": "FAST but UNUSABLE — model picks regions but can't distinguish 57px buttons"
+      },
+      {
+        "name": "C uncropped (agent_click_sequence, full 1512×982)",
+        "wall_s": 60.5,
+        "ground_s": 58.2,
+        "tokens_per_target": 4114,
+        "accuracy_of_6": 6,
+        "math_correct": true,
+        "math_displayed": "376",
+        "verdict": "ACCURATE — 6× more pixels per button gives the model enough precision"
+      },
+      {
+        "name": "Sharper prompts, cropped (3 iterations)",
+        "wall_s_progression": [17.1, 10.3, 7.9, 7.2],
+        "accuracy_progression": ["1/6", "3/6", "3/6", "1/6"],
+        "verdict": "Prompt-eng caps at 3/6 at 7.9s. 'Orange-neighbor' anchoring made it WORSE (1/6) by pulling the model toward orange operators"
+      },
+      {
+        "name": "Padding crop (Option B: +25% of min-dim, [100-250]px clamp)",
+        "wall_s": 179.4,
+        "outcome": "exhausted",
+        "ground_attempts": 24,
+        "all_OOB_refused_by_bounds_validate": true,
+        "verdict": "WORSE THAN CROPPED — padding pulled in adjacent windows (Cursor IDE chat); model anchored on Cursor button-like elements in the padded region's bottom-right; every re-ground hit the same corner, bounds-validate refused all 24, brain emitted unparseable output, run died"
+      },
+      {
+        "name": "Upscale (Modal-side PIL.LANCZOS resize before grounding)",
+        "via": "direct curl to /ground/batch with crop + upscale param",
+        "variants": [
+          { "upscale": null, "wall_s": 7.60, "tokens": 185, "accuracy": "2/6" },
+          { "upscale": 2.0, "wall_s": 5.23, "tokens": 460, "accuracy": "1/6" },
+          { "upscale": 3.0, "wall_s": 9.34, "tokens": 930, "accuracy": "2/6" },
+          { "upscale": 4.0, "wall_s": 14.79, "tokens": 1573, "accuracy": "2/6" }
+        ],
+        "key_observation": "At 3× and 4× the model returned IDENTICAL coords (1278,690) for different digit prompts — converging to a 'default' digit-area point. Out of training distribution.",
+        "verdict": "DOES NOT FIX accuracy. Upscale increases token count linearly but doesn't add real spatial information the model can use. Cropping + upscaling isn't a substitute for native pixel resolution."
+      }
+    ],
+    "winning_combination_for_calculator": {
+      "approach": "Skip cropping entirely. Use agent_click_sequence (batched) WITHOUT targetApp.",
+      "wall_s": 60.5,
+      "accuracy_of_6": 6,
+      "math": "376",
+      "rationale": "For sub-300px windows, the speed-vs-accuracy tradeoff is irreducible at this model. A wrong answer in 7s is worse than a right answer in 60s. The 60s wall is dominated by inference on 4114-token prompts × 6 parallel targets; the only way to drop further is a faster model or pinning llama.cpp to an earlier (faster) build."
+    }
+  },
+  "bulbasaur_web_bench": {
+    "task": "Search Facebook Marketplace for 'bulbasaur' (then upload images to the listing)",
+    "intended_path": "agent_do via Ponder on Chrome window (targetApp:'Google Chrome', surface:'other')",
+    "actual_outcome": "BLOCKED at step 1 — Facebook 'See more on Facebook' login modal occluded the search field; agent didn't recognize modal as blocker, clicks went to modal-covered area, type events went to login email field instead of search field. Escape didn't dismiss (FB modal is content-blocker for non-logged-in users).",
+    "transcript_excerpt": [
+      "[t=16.1s] thought: click on the 'Search Marketplace' input field",
+      "[t=31.7s] action: click {x:151,y:247}  -- behind the login modal",
+      "[t=44.8s] thought: type 'bulbasaur'  -- but typed into login email field",
+      "[t=61.7s] thought: press enter (× 3 attempts, all useless)",
+      "[t=127.3s] error: Already attempted 'bulbasaur' earlier — anti-loop bailed"
+    ],
+    "per_step_timing": "~15s per step (~13s plan + ~13s ground for click, ~3s type) at full-screen 1512×982. Chrome is large so cropping would help speed, but the failure mode here is brain reasoning, not vision precision.",
+    "what_this_reveals": [
+      "Ponder loop has no notion of 'modal occluder' as a recoverable obstacle. The anti-loop coord-scatter guard works for hallucinated clicks; it doesn't catch the 'we have an unrecognized modal in the way' case.",
+      "Bounds-validation (f75b00f) wouldn't help here — Chrome's window is huge (full screen), so all clicks are 'inside Chrome'. The modal is INSIDE Chrome, not outside.",
+      "For real-world Facebook automation: must either (a) start from a logged-in session, OR (b) teach the loop to detect login/auth/permission modals as a known obstacle class and emit a specific 'dismiss modal' action.",
+      "The agent_do architecture is fundamentally suited for stateful flows BUT requires the brain to recognize state changes. Sub-300px UIs aren't the only failure mode — modal-blocked UIs are another."
+    ]
+  },
+  "shipped_this_session": [
+    {
+      "commit": "1976d6c",
+      "fix": "/window/raise endpoint + raise-then-recapture in maybeCropToTargetApp",
+      "impact": "Eliminates Z-order occlusion where crop captures occluder pixels. False-positive DONE on session-title text was caught."
+    },
+    {
+      "commit": "f75b00f",
+      "fix": "Bounds-validate clicks against targetApp window when set",
+      "impact": "OOB clicks (May-11 = click at (347,279) focusing Terminal) are now refused; brain re-grounds with note. Caveat: brain can loop on the SAME wrong region (saw this 24×24 in the padding test) until coord-scatter or unparseable-output guard catches it."
+    },
+    {
+      "commit": "73dc680 → reverted by 02d1cbc",
+      "fix": "Option B padding crop — TRIED but ROLLED BACK",
+      "impact": "Padding made accuracy WORSE because it includes adjacent windows' UI as distractors. 24 OOB-refused clicks → exhausted."
+    },
+    {
+      "commit": "02d1cbc",
+      "fix": "300px size threshold — skip cropping for tiny windows",
+      "impact": "Tiny windows (Calculator) auto-route to uncropped grounding. 60s wall, 6/6 accuracy."
+    },
+    {
+      "commit": "WIP modal_app.py upscale param",
+      "fix": "Added optional `upscale` to /ground/batch (PIL.LANCZOS resize) + post-process coord division",
+      "impact": "Tested 2×/3×/4× — NO accuracy improvement on Calculator. Useful infra for future experiments (e.g. partial-region focus) but doesn't unblock tiny-UI accuracy."
+    }
+  ],
+  "open_problems": [
+    {
+      "id": "tiny-ui-accuracy-vs-speed",
+      "summary": "For sub-300px windows, Calculator-style, there's no current way to get both <30s wall AND >50% accuracy. Workarounds: use the slow accurate path (60s), or pin a faster llama.cpp commit (untested potential 5-10×), or use a different vision model.",
+      "next_action": "Pin llama.cpp to a commit known to give ~0.3s/target on full screen. The 60s/6-of-6 path drops to ~10s/6-of-6 at that inference rate."
+    },
+    {
+      "id": "ponder-modal-blindness",
+      "summary": "Ponder's brain doesn't recognize modal overlays as obstacles — it clicks 'through' them and the events go to whichever element actually has focus. Result: agent grinds against an invisible barrier.",
+      "next_action": "Add a 'modal detector' to the brain's prompt: 'If you see a centered overlay, panel, or popup with a Close/Cancel/Dismiss button, click that FIRST before proceeding'. OR add OS-level detection of dialog windows via accessibility tree."
+    },
+    {
+      "id": "fb-bench-needs-logged-in-state",
+      "summary": "Any Facebook automation bench requires a pre-logged-in Chrome session.",
+      "next_action": "User pre-logs into Facebook → bookmarks a real bulbasaur listing → re-runs bench from that bookmark."
+    }
+  ],
+  "speed_accuracy_floor_matrix": {
+    "tiny_ui_lt_300px_cropped": "FAST (7-17s) but INACCURATE (1-3/6)",
+    "tiny_ui_lt_300px_uncropped": "SLOW (60s) but ACCURATE (6/6)",
+    "tiny_ui_lt_300px_upscaled_crop": "FAST-MEDIUM (5-15s) but STILL INACCURATE (1-2/6)",
+    "tiny_ui_lt_300px_padded_crop": "BROKEN (180s exhausted) due to adjacent-window distractors",
+    "large_ui_gt_300px_cropped": "Untested with corrected setup but EXPECTED FAST AND ACCURATE (per Chrome 1200×800 model has enough pixels)",
+    "large_ui_gt_300px_uncropped": "MEDIUM (15s/step) and ACCURATE provided no modal occluders"
+  }
+}

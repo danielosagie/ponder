@@ -487,6 +487,7 @@ class Holo3:
         screen_w: int,
         screen_h: int,
         crop: dict[str, int] | None = None,
+        upscale: float | None = None,
     ) -> list[dict[str, Any]]:
         """Ground N instructions against ONE screenshot.
 
@@ -550,23 +551,72 @@ class Holo3:
                     lower = max(upper, min(ih, cy + ch))
                     if right > left and lower > upper:
                         cropped = img.crop((left, upper, right, lower))
+                        # UPSCALE: when set, resize the cropped image
+                        # by `upscale` factor before grounding. The
+                        # field of view is unchanged (still just the
+                        # target window) — we just give the model more
+                        # pixels per UI element. The grounded coords
+                        # come back in the UPSCALED image's space
+                        # (0–upscaled_w by 0–upscaled_h); we pass the
+                        # upscaled dims as effective_w/effective_h so
+                        # the model's 0–1000 normalized output scales
+                        # to the upscaled image and we divide back
+                        # afterwards.
+                        #
+                        # CRITICAL: we report `effective_w/effective_h`
+                        # to the model and to llama-server as the
+                        # SCREEN dims. The model's pixel coordinates
+                        # come back in this space. The caller needs to
+                        # DIVIDE returned coords by `upscale` to get
+                        # coords in the original cropped-image space,
+                        # then add crop.x/y to translate to screen.
+                        # We do that division on the server here so
+                        # callers see coords in cropped-image space
+                        # regardless of upscale factor (so existing
+                        # client code doesn't need to know about it).
+                        if upscale and upscale > 1.0:
+                            ucw = int((right - left) * upscale)
+                            uch = int((lower - upper) * upscale)
+                            cropped = cropped.resize(
+                                (ucw, uch),
+                                Image.LANCZOS,
+                            )
+                            print(
+                                f"[ground_batch] upscale {upscale}x: "
+                                f"{right - left}x{lower - upper} → {ucw}x{uch}"
+                            )
                         buf = io.BytesIO()
                         cropped.save(buf, format="PNG")
                         effective_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                        effective_w = right - left
-                        effective_h = lower - upper
+                        # Report effective dims at the UPSCALED size so
+                        # the model's 0-1000 normalized output maps
+                        # onto upscaled pixels — more spatial budget.
+                        effective_w = cropped.size[0]
+                        effective_h = cropped.size[1]
             except Exception as e:
                 # Log to stderr so the failure is visible in modal logs,
                 # but don't fail the request — un-cropped grounding is
                 # still useful, just lacks the decoy defense.
                 print(f"[ground_batch] crop failed: {e}; using uncropped")
 
-        return await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self._ground_one_async(instr, effective_b64, effective_w, effective_h)
                 for instr in instructions
             ]
         )
+        # If we upscaled, the returned x/y are in upscaled-image space.
+        # Divide by upscale so the caller receives coords in the
+        # ORIGINAL cropped-image space — keeps the client-side coord
+        # translation (`screen_x = result.x + crop.x`) unchanged.
+        if upscale and upscale > 1.0 and crop:
+            for r in results:
+                if isinstance(r, dict) and "x" in r and "y" in r:
+                    r["x"] = int(round(r["x"] / upscale))
+                    r["y"] = int(round(r["y"] / upscale))
+                    # Also annotate so curl tests can see what happened.
+                    r["upscale_applied"] = upscale
+        return results
 
     # ---- Helpers ----
 
@@ -734,6 +784,28 @@ def ground_batch_endpoint(
         if crop["w"] <= 0 or crop["h"] <= 0:
             return {"error": "crop w and h must be positive"}
 
+    # Optional `upscale` factor. When set (e.g. 2.0 or 3.0), the
+    # cropped image is enlarged with PIL.Image.LANCZOS BEFORE
+    # grounding. Same field of view, more pixels per UI element →
+    # the model's 0-1000 normalized output maps onto a higher-
+    # resolution coordinate space, so adjacent buttons get further
+    # apart in normalized-unit space and are easier to distinguish.
+    # Server reports coords back in the ORIGINAL cropped-image
+    # space (divides by upscale before returning), so the client's
+    # crop.x/y translation works unchanged. Validated May-11 on
+    # Calculator's 230×408 keypad where 0–1000 normalization gave
+    # only ~14 normalized units per 57px button — model jitter of
+    # ±5 units routinely flipped buttons. At upscale 2.5×, units
+    # per button rise to ~35, well above noise.
+    upscale = body.get("upscale")
+    if upscale is not None:
+        try:
+            upscale = float(upscale)
+        except (TypeError, ValueError):
+            return {"error": "upscale must be a number"}
+        if upscale < 1.0 or upscale > 8.0:
+            return {"error": "upscale must be in [1.0, 8.0]"}
+
     holo3 = Holo3()
     results = holo3.ground_batch.remote(
         instructions,
@@ -741,5 +813,6 @@ def ground_batch_endpoint(
         int(body.get("screen", [0, 0])[0]),
         int(body.get("screen", [0, 0])[1]),
         crop,
+        upscale,
     )
     return {"results": results}

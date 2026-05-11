@@ -301,6 +301,58 @@ function normalizeAction(a: string): string {
 }
 
 /**
+ * Heuristic: detect references to specific macOS native apps in the
+ * task text. When the user says "calculate X on the calculator", they
+ * mean Calculator.app — NOT "open Chrome and find a web calculator".
+ * The hierarchical planner has historically picked the wrong path on
+ * exactly these prompts (the May-10 mathway.com debacle:
+ *   task: "calculate 12345/21412 x 12 on the calculator"
+ *   plan: ["Open Chrome", "Navigate to the calculator page", ...]
+ *   result: 20 hallucinated clicks on mathway.com, never reaches
+ *           Calculator.app).
+ *
+ * When we detect a known native-app reference AND the caller hasn't
+ * explicitly set targetApp / flat, we:
+ *   1. Auto-set targetApp so screenshots get cropped to that app's
+ *      window (~6× speedup on plan + ground).
+ *   2. Force flat mode so the planner doesn't decompose into wrong
+ *      subtasks — runOneSubtask handles the whole task with framing
+ *      via the original task text.
+ *
+ * Patterns are intentionally narrow to avoid false positives — e.g.
+ * "notes" alone is too generic (could mean any kind of note); we
+ * require "Notes app". A user who genuinely wants the web flow can
+ * pass flat:false explicitly, or pass targetApp:"" to opt out.
+ */
+const NATIVE_APP_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  // Calculator: the failing example. Anchor on the word so "calculate"
+  // (the verb) doesn't false-positive — only matches "calculator".
+  { name: "Calculator", re: /\bcalculator\b/i },
+  // Finder: very strong signal. "in Finder", "the Finder window".
+  { name: "Finder", re: /\bfinder\b/i },
+  // Calendar.app — the macOS native one. "calendar app", "in Calendar"
+  // (capitalized), or "macOS Calendar".
+  { name: "Calendar", re: /\bcalendar app\b|\bin Calendar\b|\bmacos calendar\b/i },
+  // Native apps with disambiguating words.
+  { name: "Notes", re: /\bnotes app\b|\bin Notes\b/i },
+  { name: "Preview", re: /\bpreview app\b|\bin Preview\b/i },
+  { name: "Reminders", re: /\breminders app\b|\bin Reminders\b/i },
+  // Settings UIs (macOS calls it "System Settings" since Ventura).
+  {
+    name: "System Settings",
+    re: /\bsystem settings\b|\bsystem preferences\b/i,
+  },
+  { name: "Terminal", re: /\bterminal app\b|\bin Terminal\b/i },
+];
+
+function inferTargetApp(task: string): string | null {
+  for (const { name, re } of NATIVE_APP_PATTERNS) {
+    if (re.test(task)) return name;
+  }
+  return null;
+}
+
+/**
  * Public entry point. Decomposes the task with the small local planner
  * (qwen3 via Ollama by default), then runs the existing per-step Holo3 loop
  * once per subtask, feeding the OVERALL goal back into each subtask's prompt
@@ -309,11 +361,31 @@ function normalizeAction(a: string): string {
  * If the planner is unavailable, returns a single-subtask plan and we run
  * exactly the old flat behavior — no regression for users who don't have
  * Ollama installed.
+ *
+ * Auto-targetApp detection: when the task text mentions a known native
+ * macOS app (Calculator, Finder, etc.) AND the caller hasn't set
+ * targetApp / flat explicitly, we (1) set targetApp to crop screenshots
+ * to that app's window for the ~6× plan/ground speedup, and (2) force
+ * flat mode so the planner doesn't decompose into wrong subtasks
+ * ("Open Chrome → web calculator…"). See NATIVE_APP_PATTERNS above.
  */
 export async function runTask(
   opts: RunOptions,
 ): Promise<"done" | "cancelled" | "exhausted"> {
   const { task, events } = opts;
+
+  // Auto-targetApp / auto-flat: detect native-app intent in the task
+  // text. Only kicks in when the caller hasn't set targetApp already
+  // (so explicit MCP calls override) AND flat wasn't already passed
+  // (so existing flat-mode contract is unchanged).
+  const inferredApp =
+    !opts.targetApp && !opts.flat ? inferTargetApp(task) : null;
+  if (inferredApp) {
+    console.log(
+      `[loop] 🪟 inferred targetApp="${inferredApp}" from task text → forcing flat mode and enabling crop (skips the hierarchical planner that would otherwise decompose into wrong subtasks like "Open Chrome → web calculator")`,
+    );
+    opts = { ...opts, targetApp: inferredApp, flat: true };
+  }
 
   // Flat mode (agent_do) — skip the hierarchical planner entirely.
   //
@@ -514,6 +586,24 @@ async function runOneSubtask(
   // on the Screenshot…PM.png file" emissions while the file was actually
   // being selected — the legacy guard killed a working flow.
   const actionScreenHashes: string[] = [];
+  // Sliding window of the last few (action-text, ground-coord) pairs
+  // captured from successful click grounds. Used by the anti-loop
+  // guard's coord-scatter check: when the same action text repeats
+  // 3+ times in this window AND its grounds are >SCATTER_THRESHOLD
+  // apart spatially, the brain is hallucinating (vision model
+  // returning random coords because the target isn't on screen).
+  // Bail even if pixels are changing — mathway.com / facebook /
+  // many websites have animated ads that produce pixel churn
+  // without any progress being made.
+  //
+  // We only push on SUCCESSFUL grounds (not browser.*, not type,
+  // not DONE) — the anti-loop is already paired with the existing
+  // history-based check that fires on any repeat. This array's job
+  // is to disambiguate "screen IS changing" cases.
+  const recentClickGrounds: Array<{ action: string; x: number; y: number }> =
+    [];
+  const SCATTER_THRESHOLD_PX = 250;
+  const SCATTER_WINDOW = 6;
   // Ralph verifier: when the brain emits DONE we ask the same model
   // (different prompt) "did the goal actually land?". If RETRY, we
   // push a [note: …] to history and run one more iteration so the
@@ -1182,8 +1272,45 @@ async function runOneSubtask(
         );
         return "exhausted";
       }
+      // Screen is changing — but is the brain actually making progress,
+      // or is it WANDERING? Check coord scatter: if the recent grounds
+      // for THIS same action text are >SCATTER_THRESHOLD_PX apart,
+      // the vision model is hallucinating coords for a target it can't
+      // actually see, not converging on a real button. The screen-is-
+      // changing exemption was meant for "the file picker is selecting
+      // items as we click" — a converging, monotonic flow — not for
+      // "we're flailing across the page while an ad animation runs".
+      const sameActionGrounds = recentClickGrounds.filter(
+        (g) => g.action === normNow,
+      );
+      if (sameActionGrounds.length >= 3) {
+        let maxDist = 0;
+        for (let i = 0; i < sameActionGrounds.length; i++) {
+          for (let j = i + 1; j < sameActionGrounds.length; j++) {
+            const dx = sameActionGrounds[i]!.x - sameActionGrounds[j]!.x;
+            const dy = sameActionGrounds[i]!.y - sameActionGrounds[j]!.y;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d > maxDist) maxDist = d;
+          }
+        }
+        if (maxDist > SCATTER_THRESHOLD_PX) {
+          console.warn(
+            `[loop] 🛑 anti-loop (coord-scatter): action "${action}" grounded ${sameActionGrounds.length} times with max pairwise distance ${Math.round(maxDist)}px (threshold ${SCATTER_THRESHOLD_PX}). Vision model is hallucinating coords — the target is NOT on this screen. Bailing despite pixel changes.`,
+          );
+          const coordList = sameActionGrounds
+            .map((g) => `(${g.x},${g.y})`)
+            .join(" → ");
+          await events.onError(
+            `Stuck: the brain emitted "${action}" ${sameActionGrounds.length} times but the grounder pointed to wildly different spots each time (${coordList}). ` +
+              `That means the target isn't actually on the screen — the vision model is guessing. ` +
+              `Try a different approach: re-observe with screen_screenshot, switch to a different verb (keyboard input?), ` +
+              `or check whether the right app / page is even foregrounded.`,
+          );
+          return "exhausted";
+        }
+      }
       console.log(
-        `[loop] ⚠ action "${action}" repeated ${same}/4 times but screen IS changing — not bailing (progress likely happening)`,
+        `[loop] ⚠ action "${action}" repeated ${same}/4 times but screen IS changing — not bailing (progress likely happening, coord-scatter check passed: ${sameActionGrounds.length} grounds within ${SCATTER_THRESHOLD_PX}px)`,
       );
     }
 
@@ -1312,7 +1439,25 @@ async function runOneSubtask(
       console.log(
         `[loop] 🎯 ground (${Date.now() - tGround}ms): ${coords ? `(${coords.x}, ${coords.y})` : "FAILED"}`,
       );
-      if (coords) await events.onGround(coords);
+      if (coords) {
+        await events.onGround(coords);
+        // Record this (action, ground-coord) pair for the anti-loop
+        // coord-scatter check. We record SCREENSHOT-space coords here
+        // (before the offsetX/Y translation a few lines down) — those
+        // are the values the vision model produced, so they're what
+        // tells us whether the model is wandering. The threshold is
+        // SCATTER_THRESHOLD_PX in screenshot-pixel space (250 = about
+        // 1/6 of a 1512×982 screen — way larger than the few-px
+        // jitter you get from genuine same-target re-grounding).
+        recentClickGrounds.push({
+          action: normalizeAction(action),
+          x: coords.x,
+          y: coords.y,
+        });
+        if (recentClickGrounds.length > SCATTER_WINDOW) {
+          recentClickGrounds.shift();
+        }
+      }
       if (cancelled()) return "cancelled";
     }
 

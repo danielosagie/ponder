@@ -462,11 +462,15 @@ function chainBridge<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function runAgentTaskForBridge(
-  opts: { prompt: string; targetApp?: string } | string,
+  opts:
+    | { prompt: string; targetApp?: string; maxSteps?: number }
+    | string,
 ): Promise<BridgeResult> {
   // Backwards-compat: prior callers passed a bare prompt string.
-  const { prompt, targetApp } =
-    typeof opts === "string" ? { prompt: opts, targetApp: undefined } : opts;
+  const { prompt, targetApp, maxSteps } =
+    typeof opts === "string"
+      ? { prompt: opts, targetApp: undefined, maxSteps: undefined }
+      : opts;
   // Mirror the perms gate from the IPC handler — better to fail fast
   // with an actionable message than 50 silent no-op steps.
   const permsCheck = await checkActionPermissions();
@@ -617,6 +621,15 @@ async function runAgentTaskForBridge(
       // /plan because image-patch tokens scale with pixel count. See
       // src/agent/loop.ts maybeCropToTargetApp.
       targetApp,
+      // Per-call action budget override. Defaults to MAX_STEPS (50)
+      // when not set. Long-horizon multi-app cases (e.g. the
+      // honda-crv-spreadsheet-research T4) need ~40-60 steps; short
+      // cases can keep the default. The bench harness reads this from
+      // each case's frontmatter `max_steps:` field and passes it
+      // through the /agent_do POST body.
+      ...(typeof maxSteps === "number" && maxSteps > 0
+        ? { maxSteps }
+        : {}),
       onBrowserSnapshot: (snap) => {
         lastSnapshot = snap;
       },
@@ -770,6 +783,7 @@ function startBridgeServer(): void {
             const parsed = JSON.parse(body) as {
               task?: unknown;
               targetApp?: unknown;
+              maxSteps?: unknown;
             };
             const task = typeof parsed.task === "string" ? parsed.task : "";
             const targetApp =
@@ -777,13 +791,24 @@ function startBridgeServer(): void {
               parsed.targetApp.trim().length > 0
                 ? parsed.targetApp.trim()
                 : undefined;
+            // Optional per-call action budget. Sanity-clamp to
+            // [5, 200] so a malformed payload can't accidentally
+            // run for thousands of steps. Default (undefined)
+            // lets runAgentTaskForBridge use the loop's MAX_STEPS.
+            const maxSteps =
+              typeof parsed.maxSteps === "number" &&
+              Number.isFinite(parsed.maxSteps) &&
+              parsed.maxSteps >= 5 &&
+              parsed.maxSteps <= 200
+                ? Math.floor(parsed.maxSteps)
+                : undefined;
             if (!task.trim()) {
               res.writeHead(400);
               res.end(JSON.stringify({ error: "empty task" }));
               return;
             }
             const result = await chainBridge(() =>
-              runAgentTaskForBridge({ prompt: task, targetApp }),
+              runAgentTaskForBridge({ prompt: task, targetApp, maxSteps }),
             );
             res.writeHead(200);
             res.end(JSON.stringify(result));

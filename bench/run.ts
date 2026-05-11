@@ -57,6 +57,7 @@ interface Args {
   dryRun: boolean;
   noSetup: boolean;
   targetAppOverride?: string;
+  maxStepsOverride?: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -70,7 +71,14 @@ function parseArgs(argv: string[]): Args {
     if (a === "--dry-run") args.dryRun = true;
     else if (a === "--no-setup") args.noSetup = true;
     else if (a === "--targetApp") args.targetAppOverride = argv[++i];
-    else if (a.startsWith("--")) {
+    else if (a === "--maxSteps") {
+      const n = Number(argv[++i]);
+      if (!Number.isFinite(n) || n < 5 || n > 200) {
+        console.error(`--maxSteps must be 5..200; got ${argv[i]}`);
+        process.exit(2);
+      }
+      args.maxStepsOverride = Math.floor(n);
+    } else if (a.startsWith("--")) {
       console.error(`Unknown flag: ${a}`);
       process.exit(2);
     } else if (!args.caseId) args.caseId = a.replace(/\.md$/, "");
@@ -81,7 +89,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (!args.caseId) {
     console.error(
-      "Usage: tsx bench/run.ts <case-id> [--dry-run] [--no-setup] [--targetApp X]",
+      "Usage: tsx bench/run.ts <case-id> [--dry-run] [--no-setup] [--targetApp X] [--maxSteps N]",
     );
     process.exit(2);
   }
@@ -97,6 +105,11 @@ interface CaseFrontmatter {
   expected_actions?: number;
   infeasible?: boolean;
   targetApp?: string;
+  // Long-horizon cases override the loop's default MAX_STEPS (50).
+  // The harness passes this to the bridge's /agent_do POST body; the
+  // bridge clamps to [5, 200]. Use sparingly — bigger budgets mean
+  // longer wall times when the agent loops.
+  max_steps?: number;
 }
 
 interface ParsedCase {
@@ -256,6 +269,7 @@ interface AgentDoResult {
 async function callAgentDo(
   task: string,
   targetApp: string | undefined,
+  maxSteps: number | undefined,
   timeoutMs: number,
 ): Promise<{ ok: boolean; body: AgentDoResult; httpStatus: number }> {
   const ctrl = new AbortController();
@@ -264,7 +278,7 @@ async function callAgentDo(
     const res = await fetch(`${BRIDGE_BASE}/agent_do`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task, targetApp }),
+      body: JSON.stringify({ task, targetApp, maxSteps }),
       signal: ctrl.signal,
     });
     const body = (await res.json()) as AgentDoResult;
@@ -441,16 +455,23 @@ async function main(): Promise<void> {
   let agentOutcome = "skipped";
   let agentDurationMs = 0;
   const targetApp = args.targetAppOverride ?? c.frontmatter.targetApp;
+  const maxSteps = args.maxStepsOverride ?? c.frontmatter.max_steps;
+  // Long-horizon cases need a longer HTTP timeout. Heuristic: budget
+  // ~30s per step plus 60s headroom for warmup/save dialogs.
+  const httpTimeoutMs = ((maxSteps ?? 50) * 30 + 60) * 1000;
   if (!args.dryRun) {
     console.log(
-      `▶ POST ${BRIDGE_BASE}/agent_do  targetApp=${targetApp ?? "(auto)"}`,
+      `▶ POST ${BRIDGE_BASE}/agent_do  targetApp=${targetApp ?? "(auto)"}  maxSteps=${
+        maxSteps ?? "(default 50)"
+      }  http-timeout=${(httpTimeoutMs / 1000).toFixed(0)}s`,
     );
     const t0 = Date.now();
     try {
       const { ok, body, httpStatus } = await callAgentDo(
         c.taskPrompt,
         targetApp,
-        15 * 60_000,
+        maxSteps,
+        httpTimeoutMs,
       );
       agentDurationMs = Date.now() - t0;
       agentResult = body;
@@ -525,6 +546,7 @@ async function main(): Promise<void> {
     stale_bridge_warning: staleBridge,
     dry_run: args.dryRun,
     targetApp: targetApp ?? null,
+    max_steps: maxSteps ?? null,
     task_prompt: c.taskPrompt,
     setup: setupResult
       ? {

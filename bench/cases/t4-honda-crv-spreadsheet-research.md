@@ -78,8 +78,16 @@ osascript -e 'tell application "Microsoft Excel" to quit saving no' 2>/dev/null
 sleep 1
 
 # Ensure Chrome is frontmost so the agent can pivot to it without
-# fighting the activation flake we hit in the t4-safari pilot.
+# fighting the activation flake we hit in the t4-safari pilot. The
+# first run (2026-05-11 14:08Z) found Chrome on a random FB photo
+# page; the brain hallucinated a "password reminder dialog" on the
+# black-tshirt photo and bailed in 3 steps. Pre-navigating Chrome
+# to about:blank gives the agent a deterministic clean slate so the
+# failure mode reflects task difficulty, not setup-state randomness.
 osascript -e 'tell application "Google Chrome" to activate'
+osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "about:blank"' 2>/dev/null \
+  || echo "WARN: could not navigate Chrome to about:blank (Automation perm? continuing anyway)"
+sleep 1
 
 # Probe whether the user is actually logged into Facebook. We can't
 # inspect cookies without breaching the session, so we just open the
@@ -364,12 +372,25 @@ npm run dev 2>&1 | tee bench/results/dev-server-$(date +%s).log
 
 | Date | Commit | Outcome | Wall | Steps | Notes |
 |---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | First run after harness + maxSteps plumbing landed. |
+| 2026-05-11 14:08Z | `faaffd8` (bridge stale @ `cab0c42`) | **FAIL** (deterministic) / `exhausted` (agent) | 3m38s | 3 | Brain hallucinated a "Facebook password reminder dialog" on a Chrome page that was actually a FB photo viewer (`facebook.com/photo/?fbid=…`). Emitted "click OK" 3× with grounder coords scattering across the screen (413,838 → 708,598 → 419,838). Coord-scatter anti-loop guard bailed at step 3 — exactly its job. Never reached Excel, never made it to marketplace, no spreadsheet produced. See `bench/results/t4-honda-crv-spreadsheet-research-2026-05-11T14-11-43-803Z.json` + `-final.png`. |
 
-### What we'll learn from the first run
+### Run 1 takeaways (2026-05-11)
 
-Regardless of PASS/FAIL, the first run will surface:
+1. **Setup state randomness drove the failure, not task difficulty.** Chrome was already on a Facebook photo page (a black t-shirt photo) when the agent started. The brain's first thought was "click OK on the Facebook password reminder dialog" — a dialog that didn't exist. The grounder then hallucinated coords for the imaginary button. **Mitigation landed**: setup now pre-navigates Chrome to `about:blank` so the agent starts from a deterministic clean slate.
 
+2. **Two-layer hallucination**: brain misread the screen, AND the grounder fabricated click positions for the imaginary UI element. Each layer compounds: a hallucinated thought produces an action verb the grounder must localize, and lacking the target the grounder picks plausible-looking pixels. The coord-scatter anti-loop guard (commit `4956638`) is the only thing that caught it — without that guard, this would have run the full 50-step budget at ~70s/step = 60+ min of inference burning on a nonexistent dialog.
+
+3. **The single-targetApp architectural concern wasn't tested.** Agent never made it past Chrome; Excel was never opened. We still don't have data on whether the auto-detect → Chrome lock breaks during Phase A Excel work.
+
+4. **Result JSON bloat fixed**: the run produced a 1.2 MB JSON because `finalScreenshotBase64` was inlined. Harness now auto-strips it to a sidecar `*-final.png` and references the path + sha256 in the JSON. Future result files stay <10 KB.
+
+5. **Bridge SHA staleness was inconsequential here**: the bridge was on `cab0c42` (missing `maxSteps` plumbing) but the agent bailed at step 3, well below either ceiling. For Run 2 the SHA gap doesn't need to be closed before retrying — though closing it gives us the 70-step budget if Run 2 makes it past Phase A.
+
+### What we'll learn from Run 2 (clean-slate setup)
+
+With Chrome pre-navigated to `about:blank`:
+
+- Whether the brain prioritizes the prompt's "Open Excel first" instruction or the visible Chrome window.
 - Whether the brain can complete Phase A (Excel setup) at all — that's
   a single-app subtask in its own right and probably the cleanest
   signal of long-horizon viability.

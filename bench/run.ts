@@ -44,6 +44,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 const BRIDGE_BASE = process.env.PONDER_BRIDGE_BASE ?? "http://127.0.0.1:7900";
 const REPO_ROOT = resolve(__dirname, "..");
@@ -579,6 +580,40 @@ async function main(): Promise<void> {
       ((verdict === "PASS" && agentOutcome !== "done") ||
         (verdict === "FAIL" && agentOutcome === "done")),
   };
+
+  // Strip the embedded base64 final screenshot to a sidecar PNG.
+  // Without this the result JSON balloons to 1+ MB and becomes
+  // un-Readable by tools with file-size limits. The sidecar is
+  // referenced from the JSON via path + sha256.
+  const resp = result.agent.response;
+  if (
+    resp &&
+    typeof resp === "object" &&
+    typeof (resp as { finalScreenshotBase64?: unknown })
+      .finalScreenshotBase64 === "string"
+  ) {
+    const b64 = (resp as { finalScreenshotBase64: string })
+      .finalScreenshotBase64;
+    try {
+      const png = Buffer.from(b64, "base64");
+      const sidecarName = resultFilename.replace(/\.json$/, "-final.png");
+      const sidecarPath = join(RESULTS_DIR, sidecarName);
+      writeFileSync(sidecarPath, png);
+      delete (resp as { finalScreenshotBase64?: string })
+        .finalScreenshotBase64;
+      (resp as Record<string, unknown>).finalScreenshotSidecarPath =
+        sidecarName;
+      (resp as Record<string, unknown>).finalScreenshotSidecarSha256 =
+        createHash("sha256").update(png).digest("hex").slice(0, 16);
+      console.log(
+        `  📷 stripped ${png.length}b screenshot → ${sidecarName}`,
+      );
+    } catch (e) {
+      console.warn(
+        `  ⚠ failed to strip screenshot: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
 
   writeFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
   console.log(`▶ wrote ${resultPath}`);

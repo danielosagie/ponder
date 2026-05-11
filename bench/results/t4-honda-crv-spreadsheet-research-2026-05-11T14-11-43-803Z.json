@@ -1,0 +1,65 @@
+{
+  "id": "t4-honda-crv-spreadsheet-research-2026-05-11T14:08:05.283Z",
+  "case": "t4-honda-crv-spreadsheet-research",
+  "tier": "T4",
+  "axes": [
+    "multi-app-handoff",
+    "state-reading",
+    "long-horizon",
+    "modal-dialog",
+    "grounding-precision"
+  ],
+  "started_at": "2026-05-11T14:08:05.283Z",
+  "ended_at": "2026-05-11T14:11:43.788Z",
+  "elapsed_ms": 218505,
+  "repo_head_short": "faaffd8a7ee5",
+  "bridge_version": {
+    "commit": "cab0c42dee34605cee98310315d8597845fa8b37",
+    "commitShort": "cab0c42dee34",
+    "dirty": true,
+    "builtAt": "2026-05-11T11:34:25.652Z"
+  },
+  "stale_bridge_warning": true,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": 70,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. Open Microsoft Excel and create a new spreadsheet with these column headers in row 1: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Save the file to the Desktop with the name `honda-crv-research.xlsx`. Then switch to Google Chrome and navigate to `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000`. For at least 3 listings from the results, open the listing, read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to Excel and add one row per listing under the headers, filling URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. Save the spreadsheet again when you've added all the rows.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "excel_version=16.108.3\nsetup_done_at=2026-05-11T14:08:06Z\nfacebook_login_expectation=user must be logged into facebook.com in the frontmost Chrome profile; otherwise marketplace search returns a login wall\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "exhausted",
+    "duration_ms": 216818,
+    "steps": 3,
+    "response": {
+      "outcome": "exhausted",
+      "sessionId": "j57c110k0avvnh1daxv194qk5n86hsde",
+      "steps": 3,
+      "transcript": [
+        "[t=26.7s] thought: click the \"OK\" button in the Facebook password reminder dialog",
+        "[t=31.8s] action: click {\"x\":413,\"y\":838}",
+        "[t=194.0s] thought: click the \"OK\" button in the Facebook password reminder dialog",
+        "[t=199.7s] action: click {\"x\":708,\"y\":598}",
+        "[t=205.7s] thought: click the \"OK\" button in the Facebook password reminder dialog",
+        "[t=208.8s] action: click {\"x\":419,\"y\":838}",
+        "[t=215.9s] thought: click the \"OK\" button in the Facebook password reminder dialog",
+        "[t=216.0s] error: Stuck: the brain emitted \"click the \"OK\" button in the Facebook password reminder dialog\" 3 times but the grounder pointed to wildly different spots each time ((413,783) \u2192 (708,543) \u2192 (419,783)). That means the target isn't actually on the screen \u2014 the vision model is guessing. Try a different approach: re-observe with screen_screenshot, switch to a different verb (keyboard input?), or check whether the right app / page is even foregrounded."
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-spreadsheet-research-2026-05-11T14-11-43-803Z-final.png",
+      "finalScreenshotSidecarSha256": "994a62d7a95ffca8"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx",
+    "exit_code": 0,
+    "stdout": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "exhausted",
+  "disagreement": false
+}

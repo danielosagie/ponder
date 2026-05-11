@@ -248,59 +248,40 @@ async function maybeCropToTargetApp(
     );
   }
   const tBounds = Date.now();
-  const rawBounds = await screen.getMacWindowBounds(targetApp);
-  if (!rawBounds) {
+  const bounds = await screen.getMacWindowBounds(targetApp);
+  if (!bounds) {
     console.log(
       `[loop] 🪟 crop skipped: getMacWindowBounds("${targetApp}") returned null in ${Date.now() - tBounds}ms — running uncropped this step.`,
     );
     return shot;
   }
-  // PADDING: the May-11 Calculator bench at 230×408 cropped achieved
-  // 17.1s wall but only 1/6 button accuracy — the model couldn't
-  // distinguish 57px-wide buttons at that resolution. Uncropped at
-  // 1512×982 was 6/6 accurate but 60.5s. The compromise: pad the
-  // window by 25% of its min-dimension (clamped to 100px floor / 250px
-  // ceiling per side) so the cropped region gives the model more
-  // pixel-resolution per UI element while still being much smaller
-  // than the full display. For Calculator 230×408 → ~430×608 (~3.5×
-  // more pixels than the tight crop, still ~6× smaller than full
-  // screen). For a Chrome window of 1200×800 → ~1400×1000 (negligible
-  // padding because the window's already large). The padding scales
-  // with window size, so it's adaptive.
-  const padPerSide = Math.max(
-    100,
-    Math.min(250, Math.round(Math.min(rawBounds.width, rawBounds.height) * 0.25)),
-  );
-  // Clamp the padded rect to the shot's bounds — if the window is
-  // near a screen edge, the naive expansion would go off-screen and
-  // the "fitsInCurrentShot" check below would fail. Clamping keeps
-  // SOME padding (asymmetric in that case) instead of falling
-  // through to uncropped.
-  const padX = Math.max(
-    shot.offsetX,
-    rawBounds.x - padPerSide,
-  );
-  const padY = Math.max(
-    shot.offsetY,
-    rawBounds.y - padPerSide,
-  );
-  const padRight = Math.min(
-    shot.offsetX + shot.width,
-    rawBounds.x + rawBounds.width + padPerSide,
-  );
-  const padBottom = Math.min(
-    shot.offsetY + shot.height,
-    rawBounds.y + rawBounds.height + padPerSide,
-  );
-  const bounds = {
-    x: padX,
-    y: padY,
-    width: padRight - padX,
-    height: padBottom - padY,
-  };
-  console.log(
-    `[loop] 🪟 crop padding: raw ${rawBounds.width}×${rawBounds.height}@${rawBounds.x},${rawBounds.y} + ${padPerSide}px → padded ${bounds.width}×${bounds.height}@${bounds.x},${bounds.y} (${Math.round(((bounds.width * bounds.height) / (rawBounds.width * rawBounds.height)) * 10) / 10}× more pixels for grounder context).`,
-  );
+  // SIZE THRESHOLD: skip cropping for windows whose min dimension is
+  // below MIN_CROP_DIM_PX. The May-11 bench showed that at 230×408
+  // cropped, the model could only get 1/6 Calculator buttons right —
+  // 57px-wide buttons don't survive the model's 0-1000 normalized
+  // grounding output (~4px per unit). Padding the crop to give more
+  // context (commit 73dc680) made it WORSE: the padded region picked
+  // up distractors from adjacent windows (Cursor IDE chat) that looked
+  // button-like, and the model locked onto those corners.
+  //
+  // The right call for sub-300px UIs is: don't crop. Use the full
+  // screen and pay the inference cost. The model NEEDS full pixel
+  // resolution to distinguish small buttons. For Calculator-class
+  // apps the accuracy win (6/6 vs 1/6) far outweighs the 60s vs 17s
+  // speed difference — a wrong answer fast is worse than a right
+  // answer slow.
+  //
+  // For Chrome/Finder/normal-sized windows (min >= 300px) cropping
+  // remains a strong win: their UI elements are large enough (typ.
+  // 30-60px text, 50-100px buttons) that the model resolves them
+  // fine in a sub-1000px crop, and the 6× wall-time speedup is real.
+  const MIN_CROP_DIM_PX = 300;
+  if (Math.min(bounds.width, bounds.height) < MIN_CROP_DIM_PX) {
+    console.log(
+      `[loop] 🪟 crop skipped: ${targetApp} window ${bounds.width}×${bounds.height} is below the ${MIN_CROP_DIM_PX}px threshold — the model can't reliably ground small UI elements at sub-${MIN_CROP_DIM_PX}px crop resolution, so running uncropped this step (slower but accurate). Verified May-11: tight crop got 1/6 Calculator buttons right; uncropped got 6/6.`,
+    );
+    return shot;
+  }
   // Translate screen-space window bounds into screenshot-pixel space. On
   // a single-display setup both offsets are 0; on multi-monitor where
   // the cursor sits on the secondary display, shot.offsetX/Y carry that

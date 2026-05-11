@@ -50,6 +50,33 @@ export async function think(
   // an AX tree. When BOTH are available, the browserSnapshot block
   // below carries the same URL more verbosely; we skip the dup.
   if (args.currentUrl && !args.browserSnapshot) {
+    const urlForHints = (args.currentUrl.url || "").toLowerCase();
+    const titleForHints = (args.currentUrl.title || "").toLowerCase();
+    const onFacebookMarketplace =
+      urlForHints.includes("facebook.com/marketplace") ||
+      titleForHints.includes("marketplace");
+    // CONSTRUCTABLE-URL HINT (keyboard sequence): when the brain is on
+    // a site with a well-known URL pattern for the target action, hint
+    // the keyboard fast-path: cmd+l (focus URL bar), type the target
+    // URL, press enter. 3 keyboard actions but each is reliable (no
+    // grounding precision needed) AND avoids the sidebar-misclick
+    // failure mode entirely. The browser.navigate verb won't work in
+    // Ponder MCP-forwarded flat mode because Playwriter isn't wired
+    // (browser=null), but keyboard primitives all route through the
+    // bridge's /screen/hotkey + /screen/type which DO work.
+    let constructableHint = "";
+    if (onFacebookMarketplace) {
+      constructableHint =
+        `\n\n[FAST PATH AVAILABLE — keyboard nav]\n` +
+        `You're on Facebook Marketplace. For searches you can SKIP\n` +
+        `clicking the sidebar search bar by using the keyboard:\n` +
+        `  Step 1: press cmd+l         (focuses the URL bar)\n` +
+        `  Step 2: type the URL "https://www.facebook.com/marketplace/search?query=<term>" and press enter\n` +
+        `Replace <term> with the user's query. This is faster than\n` +
+        `click-find-search-bar + click-then-type AND immune to\n` +
+        `grounding-precision misses. Use it for any search-style task\n` +
+        `on a site you know the URL pattern for.\n`;
+    }
     task =
       `[Browser state — for state-awareness only, do NOT emit actions about this:]\n` +
       `  URL:   ${args.currentUrl.url}\n` +
@@ -57,7 +84,7 @@ export async function think(
       `Use this to decide if your prior action LANDED — if the URL changed to ` +
       `a results / detail / success page, emit DONE. If the URL didn't change ` +
       `after a click/type/key action, the action didn't fire — pick a different ` +
-      `target.\n\n` +
+      `target.${constructableHint}\n\n` +
       task;
   }
   if (args.browserSnapshot) {

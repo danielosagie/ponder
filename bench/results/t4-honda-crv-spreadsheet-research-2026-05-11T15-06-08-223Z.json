@@ -1,0 +1,73 @@
+{
+  "id": "t4-honda-crv-spreadsheet-research-2026-05-11T15:04:58.751Z",
+  "case": "t4-honda-crv-spreadsheet-research",
+  "tier": "T4",
+  "axes": [
+    "multi-app-handoff",
+    "state-reading",
+    "long-horizon",
+    "modal-dialog",
+    "grounding-precision"
+  ],
+  "started_at": "2026-05-11T15:04:58.751Z",
+  "ended_at": "2026-05-11T15:06:08.207Z",
+  "elapsed_ms": 69456,
+  "repo_head_short": "f2240a98bcc1",
+  "bridge_version": {
+    "commit": "f2240a98bcc15a1bb0249b89f6097bbe7c10bf7b",
+    "commitShort": "f2240a98bcc1",
+    "dirty": true,
+    "builtAt": "2026-05-11T15:02:02.283Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": 70,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. Open Microsoft Excel and create a new spreadsheet with these column headers in row 1: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Save the file to the Desktop with the name `honda-crv-research.xlsx`. Then switch to Google Chrome and navigate to `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000`. For at least 3 listings from the results, open the listing, read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to Excel and add one row per listing under the headers, filling URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. Save the spreadsheet again when you've added all the rows.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "excel_version=16.108.3\nsetup_done_at=2026-05-11T15:05:02Z\nfacebook_login_expectation=user must be logged into facebook.com in the frontmost Chrome profile; otherwise marketplace search returns a login wall\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "exhausted",
+    "duration_ms": 66092,
+    "steps": 7,
+    "response": {
+      "outcome": "exhausted",
+      "sessionId": "j572pyb2f23fv3n86hzrgcgynn86g1g0",
+      "steps": 7,
+      "transcript": [
+        "[t=8.2s] thought: hotkey cmd+space",
+        "[t=9.0s] action: key {\"combo\":\"cmd+space\"}",
+        "[t=15.6s] thought: type \"Microsoft Excel\" and press enter to launch Excel",
+        "[t=20.4s] action: type {\"text\":\"Microsoft Excel\",\"thenPress\":\"enter\"}",
+        "[t=25.3s] thought: click the Google Chrome window to bring it to the foreground",
+        "[t=30.4s] action: click {\"x\":207,\"y\":151}",
+        "[t=37.5s] thought: click the Google Chrome window to bring it to the foreground",
+        "[t=40.2s] action: click {\"x\":211,\"y\":151}",
+        "[t=46.1s] thought: click the Google Chrome window to bring it to the foreground",
+        "[t=48.4s] action: click {\"x\":222,\"y\":190}",
+        "[t=53.6s] thought: press enter",
+        "[t=53.7s] action: key {\"combo\":\"enter\"}",
+        "[t=58.9s] thought: wait 1s",
+        "[t=59.9s] action: wait {\"ms\":1000}",
+        "[t=65.1s] thought: wait 1s",
+        "[t=65.2s] error: Brain emitted no-op-like actions (wait / press enter / press escape) 3 times in a row — either it's stalled, OR the goal already landed and it didn't notice. Look at the current screenshot AND the URL — has the page navigated? Has a result/dialog appeared? If yes, emit DONE. If no, the prior action didn't fire — pick a different verb (click on a specific labeled element instead of blindly pressing keys)."
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-spreadsheet-research-2026-05-11T15-06-08-223Z-final.png",
+      "finalScreenshotSidecarSha256": "1f15ca7f98c52427"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx",
+    "exit_code": 0,
+    "stdout": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "exhausted",
+  "disagreement": false
+}

@@ -374,6 +374,22 @@ npm run dev 2>&1 | tee bench/results/dev-server-$(date +%s).log
 |---|---|---|---|---|---|
 | 2026-05-11 14:08Z | `faaffd8` (bridge stale @ `cab0c42`) | **FAIL** (deterministic) / `exhausted` (agent) | 3m38s | 3 | Brain hallucinated a "Facebook password reminder dialog" on a Chrome page that was actually a FB photo viewer (`facebook.com/photo/?fbid=…`). Emitted "click OK" 3× with grounder coords scattering across the screen (413,838 → 708,598 → 419,838). Coord-scatter anti-loop guard bailed at step 3 — exactly its job. Never reached Excel, never made it to marketplace, no spreadsheet produced. See `bench/results/t4-honda-crv-spreadsheet-research-2026-05-11T14-11-43-803Z.json` + `-final.png`. |
 | 2026-05-11 14:19Z | `4d270f0` (bridge fresh) | **FAIL** (deterministic) / `exhausted` (agent) | 44s | 3 | Clean-slate setup worked — Chrome on `about:blank`. New failure: brain emitted *"click on the close button of the current tab to close it"* 3× at the same coord (573, 151) with no screen change. Same-action anti-loop guard bailed cleanly. The brain ignored the prompt's first instruction (*"Open Microsoft Excel"*) and instead tried to "tidy up" Chrome tabs (there was a stale "Little Amps Coffee Roaster" tab still open). **Task-ordering failure** — brain reacted to visible Chrome state instead of following the prompt's phase order. |
+| 2026-05-11 15:05Z | `f2240a9` (TASK PRIORITY preamble) | **FAIL** (deterministic) / `exhausted` (agent) | 66s | 7 | **First time brain attempted the correct first action.** Steps 1-2: `cmd+space` → `type "Microsoft Excel" + enter` — exactly what the preamble's rule #1 said to do (Spotlight-open the app named first in the task). But after Spotlight fired, the next screenshot still showed Chrome (Excel hadn't appeared in the frame yet — either it was still loading or the screenshot raced ahead). Brain then emitted *"click the Google Chrome window to bring it to the foreground"* 3× at sub-pixel-different coords, then pressed enter, then wait/wait. No-op-spam anti-loop guard bailed at step 7. **Progress**: 7 steps vs Run 2's 3 steps. The preamble works for the OPENING; the regression is downstream of Spotlight launch timing. |
+
+### Run 3 takeaways (2026-05-11 15:05Z)
+
+1. **TASK PRIORITY preamble delivered measurable behavior change.** Run 3's first two actions were `cmd+space` → `type "Microsoft Excel" + enter`. That's the textbook Spotlight-open sequence. Runs 1 and 2 never even attempted to open Excel — they got distracted by the visible Chrome state. The preamble's rule #1 ("If the task says 'Open <App>' and <App> isn't visible: your FIRST action is to open it via Spotlight") worked.
+
+2. **New downstream failure: post-Spotlight screenshot timing race.** After `type "Microsoft Excel" + enter`, the next screenshot captured Chrome (about:blank with 3 tabs), not Excel. Two possibilities: (a) Excel hadn't finished launching at screenshot-capture time, or (b) Excel did launch but its window hasn't received focus yet, leaving Chrome frontmost in the screenshot. The brain then emitted *"click the Google Chrome window to bring it to the foreground"* — exactly the wrong direction; Excel needed time, not refocus.
+
+3. **No-op-spam guard caught the recovery loop**: after the Chrome-foreground clicks didn't change anything, brain emitted press-enter → wait → wait. Three consecutive no-ops triggered `4defce2`'s wait-spam guard at step 7. Saved another 40+ steps of dead time.
+
+4. **Forward progress is real**: Run 2 = 3 steps, Run 3 = 7 steps. The system spent twice as long actually attempting the task before bailing. That's not a PASS but it's the right direction.
+
+5. **The fix surface for the next iteration is clear**:
+   - **Post-Spotlight settle delay**: After `cmd+space` + type + enter, the loop could wait 1500-3000ms before the next screenshot to give the launched app time to appear. This is a per-action settle, not a global one.
+   - **Or: an explicit "wait for app frontmost" primitive**: brain could emit `wait_for_app Microsoft Excel` and the executor polls `System Events` for `frontmost is true` before continuing. Would eliminate the timing race entirely.
+   - **Or: brain prompt addition**: "After you launch an app via Spotlight, the screenshot may briefly still show the previous app. Don't react to it — wait one step and re-observe."
 
 ### Run 2 takeaways (2026-05-11 14:19Z)
 

@@ -13,7 +13,41 @@ The Ponder runtime drives the user's REAL Chrome session and macOS desktop. Ever
 
 You can't run these on CI without orchestrating a desktop. They're meant for manual / scheduled runs against a real workstation.
 
-## Running a benchmark from inside Claude Code
+## Running a benchmark
+
+### Via the harness (recommended for the OS suite)
+
+```sh
+npx tsx bench/run.ts <case-id>             # full run
+npx tsx bench/run.ts <case-id> --dry-run   # parse + setup + score (skip agent)
+npx tsx bench/run.ts <case-id> --no-setup  # skip setup block (state already staged)
+npx tsx bench/run.ts <case-id> --targetApp Calculator   # override targetApp
+```
+
+`bench/run.ts` parses the case .md (frontmatter + `## Task` blockquote + first ```sh block in `## Setup` and `## Scoring`), preflights the Electron bridge SHA against `git rev-parse --short=12 HEAD`, runs setup, POSTs to `http://127.0.0.1:7900/agent_do`, runs scoring with env vars (`OUTCOME`, `RUN_START_ISO`, `RUN_END_ISO`), and writes a result JSON.
+
+The harness exit code is `0` for PASS, `1` for FAIL, `2` for UNKNOWN (no PASS/FAIL line in scorer stdout) — useful for shell loops over the suite.
+
+#### Verdict convention
+
+Every `## Scoring` block must emit a final line that **starts with `PASS` or `FAIL`**. The harness reads the LAST such line as the verdict (so intermediate `echo` calls for diagnostics are fine). Examples:
+
+- `PASS` — bare verdict, no reason needed
+- `PASS: note created with correct URL` — verdict with reason
+- `FAIL: false-positive DONE on infeasible task` — verdict with reason
+- `FAIL: CATASTROPHIC — fixture file missing` — canonical FAIL prefix even for catastrophic outcomes (do NOT invent custom prefixes; the parser only matches PASS / FAIL)
+
+#### Authority order
+
+From the t4-safari-link-to-notes pilot (2026-05-11): the strict verifier and deterministic AppleScript scorer can **disagree**. The harness records both signals but treats the deterministic check as authoritative. The result JSON's `disagreement: true` flag fires whenever they conflict.
+
+```
+deterministic_score  >  strict_verifier  >  agent_self_reported_outcome
+```
+
+A high disagreement rate across the suite is itself a useful signal about verifier quality — track it.
+
+### Via a Claude Code subagent (legacy, for the original Chrome cases)
 
 In Claude Code (with this repo and the Ponder MCP attached), ask the assistant to run a case. The assistant spawns a Haiku/Sonnet/Opus subagent via its `Agent` tool with a benchmark-shaped prompt that demands structured JSON output, writes the result to `bench/results/`, and reports metrics back.
 

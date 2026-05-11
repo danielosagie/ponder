@@ -373,6 +373,15 @@ npm run dev 2>&1 | tee bench/results/dev-server-$(date +%s).log
 | Date | Commit | Outcome | Wall | Steps | Notes |
 |---|---|---|---|---|---|
 | 2026-05-11 14:08Z | `faaffd8` (bridge stale @ `cab0c42`) | **FAIL** (deterministic) / `exhausted` (agent) | 3m38s | 3 | Brain hallucinated a "Facebook password reminder dialog" on a Chrome page that was actually a FB photo viewer (`facebook.com/photo/?fbid=…`). Emitted "click OK" 3× with grounder coords scattering across the screen (413,838 → 708,598 → 419,838). Coord-scatter anti-loop guard bailed at step 3 — exactly its job. Never reached Excel, never made it to marketplace, no spreadsheet produced. See `bench/results/t4-honda-crv-spreadsheet-research-2026-05-11T14-11-43-803Z.json` + `-final.png`. |
+| 2026-05-11 14:19Z | `4d270f0` (bridge fresh) | **FAIL** (deterministic) / `exhausted` (agent) | 44s | 3 | Clean-slate setup worked — Chrome on `about:blank`. New failure: brain emitted *"click on the close button of the current tab to close it"* 3× at the same coord (573, 151) with no screen change. Same-action anti-loop guard bailed cleanly. The brain ignored the prompt's first instruction (*"Open Microsoft Excel"*) and instead tried to "tidy up" Chrome tabs (there was a stale "Little Amps Coffee Roaster" tab still open). **Task-ordering failure** — brain reacted to visible Chrome state instead of following the prompt's phase order. |
+
+### Run 2 takeaways (2026-05-11 14:19Z)
+
+1. **Brain doesn't follow task ordering.** The prompt clearly says "Open Microsoft Excel **and** create a new spreadsheet ... **Then** switch to Google Chrome ...". With Chrome already visible on screen (about:blank + a stale tab), the brain decided to clean up Chrome first instead of opening Excel. This is a phase-ordering failure that's distinct from Run 1's hallucination — the brain literally chose the wrong starting subtask.
+
+2. **Same-action anti-loop guard caught it cleanly** at step 3. The recovery prompt ("re-observing state and asking the brain to change approach") was emitted but the brain emitted the EXACT SAME thought after recovery — same-action guard bailed. Together with Run 1's coord-scatter bail, that's two complementary guards working as designed.
+
+3. **Both Run 1 and Run 2 have the same root cause**: the brain weights visible screen state over the prompt's intended sequence. Run 1: hallucinated UI on a photo page. Run 2: cleaned up tabs instead of opening Excel. In both cases, the FIRST instruction of the task (open Excel) was never executed.
 
 ### Run 1 takeaways (2026-05-11)
 

@@ -62,6 +62,8 @@ Then run the benchmark. The server-side log lines for the run are in `dev-server
 ## Cases
 
 - [`bulbasaur-photo-upload`](cases/bulbasaur-photo-upload.md) — the canonical regression test. Upload latest desktop screenshot to a Marketplace listing's photos. Expected: ≤7 tool calls in the worst case (wrong tab attached + native picker fallback), ≤5 in the happy path.
+- [`calculator-mouse-math`](cases/calculator-mouse-math.md) — vision-grounded `agent_click` end-to-end on macOS Calculator. Per-click variant (~240s wall) and `agent_click_sequence`-batched variant (~3–7s).
+- [`calculator-mouse-math-os`](cases/calculator-mouse-math-os.md) — a11y-grounded `os_*` variant of the calculator case. Zero vision tokens, target ≤ 2s wall. Run directly with `tsx scripts/bench-calculator-os.ts` to bypass the orchestrator.
 
 ## Adding a case
 

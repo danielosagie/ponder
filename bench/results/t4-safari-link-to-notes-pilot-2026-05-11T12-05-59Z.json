@@ -1,0 +1,111 @@
+{
+  "id": "t4-safari-link-to-notes-pilot-2026-05-11T12-05-59Z",
+  "case": "t4-safari-link-to-notes",
+  "tier": "T4",
+  "model": "Holo3-35B-A3B-APEX (llama.cpp b9082 on Modal L4)",
+  "started_at": "2026-05-11T12:02:00Z",
+  "ended_at": "2026-05-11T12:11:00Z",
+  "commit": "86a6dd5",
+  "run_mode": "MANUAL_PILOT — orchestrated by Claude calling agent_do twice (phase split), NOT yet via bench/run.ts harness",
+  "purpose": "Validate the t4-safari-link-to-notes spec end-to-end BEFORE building harness infrastructure. The user explicitly chose: 'Pilot one T4 task END-TO-END... it'll surface anything wrong with my spec before we invest in harness infrastructure.'",
+  "deviations_from_spec": [
+    "Safari activation failed (no front Safari window after osascript activate). Pivoted to Chrome since Chrome was already frontmost from earlier Bulbasaur tests. The substantive task — copy URL of frontmost browser tab, paste into a new Note — is unchanged; only the source browser app differs.",
+    "Note title prefix changed from 'Bench Safari Link' to 'Bench Chrome Link' to match the source app.",
+    "Run was split into two phases (copy, then paste) so the scoring could observe Phase 1's clipboard state between phases. The harness would run this as one continuous agent_do."
+  ],
+  "phases": {
+    "phase_1_copy_url_to_clipboard": {
+      "task_prompt": "In Chrome (frontmost), copy the URL of the current tab to the clipboard. Use cmd+l to focus the address bar, then cmd+c to copy.",
+      "outcome": "done",
+      "wall_s": 36.8,
+      "actions": 2,
+      "actions_taken": ["press cmd+l", "press cmd+c"],
+      "post_phase_clipboard_check": {
+        "tool": "osascript -e 'the clipboard'",
+        "result": "https://www.facebook.com/marketplace/?ref=app_tab",
+        "matches_chrome_url": true,
+        "verdict": "PASS — clipboard contains exactly the frontmost tab URL, no extra whitespace, no truncation"
+      },
+      "comment": "Two-action minimum hit. Very clean. The brain followed the explicit cmd+l → cmd+c hint without wandering."
+    },
+    "phase_2_paste_into_new_note": {
+      "task_prompt": "Switch to the Notes app (cmd+tab or click in Dock). Create a new note with cmd+N. Type 'Bench Chrome Link 2026-05-11T12-05-59Z' as the title. Press Tab then cmd+v to paste the URL as the body. Notes auto-saves.",
+      "outcome": "exhausted",
+      "wall_s": ~210,
+      "actions": 7,
+      "verifier_verdict": "not-verified",
+      "verifier_reason": "No Notes window or note content visible; screenshot shows browser tabs instead of Notes app",
+      "deterministic_score_via_applescript": {
+        "tool": "osascript -e 'tell application \"Notes\" to set matches to notes whose name starts with \"Bench Chrome Link\"; ...'",
+        "matches_found": 1,
+        "note_name": "Bench Chrome Link 2026-05-11T12-05-59Z",
+        "body_length": 120,
+        "body_content": "<div><h1>Bench Chrome Link 2026-05-11T12-05-59Z</h1></div><div>https://www.facebook.com/marketplace/?ref=app_tab</div>",
+        "url_present_in_body": true,
+        "verdict": "PASS — note exists with correct name AND body contains the expected URL substring"
+      },
+      "comment": "Critical disagreement between strict verifier (FAIL) and deterministic state checker (PASS). The task DID succeed; Chrome regained focus between the final paste and the verifier screenshot, so the verifier saw the wrong app and rejected. The harness MUST treat the deterministic AppleScript check as authoritative."
+    }
+  },
+  "scoring_summary": {
+    "spec_pass_condition": "AppleScript returns 'PASS' — a note exists whose name starts with 'Bench Safari/Chrome Link' AND whose body contains 'facebook.com' (or the expected URL)",
+    "result": "PASS",
+    "agent_self_reported_outcome": "exhausted (Phase 2)",
+    "deterministic_state_outcome": "PASS",
+    "design_implication": "agent_do.outcome is NOT a reliable scoring signal. The harness must always run the case-specific deterministic check post-run, independent of what the agent reports."
+  },
+  "key_findings": [
+    {
+      "id": "F1",
+      "title": "Spec scoring approach VALIDATED",
+      "evidence": "AppleScript 'notes whose name starts with X' + body substring check returned a clean PASS for a real successful run. No OCR, no screenshot diff, no flakiness. The same check would also cleanly FAIL if the note had been created with empty body or with a wrong title.",
+      "implication": "The deterministic-state-inspection scoring philosophy from SUITE.md is implementable and trustworthy. Confidently ship the harness with this scoring style."
+    },
+    {
+      "id": "F2",
+      "title": "Verifier and state-checker can disagree — state wins",
+      "evidence": "Verifier said 'not-verified, screenshot shows browser tabs instead of Notes app'. AppleScript said 'note exists with correct name and URL in body'. The state-checker was right; the verifier was confused by a focus change AFTER the work was complete.",
+      "implication": "Even a strict verifier (commit 1957823) sees only the screenshot snapshot at terminal step. Background state mutations are invisible to it. The harness's primary scoring authority is the deterministic checker, not the verifier."
+    },
+    {
+      "id": "F3",
+      "title": "Safari activation flaky on this machine; Chrome works",
+      "evidence": "`osascript -e 'tell application \"Safari\" to activate'` returned 0 but no Safari window appeared in screenshot. Chrome was already frontmost and stayed responsive across both phases.",
+      "implication": "The harness setup step needs a 'wait for app to be frontmost' retry loop, not just a fire-and-forget activate. Recommend: `setup/openApp(name)` helper that activates → polls frontmost via `tell application \"System Events\" to get name of first application process whose frontmost is true` for up to 3s before declaring failure. If failure, mark the case 'setup-failed' and skip rather than running the agent against the wrong app."
+    },
+    {
+      "id": "F4",
+      "title": "Phase 1 (clipboard) is reliable in 2 actions",
+      "evidence": "cmd+l → cmd+c → done in 36.8s. No wandering, no anti-loop bails. The brain follows explicit keyboard shortcuts cleanly when the prompt lists them.",
+      "implication": "For T4-T5 multi-app tasks, the prompt should LEAD with the keyboard sequence when one exists, before mentioning the visual surface. This matches the 'small models follow worked examples' insight from optimizations-summary-2026-05-11.json."
+    },
+    {
+      "id": "F5",
+      "title": "Phase 2 ran the full 7-action plan but used all action budget recovering focus",
+      "evidence": "actions=7 with outcome=exhausted means the brain ran out of budget AFTER doing the substantive work. Cross-checking the AppleScript result, the note was successfully created — meaning the substantive work happened in earlier actions, and the later actions wasted budget trying to verify (probably clicking around or pressing keys that didn't change observable state, which the no-op-spam guard should have caught).",
+      "implication": "Once the work is done, the brain doesn't know it's done because the verifier hasn't fired yet AND because the state-confirmation signal (a new note in the sidebar) is OCR-only. We should consider either: (a) raising the per-task action budget when targetApp is non-browser, or (b) adding a post-action AppleScript 'completion probe' for cases where the spec includes one — but (b) is essentially leaking the scorer into the agent and is wrong. Better fix: improve the brain's prompt to recognize 'I pressed cmd+v and saw text appear; I can stop now' as a terminal state."
+    },
+    {
+      "id": "F6",
+      "title": "URL got embedded as HTML <div>, not plain text",
+      "evidence": "body comes back as '<div><h1>Bench Chrome Link...</h1></div><div>https://www.facebook.com/marketplace/?ref=app_tab</div>'. Notes wraps everything in divs.",
+      "implication": "The spec's PASS condition uses 'body contains URL substring' which survives the HTML wrapping. Good. But naive 'body == URL' would fail. Document this in the harness scoring lib."
+    }
+  ],
+  "harness_design_implications": [
+    "AUTHORITY: Deterministic state checker > verifier > agent self-reported outcome. The case .md defines the authoritative check; the harness runs it AFTER the agent finishes regardless of agent's claimed outcome.",
+    "SETUP RETRIES: openApp(name) helper polls frontmost-by-name for up to 3s. On failure, case is marked 'setup-failed' and scoring is skipped (not counted as FAIL).",
+    "RUN ATOMICITY: Each case is one agent_do call (not split phases). The pilot's split was for diagnostic visibility only.",
+    "OUTCOME COLUMN: Result JSON tracks BOTH agent_outcome (done|exhausted|cancelled|error|infeasible) AND deterministic_score (pass|fail|setup-failed). The aggregate report shows: deterministic-PASS / agent-self-DONE / disagreements. A high disagreement rate is itself a signal worth tracking.",
+    "INFEASIBLE: t5-infeasible-rename-readonly.md exposes that there's no INFEASIBLE outcome enum today. Wiring this through brain → executor → verifier is a prerequisite for the T5 tier. Estimate ~50 LOC across loop.ts, brain.ts, verifier.ts. Defer until T1-T4 land cleanly."
+  ],
+  "ready_to_ship_harness": true,
+  "next_steps": [
+    "1. Build bench/run.ts (~200 LOC): parse case .md frontmatter, run setup, call agent_do, run scoring, write result JSON.",
+    "2. Build bench/lib/check.ts (~150 LOC): appleScriptValue(script), fileChecksum(path), defaultsRead(domain, key), clipboardContents(), wait helpers.",
+    "3. Write the remaining 33 case .md files (T1×5, T2×8, T3×6, T4×6, T5×7) — but only AFTER scaffolding the harness so each case can be smoke-tested as it's written.",
+    "4. Wire INFEASIBLE outcome enum for T5 tier (depends on harness landing first).",
+    "5. Track the verifier-vs-state-checker disagreement rate across the suite. If it's > 20%, that's a signal the verifier prompt needs another iteration."
+  ],
+  "win_summary": "The spec works. Real successful run on a real T4 multi-app task; AppleScript scoring gave a clean PASS that disagreed with the agent's self-reported 'exhausted' outcome — exactly the failure-mode-resilience the suite is designed to catch. We now have confidence to scaffold the harness."
+}

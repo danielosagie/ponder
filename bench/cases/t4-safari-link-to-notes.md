@@ -118,8 +118,18 @@ Without further work, the brain might:
 
 ## Prior runs
 
-Track here once the harness lands. Format:
-
 | Date | Commit | Outcome | Wall | Steps | Notes |
 |---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | First run after harness. |
+| 2026-05-11 | `86a6dd5` | **PASS** (deterministic) / `exhausted` (agent) | ~247s | 9 (2 + 7) | Manual pilot, NOT via harness. Safari activation flaked → pivoted to Chrome. Phase 1 (cmd+l, cmd+c) clean in 2 actions / 36.8s. Phase 2 ran full 7-action budget, agent reported `exhausted`, but AppleScript scorer found note `Bench Chrome Link 2026-05-11T12-05-59Z` with URL `facebook.com/marketplace/?ref=app_tab` in body. **Validates spec; surfaces verifier-vs-state disagreement.** See `bench/results/t4-safari-link-to-notes-pilot-2026-05-11T12-05-59Z.json` for full diagnostic. |
+
+### Pilot takeaways (2026-05-11)
+
+1. **Spec scoring works as designed.** AppleScript `notes whose name starts with "Bench …"` + body substring check gave a crisp PASS on a real successful run. No OCR, no flakiness.
+
+2. **Verifier and state-checker can disagree — state wins.** Strict verifier said "screenshot shows browser tabs instead of Notes app, FAIL". AppleScript said "note exists with correct title and URL in body, PASS". The work succeeded; Chrome regained focus before the verifier screenshot. Harness MUST treat the deterministic check as authoritative.
+
+3. **`agent_do.outcome` is not a reliable scoring signal.** This run reported `exhausted` for a successful task. The harness should always run the case-specific check post-run, regardless of what the agent claims.
+
+4. **Setup needs retries.** `osascript -e 'tell app "Safari" to activate'` returned 0 but Safari did not become frontmost. Recommend an `openApp(name)` helper that polls `name of first application process whose frontmost is true` for up to 3s before declaring setup failed.
+
+5. **No INFEASIBLE outcome wiring yet.** Documented as a known gap in `t5-infeasible-rename-readonly.md`; not needed for T1-T4 to ship.

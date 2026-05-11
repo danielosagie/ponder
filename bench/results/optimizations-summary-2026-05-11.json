@@ -1,0 +1,129 @@
+{
+  "id": "optimizations-summary-2026-05-11",
+  "case": "Stacked little-optimizations on Ponder agent_do for web tasks (Calculator + FB Marketplace)",
+  "model": "Holo3-35B-A3B-APEX (llama.cpp b9082 on Modal L4)",
+  "started_at": "2026-05-11T03:30:00Z",
+  "ended_at": "2026-05-11T11:40:00Z",
+  "approach": "User wanted to stack small optimizations (no H100, no model swap) toward 10× cumulative speedup vs Day 1 baselines.",
+  "optimizations_shipped_today": [
+    {
+      "commit": "4956638",
+      "name": "auto-targetApp from task text + coord-scatter anti-loop",
+      "what": "Detects native macOS app names in the task; auto-sets opts.targetApp + flat:true",
+      "win": "Crop optimization automatic for known apps"
+    },
+    {
+      "commit": "1976d6c",
+      "name": "raise-then-recapture before crop",
+      "what": "Raises targetApp to front + sleep 60ms + recapture before cropping",
+      "win": "Fixes Z-order occlusion (was: false-positive DONE on Ponder UI showing in cropped region)"
+    },
+    {
+      "commit": "f75b00f",
+      "name": "bounds-validate clicks against targetApp window",
+      "what": "Refuses clicks whose translated coords fall outside the target app's window",
+      "win": "Prevents focus changes from OOB clicks"
+    },
+    {
+      "commit": "02d1cbc",
+      "name": "300px size threshold for crop",
+      "what": "Skip cropping when min(window.width, window.height) < 300px",
+      "win": "Routes Calculator-class tiny UIs to uncropped (slow but accurate) path automatically"
+    },
+    {
+      "commit": "1501d64",
+      "name": "Modal /ground/batch upscale param",
+      "what": "Optional PIL.LANCZOS upscale before grounding",
+      "win": "Infra for future experiments (not productionized; tested with no accuracy gain on tiny UIs)"
+    },
+    {
+      "commit": "4defce2",
+      "name": "wait-spam anti-loop + Chrome/Safari/Firefox auto-detect",
+      "what": "Bail after 3 consecutive 'wait' actions; auto-crop browsers",
+      "win": "Saves ~5 dead-time steps on stalls; auto-crop unlocks 5× on browser tasks"
+    },
+    {
+      "commit": "29775f3",
+      "name": "generalize wait-spam → no-op-spam (catches enter/escape too)",
+      "what": "Match 'wait' / 'press enter' / 'press escape' / 'key enter|escape' for spam detection",
+      "win": "Catches 'goal already landed but brain didn't notice' (enter-spam) class"
+    },
+    {
+      "commit": "1957823",
+      "name": "URL-surfaced brain prompt + strict verifier",
+      "what": "Brain sees `URL:` + `Title:` block when targetApp is a browser; verifier defaults to RETRY unless concrete proof of completion; URL/screenshot patterns required",
+      "win": "✅ VERIFIED on real run: strict verifier REJECTED a false-positive DONE on /marketplace/you with URL-specific reason. Yesterday rubber-stamped same state."
+    },
+    {
+      "commit": "31251e0",
+      "name": "/browser/url title-only fallback",
+      "what": "When Chrome Automation perm missing, fall back to System Events to read window title (uses Accessibility perm we already have)",
+      "win": "Works without requiring user to grant additional Automation perm"
+    },
+    {
+      "commit": "cab0c42",
+      "name": "constructable-URL keyboard fast-path hint",
+      "what": "When on Facebook Marketplace, hint brain to use cmd+l → type marketplace/search?query=X → enter (3 keyboard actions, no grounding needed)",
+      "win": "Bypasses sidebar-search-bar grounding misses entirely"
+    },
+    {
+      "commit": "1b8cb02",
+      "name": "sharper FAST-PATH hint with concrete full-URL example",
+      "what": "Replace 'type the URL <pattern> replacing <term>' with a literal worked-example URL (already substituted for the user's query). Adds explicit anti-pattern: 'DO NOT type just the search term alone — that goes to Google.'",
+      "win": "Small model copies worked examples reliably; doesn't reliably substitute placeholders"
+    }
+  ],
+  "performance_progression": {
+    "day_1_baseline": {
+      "calculator": "240s (10 calls with recovery from embedded-screenshot decoy)",
+      "bulbasaur_search": "blocked/195s timeout"
+    },
+    "after_chrome_crop_auto_detect": {
+      "per_step_chrome": "~6s (was ~32s — 5× speedup)",
+      "bulbasaur_search_31s_outcome_done_but_FALSE_POSITIVE": "URL shows /marketplace/you, not search results"
+    },
+    "after_strict_verifier_url_aware": {
+      "bulbasaur_run_2": "verifier REJECTED with specific URL reason 'The current page is the Facebook Marketplace Buying section (facebook.com/marketplace/you), not a search results page for bulbasaur'",
+      "won_class": "False-positive DONE on web tasks — ELIMINATED"
+    },
+    "after_fast_path_hint_v1": {
+      "bulbasaur_run_3": "brain used cmd+l fast-path, typed 'bulbasaur' alone, ended on google.com/search?q=bulbasaur (not FB Marketplace search)",
+      "verdict": "Partial win — brain followed hint structure but missed URL construction"
+    },
+    "after_fast_path_hint_v2": {
+      "status": "pending Electron restart to load 1b8cb02"
+    }
+  },
+  "speed_accuracy_matrix": {
+    "calculator_uncropped_baseline": "60s / 6-of-6 accuracy / math correct (376)",
+    "calculator_cropped_230x408": "17s / 1-of-6 accuracy / math wrong",
+    "calculator_cropped_230x408_upscaled": "5-15s / 1-2-of-6 / math wrong (model converges to default coord at high upscale)",
+    "calculator_padded_crop": "180s exhausted (Cursor IDE chat distractors)",
+    "chrome_uncropped": "~32s / step",
+    "chrome_cropped_1053x893": "~6s / step (5× faster)",
+    "ponder_agent_do_chrome_with_all_fixes": "31-44s for 3-step search task (with strict verifier catching false-positives correctly)"
+  },
+  "stacked_speedup_realized": {
+    "chrome_per_step": "32s → 6s = 5.3× speedup",
+    "false_positive_class_eliminated": "infinite (was: rubber-stamped wrong state; now: strict-RETRY)",
+    "tiny_ui_calculator": "no speedup possible without model change (geometry tricks fail at sub-300px)"
+  },
+  "what_didnt_work": [
+    "Padding crop (added adjacent-window distractors that pulled grounding off-target)",
+    "Upscale 2×/3×/4× on tiny UIs (model converges to default coords; out of training distribution)",
+    "Pattern-substitution hints to the small brain ('type the URL <pattern>' was misread — brain typed just the placeholder term)"
+  ],
+  "key_architectural_insights": [
+    "1. Below ~300px window size, no geometry trick (crop, pad, upscale) recovers grounding precision. Only full screen works.",
+    "2. Above ~300px, cropping IS the win — 5× consistent on Chrome.",
+    "3. Verifier strictness matters more than raw speed. A wrong-fast result is worse than slow-correct because the orchestrator trusts the verifier and stops investigating.",
+    "4. URL/title is THE most important state signal for web tasks. Surfacing it into both brain prompt AND verifier prompt closed an entire class of false-positives in one commit.",
+    "5. Small models follow worked examples, not pattern fill-ins. Always show the FULL constructed output, not a template with placeholders."
+  ],
+  "next_iteration_candidates": [
+    "Test 1b8cb02 (concrete-URL fast-path hint) end-to-end. Expected: brain types the FULL URL string verbatim, lands on /marketplace/search?query=bulbasaur, strict verifier VERIFIED.",
+    "Add a /browser/navigate bridge endpoint that takes a URL and uses AppleScript `set URL of active tab of front window` — gives the brain a 1-action navigate primitive that bypasses ALL keyboard steps. Would require ~30 LOC + Automation perm.",
+    "Add 'recent visited URLs' to the brain context (last 3 URLs seen) so it can detect circular navigation patterns.",
+    "Per-target-app PROMPT cache. The brain's task prompt is ~3000 tokens of repeated boilerplate (action vocabulary, scope rules, etc). Prompt caching at the llama-server level would save ~80% of the input tokens per step."
+  ]
+}

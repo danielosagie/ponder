@@ -1,0 +1,73 @@
+{
+  "id": "calculator-mouse-math-ponder-2026-05-11T01-30-30Z",
+  "case": "calculator-mouse-math-ponder",
+  "model": "ponder agent_do via Electron bridge (hcompany provider, llama.cpp b9082 pinned)",
+  "started_at": "2026-05-11T01:30:30Z",
+  "ended_at": "2026-05-11T02:55:02Z",
+  "elapsed_ms": 5072000,
+  "outcome": "partial",
+  "tool_call_count": 6,
+  "tool_calls": [
+    "holo3_version preflight (MCP commit 2160d4b)",
+    "bridge /version probe → 404 (Electron NOT yet on 7ef8496; running pre-/version code from 9:29 PM session)",
+    "bridge /window/bounds → returns clean integer bounds (proves screen.ts parser fix loaded)",
+    "Test 1: explicit targetApp via direct bridge /agent_do (47×8 task)",
+    "Test 2: auto-detect path via direct bridge /agent_do (sharper prompt) — hit 240s timeout",
+    "Pre/post Calculator screenshots for state diagnosis"
+  ],
+  "key_findings": {
+    "anti_loop_coord_scatter_guard_WORKS": {
+      "claim": "The coord-scatter anti-loop guard added in commit 4956638 fires correctly when the vision model hallucinates wildly different coords for the same action text",
+      "evidence_from_test_1": "Bridge returned with outcome='exhausted' at step 9 carrying the EXACT error string from src/agent/loop.ts: 'Stuck: the brain emitted \"click on the calculator app icon\" 6 times but the grounder pointed to wildly different spots each time ((425,329) → (422,317) → (425,319) → (428,317) → (425,317) → (56,213)).' The 6th ground at (56,213) is the outlier — distance from the (425,~320) cluster is ~377px, well over the 250px SCATTER_THRESHOLD_PX. Guard bailed instead of grinding through all 20 steps.",
+      "savings_vs_pre_fix": "Pre-fix the run would have exhausted all 20 steps (legacy guard granted 'screen IS changing — not bailing' exemption when ads/animations caused pixel churn). Post-fix: bailed at 9 steps. ~11 steps and ~40s of inference saved on this single run alone."
+    },
+    "brain_misframing_NEEDS_SHARPER_PROMPT": {
+      "claim": "The brain emitted 'click on the calculator app icon' across all 9 steps in Test 1 despite the task explicitly saying 'click the keypad buttons'. With or without crop, the small Holo3 model wasn't understanding that the on-screen window IS what to click.",
+      "evidence": "Action text in transcript was literally 'click on the calculator app icon' x9. Click coords clustered at (830, 604) which is on Calculator's right-column orange operator buttons — the brain interpreted them as 'icons' visually.",
+      "implication": "Crop alone isn't enough — task framing matters too. Need to either pre-tell the brain what surface it's on (which agent_do's existing `surface` param does, but the brain didn't use it strongly enough here), or give the brain a more explicit anchor in the prompt."
+    },
+    "crop_is_PROBABLY_firing_but_unverified": {
+      "claim": "Ground coords (425, 329 etc.) sit in the 458×408 cropped-image space — suggests Modal is receiving the cropped image with `screen:[458, 408]` and returning coords scaled into that space. But without bridge stdout we can't see the '[loop] 🪟 cropped to Calculator (...): bounds=Nms, crop=Nms' log line.",
+      "fix_needed": "/version endpoint (committed 7ef8496) returns 404 right now — Electron hasn't reloaded electron/main.ts yet. After the next user restart we'll be able to verify exactly which commit is in memory."
+    },
+    "multi_monitor_display_bug_explained": {
+      "claim": "Earlier in the session the cursor was on a secondary display (offset -190,-1080) while Calculator was on the primary (offset 0,0). screen.screenshot() captured the WRONG display; my maybeCropToTargetApp fell through to uncropped; the brain ground hallucinations against the wrong display's UI; eventually killed Calculator by clicking what looked like a button but was actually the red close circle of some other window.",
+      "fix": "Commit 7ef8496 adds multi-monitor recapture: when the crop rect doesn't fit the current shot, query findDisplayForRect for the display containing the target window, then call captureViaDesktopCapturer on THAT display, recompute the crop rect, and proceed. Not yet exercised end-to-end because Electron hadn't restarted with this commit loaded at run time.",
+      "workaround_used_in_test_1": "Manually clicked into Calculator via bridge /screen/click before the test, which moved the cursor to Calculator's display and ensured screen.screenshot() captured the right frame. Test 1's crop fit cleanly inside the shot — no recapture needed."
+    }
+  },
+  "speed_measurement_test_1": {
+    "wall_total_s": 71.35,
+    "outcome": "exhausted (anti-loop coord-scatter guard fired at step 9)",
+    "steps": 9,
+    "per_step_avg_s": 7.9,
+    "per_step_breakdown_observed": {
+      "step_1_warmup_s": 24.2,
+      "steps_2_9_avg_s": 5.9,
+      "thought_to_action_gap_s": 1.3,
+      "comment": "Step 1 was 24.2s due to provider warmup + first-call cache miss. Steps 2-9 averaged ~5.9s end-to-end. Much faster than the 35s/step from v10 earlier today (b9082 pin + crop firing); but still ~3x slower than the 2s target."
+    },
+    "vs_baseline": {
+      "v10_ponder_baseline_per_step_s": 35,
+      "v11_test_1_per_step_s": 5.9,
+      "speedup": "~5.9x"
+    }
+  },
+  "accuracy_measurement_test_1": {
+    "math_correct": "INCONCLUSIVE",
+    "post_run_screenshot_shows": "Calculator display = '47×8 = 376' — but the History panel reveals THREE '47×8 = 376' entries from EARLIER runs today, plus '47×47×8 = 17,672' and '17,672x8 = 141,376' from other failed runs. The orange-highlighted result is current. The 9 clicks fired in this run were 8x at (~830, 604) — Calculator's × button area — plus one at (461, 498) — Calculator's 4-button area. Hitting × 8 times on a result-showing state mostly just keeps the operator pending, doesn't reset. So the displayed '47×8 = 376' is likely RESIDUAL state from before Test 1, not a fresh computation by Test 1.",
+    "click_landings": {
+      "in_calculator_window": "9/9 (all clicks were inside (379,304)-(837,712) Calculator bounds)",
+      "comment": "No window-bounds OOB clicks — the brain was wandering INSIDE Calculator's window. Validates that crop is constraining the model's spatial output, but the model still mis-IDs which button it wants."
+    }
+  },
+  "test_2_status": "TIMED OUT — bridge ran for >240s on auto-detect path with sharper prompt. Bridge session j5731eas9xp7e2kts83px3pxgh86hfep was still active at write time. Likely the brain is in another wandering loop; another anti-loop bail probably coming.",
+  "next_actions": [
+    "1. User restarts Electron — kicks the stuck j5731eas9xp7e2kts83px3pxgh86hfep session AND loads commit 7ef8496 (/version + multi-monitor recapture).",
+    "2. Verify /version endpoint responds with commitShort matching `git rev-parse --short=12 HEAD`.",
+    "3. Re-run Test 1 (explicit targetApp + 47×8). Expected with full fix loaded: ~30-50s wall, ~5s/step, math correct on a FRESH Calculator (quit + relaunch first).",
+    "4. Sharpen the prompt for the brain — add a 'YOU ARE LOOKING AT A KEYPAD; do not click any icons; the buttons you need are labeled AC, 4, 7, ×, 8, =' framing line to all targetApp:Calculator tasks. Could be done in the agent_do tool wrapper or in the bridge's task augmentation.",
+    "5. Consider adding a 'targetApp window-bounds validation' to the loop's click executor (similar to agent_click_sequence's bounds check) — refuse to execute a click whose translated screen-space coord falls outside `targetApp`'s window when targetApp is set."
+  ],
+  "win_summary": "The anti-loop coord-scatter guard caught a vision-model hallucination scenario that would have wasted 11+ inference cycles, bailed early with a clear error. That's a real accuracy and efficiency win even when accuracy of the math itself failed. Speed: per-step inference is back to ~6s (down from the 35s v10 regression) — 5.9× faster, headed in the right direction. The remaining gap to the 2s target is partly inference latency (b9082 still slow) and partly architecture (each ponder step is plan+ground+screenshot — 3 round-trips minimum)."
+}

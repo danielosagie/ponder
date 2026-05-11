@@ -1597,6 +1597,51 @@ async function runOneSubtask(
       dragTo = { x: dragTo.x + shot.offsetX, y: dragTo.y + shot.offsetY };
     }
 
+    // Bounds-validate: when targetApp is set, the click MUST land
+    // inside that app's current window. Otherwise it focuses
+    // whatever is underneath (Terminal, Cursor IDE, Finder…) and
+    // the next screenshot captures the wrong app — exactly the
+    // failure mode from the May-11 run where one click at (347,279)
+    // landed in the menu-bar area, focused a Terminal window, and
+    // the verifier saw Terminal pixels and rejected the (otherwise
+    // correct) DONE.
+    //
+    // We DO NOT bail the run; we refuse this one click and push a
+    // [note: …] to history so the brain knows to re-ground. The
+    // brain's next plan() call will see the note and (we hope)
+    // emit a different verb. If it doesn't, the existing coord-
+    // scatter and same-action-N-times guards still apply.
+    if (opts.targetApp && coords && process.platform === "darwin") {
+      const bounds = await screen.getMacWindowBounds(opts.targetApp);
+      if (bounds) {
+        const insideX =
+          coords.x >= bounds.x && coords.x <= bounds.x + bounds.width;
+        const insideY =
+          coords.y >= bounds.y && coords.y <= bounds.y + bounds.height;
+        if (!insideX || !insideY) {
+          console.warn(
+            `[loop] 🪟 click out of bounds: (${coords.x},${coords.y}) outside ${opts.targetApp}'s window @(${bounds.x},${bounds.y}) ${bounds.width}×${bounds.height} — refusing this click. Brain will be told to re-ground.`,
+          );
+          const note =
+            `[note: your last grounded click landed at (${coords.x},${coords.y}) which is OUTSIDE ${opts.targetApp}'s window @(${bounds.x},${bounds.y}) ${bounds.width}×${bounds.height}. ` +
+            `The click was REFUSED — no action was taken. Look at the screenshot again; the button you described isn't where you thought it was. ` +
+            `Either pick a different button OR describe its position more precisely (e.g. "the orange = button in the bottom-right corner of the keypad, in the rightmost column"). Do NOT click outside the ${opts.targetApp} window.]`;
+          history.push(note);
+          actionScreenHashes.push(screenHash);
+          opts.onHistory?.(note);
+          await events.onError(
+            `Click at (${coords.x},${coords.y}) was outside ${opts.targetApp}'s window — refused. Re-grounding next step.`,
+          );
+          // Update hashes before continuing so anti-loop guards
+          // compare against current state on the next iteration.
+          prevSnapshotHash = snapHash;
+          prevScreenHash = screenHash;
+          if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
+          continue;
+        }
+      }
+    }
+
     const tExec = Date.now();
     // Wrap the executor in try/catch so a single click failure (Playwright
     // timeout because the ref is gone, an overlay intercepts pointer

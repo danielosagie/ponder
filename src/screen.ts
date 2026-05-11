@@ -129,6 +129,64 @@ export interface WindowBounds {
 }
 
 /**
+ * Bring a macOS process to the front (Z-order top) so subsequent
+ * screenshots actually capture its pixels rather than whatever was
+ * occluding it. Used by the loop's targetApp crop path — without
+ * this, cropping at `targetApp`'s bounds captures whatever app is
+ * RENDERED at those coords (Ponder's own UI, Cursor IDE, etc.) when
+ * the target is buried. Verified May-11 failure mode.
+ *
+ * Routes through the Holo3 bridge's /window/raise endpoint when
+ * available (the bridge has macOS Accessibility granted by the user;
+ * a tsx child process spawned by Claude Code does NOT). Returns
+ * `true` on success, `false` on any error or non-darwin. Never throws.
+ *
+ * Fast (~30ms when bridge is healthy + perms granted). Worth calling
+ * before each maybeCropToTargetApp run.
+ */
+export async function raiseMacApp(processName: string): Promise<boolean> {
+  if (process.platform !== "darwin") return false;
+  if (/["\\\n\r]/.test(processName)) return false;
+  const bridgePort = Number(process.env.PONDER_BRIDGE_PORT ?? 7900);
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${bridgePort}/window/raise`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ processName }),
+          signal: ctrl.signal,
+        },
+      );
+      if (res.ok) {
+        const j = (await res.json()) as { ok?: boolean; error?: string };
+        return j.ok === true;
+      }
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    // Bridge unreachable — fall through to local osascript.
+  }
+  // Local fallback. Only works when the spawning process itself has
+  // Accessibility granted (rare for tsx-from-Claude-Code, common for
+  // a terminal-launched tool that the user granted perms to).
+  try {
+    await execFileAsync(
+      "/usr/bin/osascript",
+      ["-e", `tell application "${processName}" to activate`],
+      { timeout: 1500 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Query the bounds of the FRONT window of the given macOS process.
  *
  * `processName` is the System Events process name — usually the same

@@ -1037,6 +1037,84 @@ function startBridgeServer(): void {
       return;
     }
 
+    // POST /window/raise → { processName } → { ok: true } | { error }
+    //
+    // Bring the named macOS process to the front BEFORE we screenshot.
+    // Critical for targetApp cropping: getMacWindowBounds returns the
+    // target's logical position regardless of Z-order, but the
+    // desktopCapturer screenshot captures whatever is rendered on top.
+    // If targetApp is buried under another window, the crop captures
+    // the OCCLUDING window's pixels at the target's coords, the
+    // vision model grounds against THOSE, and clicks land in the
+    // wrong UI entirely. Observed May-11: cropping at Calculator's
+    // bounds captured Ponder's own session list (Calculator was
+    // occluded), the brain saw "47 × 8" in a session title, emitted
+    // 6 clicks at the same corner of the Ponder UI, and the verifier
+    // FALSE-POSITIVED on "VERIFIED" because the text was visible.
+    //
+    // The bridge process has macOS Accessibility granted (it's the
+    // app the user added in System Settings → Privacy → Accessibility),
+    // so osascript activate works here even though it would 100% fail
+    // from the MCP server's tsx context. Same proxy pattern as
+    // /window/bounds.
+    if (method === "POST" && url === "/window/raise") {
+      readJsonBody((parsed, err) => {
+        if (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `bad JSON: ${err}` }));
+          return;
+        }
+        const { processName } = (parsed as { processName?: unknown }) ?? {};
+        if (
+          typeof processName !== "string" ||
+          processName.trim().length === 0
+        ) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "processName required (string)" }));
+          return;
+        }
+        if (/["\\\n\r]/.test(processName)) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({ error: "processName contains invalid characters" }),
+          );
+          return;
+        }
+        if (process.platform !== "darwin") {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: false, error: "non-darwin platform" }));
+          return;
+        }
+        // `activate` on the application itself is the right verb —
+        // System Events' `set frontmost` requires per-window scripting
+        // and is flakier. Application activate is also faster (~30ms).
+        const script = `tell application "${processName}" to activate`;
+        execFile(
+          "/usr/bin/osascript",
+          ["-e", script],
+          { timeout: 1500, encoding: "utf-8" },
+          (e, _stdout, stderr) => {
+            if (e) {
+              res.writeHead(200);
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: "osascript_failed",
+                  detail:
+                    (stderr && String(stderr).trim()) ||
+                    (e instanceof Error ? e.message : String(e)),
+                }),
+              );
+              return;
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          },
+        );
+      });
+      return;
+    }
+
     // POST /window/bounds → { processName } → { x, y, width, height } | { error }
     //
     // Proxy for `osascript -e 'tell process "<name>" to get position+size of

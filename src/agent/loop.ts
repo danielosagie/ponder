@@ -208,6 +208,45 @@ async function maybeCropToTargetApp(
   targetApp: string | undefined,
 ): Promise<screen.Screenshot> {
   if (!targetApp || process.platform !== "darwin") return shot;
+  // CRITICAL: bring the target app to the front before grounding.
+  // getMacWindowBounds returns the target's logical position
+  // regardless of Z-order, but the screenshot captures whatever is
+  // RENDERED there. Without raising, a buried target gets cropped to
+  // its OCCLUDER's pixels (May-11 incident: Ponder's session list
+  // was where Calculator should have been; brain emitted 6 clicks at
+  // Ponder UI thinking they were Calculator buttons; verifier false-
+  // VERIFIED on session-title text containing "47×8"). Skipping when
+  // raiseMacApp fails is acceptable — uncropped is still better than
+  // occluded.
+  const tRaise = Date.now();
+  const raised = await screen.raiseMacApp(targetApp);
+  if (raised) {
+    // Give WindowServer a tick to actually flip Z-order before we
+    // re-query bounds + re-screenshot. 60ms is empirically enough
+    // for the front-window swap to land in the screenshot pipeline.
+    await screen.sleep(60);
+    // Critical: re-capture the screenshot AFTER the raise. The shot
+    // we received was taken BEFORE we raised; cropping it would still
+    // show the previous Z-order (the occluder, not the target). The
+    // raise→sleep→recapture cycle is the difference between "crop
+    // captures Calculator's keypad" and "crop captures Ponder's UI
+    // at Calculator's coords because Calculator was buried" — the
+    // May-11 false-VERIFIED run.
+    try {
+      shot = await screen.screenshot();
+      console.log(
+        `[loop] 🪟 raised ${targetApp} to front and re-captured ${shot.width}×${shot.height} in ${Date.now() - tRaise}ms (overrides the pre-raise shot which would have cropped the occluder's pixels at the target's coords).`,
+      );
+    } catch (e) {
+      console.log(
+        `[loop] 🪟 raise OK but recapture failed (${e instanceof Error ? e.message : String(e)}) — proceeding with original (possibly occluded) shot.`,
+      );
+    }
+  } else {
+    console.log(
+      `[loop] 🪟 raise failed for "${targetApp}" — proceeding without Z-order swap (target may still be occluded; crop may capture wrong pixels).`,
+    );
+  }
   const tBounds = Date.now();
   const bounds = await screen.getMacWindowBounds(targetApp);
   if (!bounds) {

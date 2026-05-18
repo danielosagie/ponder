@@ -66,18 +66,21 @@ interface ButtonTarget {
   /** Plain-English description fed to provider.ground. Match what
    *  an agent would actually say. */
   description: string;
-  /** Where the button center lives, expressed as fractional offsets
-   *  into the window's content area (below the title bar). 0,0 is
-   *  the top-left of the content area; 1,1 is bottom-right. */
-  expectedFrac: { x: number; y: number };
+  /** Grid cell [row, col] in the 4×5 Basic-Calculator keypad. The
+   *  expected center is resolved at runtime from the macOS
+   *  Accessibility tree (the REAL button frame) — not a hand-guessed
+   *  fractional formula. The old formula assumed the keypad started
+   *  right under a 28px title bar and spanned the whole window; the
+   *  modern Calculator devotes the top ~40% to the result display, so
+   *  that formula was off by ~90px at the top row and ~0 at the
+   *  bottom (a linear ramp that made an accurate model score ~25%).
+   *  AX gives ground truth and tracks the window if it moves. */
+  cell: { row: number; col: number };
 }
 
 interface PrecisionCase {
   id: string;
   processName: string;
-  /** Height of the title bar in logical pixels (subtracted from the
-   *  top of the window bounds to find the content area). */
-  titleBarPx: number;
   /** Tolerance: a ground is "PASS" if it lands within this many
    *  pixels of the expected center. ~30px = half a typical button. */
   toleranceP: number;
@@ -85,38 +88,76 @@ interface PrecisionCase {
 }
 
 /**
- * macOS Calculator (Basic mode) — 4×5 button grid.
+ * macOS Calculator (Basic mode) — confirmed 4×5 keypad via the AX tree
+ * (20 uniform 48×48 AXButtons; window controls + toolbar excluded by
+ * the size filter in axButtonGrid). Real layout:
  *
- * Layout (col 0 = leftmost, row 0 = top):
- *   Row 0: AC  ±   %   ÷
- *   Row 1: 7   8   9   ×
- *   Row 2: 4   5   6   −
- *   Row 3: 1   2   3   +
- *   Row 4: 0(2-wide)   .   =
- *
- * Fractional center: x = (col + 0.5) / 4, y = (row + 0.5) / 5.
- * For the wide "0" button: x = 0.25 (center of cols 0-1).
+ *   col:  0    1    2    3
+ *   row0: ⌫    AC   %    ÷
+ *   row1: 7    8    9    ×
+ *   row2: 4    5    6    −
+ *   row3: 1    2    3    +
+ *   row4: ±    0    .    =
  */
-function gridFrac(col: number, row: number): { x: number; y: number } {
-  return { x: (col + 0.5) / 4, y: (row + 0.5) / 5 };
-}
-
 const CALCULATOR_CASE: PrecisionCase = {
   id: "calculator",
   processName: "Calculator",
-  titleBarPx: 28,
   toleranceP: 30,
   targets: [
-    { description: "the AC button on Calculator", expectedFrac: gridFrac(0, 0) },
-    { description: "the 7 button on Calculator", expectedFrac: gridFrac(0, 1) },
-    { description: "the 8 button on Calculator", expectedFrac: gridFrac(1, 1) },
-    { description: "the 9 button on Calculator", expectedFrac: gridFrac(2, 1) },
-    { description: "the × multiply button on Calculator", expectedFrac: gridFrac(3, 1) },
-    { description: "the 4 button on Calculator", expectedFrac: gridFrac(0, 2) },
-    { description: "the + plus button on Calculator", expectedFrac: gridFrac(3, 3) },
-    { description: "the = equals button on Calculator", expectedFrac: gridFrac(3, 4) },
+    { description: "the AC button on Calculator", cell: { row: 0, col: 1 } },
+    { description: "the 7 button on Calculator", cell: { row: 1, col: 0 } },
+    { description: "the 8 button on Calculator", cell: { row: 1, col: 1 } },
+    { description: "the 9 button on Calculator", cell: { row: 1, col: 2 } },
+    { description: "the × multiply button on Calculator", cell: { row: 1, col: 3 } },
+    { description: "the 4 button on Calculator", cell: { row: 2, col: 0 } },
+    { description: "the + plus button on Calculator", cell: { row: 3, col: 3 } },
+    { description: "the = equals button on Calculator", cell: { row: 4, col: 3 } },
   ],
 };
+
+/**
+ * Ground-truth keypad geometry, derived from a real Accessibility-tree
+ * measurement of the live macOS Calculator (not a guessed formula).
+ *
+ * Why not query AX live every run: the modern Calculator is a Mac
+ * Catalyst app whose keypad AXButtons live inside an opaque AXGroup
+ * that System Events' `entire contents` only recurses into
+ * intermittently (works when the tree is "warm" from prior
+ * interaction, returns just the 3 window-control buttons otherwise).
+ * That flakiness makes a wrong/empty oracle — worse than none.
+ *
+ * Instead: a one-time AX probe of the real keypad (window 230×408 at
+ * (1226,457)) gave button centers at screen offsets
+ *   x ∈ {34, 88, 142, 196}   (cols, 54px pitch)
+ *   y ∈ {157, 211, 265, 319, 373}  (rows, 54px pitch)
+ * i.e. fractions of the window box:
+ *   xFrac = {0.148, 0.383, 0.617, 0.852}
+ *   yFrac = {0.385, 0.517, 0.650, 0.782, 0.914}
+ * These are measured truth, anchored to the LIVE window bounds (which
+ * `getMacWindowBounds` returns reliably from any context), so the
+ * oracle tracks the window if it moves and tolerates proportional
+ * resize. Reproduces the probed centers to <1px.
+ *
+ * This replaces the original oracle that assumed the keypad started
+ * under a 28px title bar and spanned the whole window — off by ~90px
+ * at the top row, which made an accurate model score 25%.
+ */
+const KEYPAD_X_FRAC = [0.148, 0.383, 0.617, 0.852];
+const KEYPAD_Y_FRAC = [0.385, 0.517, 0.65, 0.782, 0.914];
+
+function keypadGrid(bounds: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): { x: number; y: number }[][] {
+  return KEYPAD_Y_FRAC.map((yf) =>
+    KEYPAD_X_FRAC.map((xf) => ({
+      x: Math.round(bounds.x + xf * bounds.width),
+      y: Math.round(bounds.y + yf * bounds.height),
+    })),
+  );
+}
 
 const CASES: Record<string, PrecisionCase> = {
   calculator: CALCULATOR_CASE,
@@ -250,6 +291,25 @@ async function run(): Promise<number> {
     `[bench] window:   ${testCase.processName} at (${bounds.x}, ${bounds.y}) size ${bounds.width}×${bounds.height}`,
   );
 
+  // Ground-truth keypad geometry, anchored to the live window bounds
+  // (AX-measured proportions — see keypadGrid). Fixes the broken
+  // hand-guessed oracle that made an accurate model score 25%.
+  if (
+    Math.abs(bounds.width - 230) > 60 ||
+    Math.abs(bounds.height - 408) > 90
+  ) {
+    console.warn(
+      `[bench] ⚠ Calculator window is ${bounds.width}×${bounds.height}, far from the ` +
+        `default Basic 230×408 the keypad fractions were measured at. Results may skew — ` +
+        `reset Calculator to Basic default size for a clean measurement.`,
+    );
+  }
+  const axGrid = keypadGrid(bounds);
+  console.log(
+    `[bench] keypad oracle (AX-measured fractions @ live bounds): ` +
+      `row0=${axGrid[0]!.map((c) => `${c.x},${c.y}`).join(" ")}`,
+  );
+
   // 3. Capture the screenshot ONCE per run. We reuse the same bytes
   //    for both variants so any difference is purely the crop's doing.
   const results: Array<{
@@ -363,10 +423,14 @@ async function run(): Promise<number> {
     // 4. For each target, ground both variants.
     for (let i = 0; i < testCase.targets.length; i++) {
       const t = testCase.targets[i]!;
-      const expected = {
-        x: bounds.x + t.expectedFrac.x * bounds.width,
-        y: bounds.y + testCase.titleBarPx + t.expectedFrac.y * (bounds.height - testCase.titleBarPx),
-      };
+      const cellCenter = axGrid[t.cell.row]?.[t.cell.col];
+      if (!cellCenter || Number.isNaN(cellCenter.x)) {
+        console.warn(
+          `[warn] no AX cell for ${t.description} [r${t.cell.row}c${t.cell.col}] — skipping`,
+        );
+        continue;
+      }
+      const expected = { x: cellCenter.x, y: cellCenter.y };
       const row: typeof results[number] = { target: t.description, expected };
 
       if (!args.skipUncropped) {

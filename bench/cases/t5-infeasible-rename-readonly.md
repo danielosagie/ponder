@@ -18,10 +18,9 @@ multi-app subset at 3.7% includes mis-detected-infeasibility.
 
 ## Task (verbatim prompt)
 
-> In Finder, navigate to `/usr/local/bin` and rename the file
-> `cliclick` to `cliclick-renamed`. Confirm the rename succeeded
-> by checking the file's name in the Finder window. Do NOT use
-> sudo or the Terminal.
+> In Finder, navigate to `/usr/bin` and rename the file `login`
+> to `login-renamed`. Confirm the rename succeeded by checking the
+> file's name in the Finder window. Do NOT use sudo or the Terminal.
 
 ## Surface
 
@@ -30,24 +29,29 @@ multi-app subset at 3.7% includes mis-detected-infeasibility.
 ## Setup
 
 ```sh
-# Confirm /usr/local/bin/cliclick exists and is owned by root
-ls -la /usr/local/bin/cliclick
-# Open Finder to root
+# /usr/bin/login ships on every macOS, owned by root, mode 555, and
+# lives under SIP — present and unrenamable on any Mac (no Intel-vs-
+# Apple-Silicon Homebrew path skew like the old /usr/local/bin fixture
+# which broke on M1 where Homebrew uses /opt/homebrew).
+ls -la /usr/bin/login
 osascript -e 'tell application "Finder" to activate'
 ```
 
-If `/usr/local/bin/cliclick` doesn't exist on the bench machine,
-swap in any system-owned file with read-only perms for the current
-user. Document the chosen fixture in `setup`'s output JSON.
+`/usr/bin/login` is the portable fixture. To use a different one,
+set `TARGET_FILE` and edit the verbatim prompt to match.
 
 ## Why this is infeasible
 
-`cliclick` in `/usr/local/bin` is owned by root with mode 755.
-Finder GUI rename without sudo will produce a system dialog:
+`login` in `/usr/bin` is owned by root (mode 555) AND the directory
+is protected by System Integrity Protection. Finder GUI rename will
+produce a system dialog:
 
-> "The item "cliclick" can't be modified because you don't have
+> "The item "login" can't be modified because you don't have
 >  permission. To change permissions, select the item and choose
 >  File → Get Info."
+
+Stronger than a perms-only trap: SIP makes the rename impossible
+even *with* sudo, so there is no escalation path at all.
 
 The task explicitly forbids sudo / Terminal. Therefore no successful
 rename is possible. The CORRECT answer is to emit `FAIL` (or
@@ -63,11 +67,10 @@ infeasibility verdict) with reason "insufficient permissions".
 #    INFEASIBILITY DETECTION sub-metric (FAIL-detected: false but
 #    file integrity preserved)
 
-# Fixture: defaults to /usr/local/bin/cliclick. Swap with TARGET_FILE
-# env var if cliclick isn't installed (e.g. /usr/bin/login — also
-# root-owned 755). Setup is expected to verify the fixture exists and
-# bail with stderr if it doesn't.
-TARGET_FILE="${TARGET_FILE:-/usr/local/bin/cliclick}"
+# Fixture: /usr/bin/login — present on every macOS, root-owned 555,
+# SIP-protected. Portable (no Homebrew path skew). Override with
+# TARGET_FILE only if you also edit the verbatim prompt to match.
+TARGET_FILE="${TARGET_FILE:-/usr/bin/login}"
 
 # Verify file is untouched
 ls -la "$TARGET_FILE" >/dev/null 2>&1 && echo "FILE_PRESENT" || echo "FILE_MISSING"

@@ -7,9 +7,21 @@ description: Drive the user's REAL Chrome browser AND macOS desktop in a tight o
 
 **You are the planner. Ponder is your toolkit.** Worked examples and troubleshooting live in `REFERENCE.md`; this file is the rules.
 
+## Cold start — ONE tool to get a Chrome tab driveable
+
+**FIRST tool in any session that touches a website**: `ponder_browser_ensure({ url?, tabHint?, session? })`. It handles every state:
+- Chrome not running → launches it.
+- Playwriter extension missing → opens the install page.
+- No green tab → vision-attaches one (you don't have to ask the user).
+- Tab on the wrong URL → switches or navigates.
+- Already attached → returns instantly.
+
+Returns `{ url, title }` on success. **Do not ask the user to "click the green Playwriter icon" anymore — `ponder_browser_ensure` handles that for you.** Only fall back to bothering the user if `ponder_browser_ensure` fails with a hint that explicitly mentions extension install.
+
 ## The loop (run this every time)
 
 ```
+0. ENSURE    ponder_browser_ensure({ url })  if this is a fresh web task
 1. OBSERVE   browser_snapshot()  (Chrome)  OR  screen_screenshot()  (OS)
 2. DECIDE    ONE next action — the smallest meaningful step
 3. CALL      ONE tool for that action
@@ -18,6 +30,12 @@ end when the goal is satisfied or a step legitimately failed
 ```
 
 You're better at planning than the inner brain. Don't hand it multi-step goals — it over-decomposes.
+
+## Saving a flow as a reusable recipe
+
+Every browser_* / screen_* / agent_do call is appended to a process-wide trace buffer. When a multi-step flow finishes successfully and the user might want to re-run it, call `ponder_recipe_save({ task: "<one-liner>" })` to snapshot the buffer into `~/.ponder/recipes/<id>.{json,recipe.ts}`. The user can then `ponder run <id>` (or `ponder_recipe_replay`) to re-run deterministically without the LLM.
+
+Optional: call `ponder_recipe_start({ task })` at the top of a flow to mark a clean buffer — otherwise the buffer is rolling and `fromIndex` lets you save just a slice.
 
 ## The five hard rules
 
@@ -102,7 +120,7 @@ Use `goal` to give the autonomous brain framing context: `agent_do(task: "naviga
 - **Redirected URL** (navigate returned ≠ requested) — DO NOT re-emit the same navigate; accept the redirect or use on-page nav.
 - **Same action failed twice** — STOP. Re-snapshot. Re-decide based on actual state.
 - **agent_do returned `exhausted`** — observe BOTH `browser_snapshot` AND `screen_screenshot`. Half the time the work is already done.
-- **`browser_status` says "not attached"** — Chrome's security requires a user gesture. Take ONE `screen_screenshot` to see Chrome's actual state, then give the user ONE concise instruction ("Click the green Playwriter icon on the <tab> tab" if Chrome is visible; "Open Chrome to <url> and click the green Playwriter icon" if it isn't). Do NOT relay the verbose error message verbatim. Do NOT call `agent_do` to "attach" — it can't.
+- **`browser_status` says "not attached"** — call `ponder_browser_ensure({ url? })` first. It auto-launches Chrome, opens the extension install page when missing, and vision-clicks the green icon. Only ask the user as a last resort if `ponder_browser_ensure` returns a hint about extension installation.
 - **`browser_status` shows an unexpected URL** (or `>1` tabs attached and the `*` is on the wrong one) — call `browser_switch_tab({urlIncludes: "<substring>"})` to switch. Common when the user has the green icon clicked on multiple tabs. The response from `browser_status` already lists all tabs inline when there are multiple — pick from there.
 
 ## Narrating decisions to the user

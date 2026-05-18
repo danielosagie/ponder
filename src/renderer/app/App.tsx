@@ -19,6 +19,7 @@ import { useState, useEffect } from "react";
 import { useQuery } from "convex/react";
 import { api } from "@convex/_generated/api";
 import type { Id } from "@convex/_generated/dataModel";
+import { useTaskHistory } from "../shared/taskHistory";
 
 type ProviderName = "remote" | "local" | "hcompany";
 
@@ -64,6 +65,8 @@ const PROVIDER_HINTS: Record<ProviderName, string> = {
   local: "Ollama on this machine",
 };
 
+type TopView = "sessions" | "recipes";
+
 export function App() {
   const sessions = useQuery(api.sessions.list, { limit: 100 }) as
     | SessionRow[]
@@ -72,6 +75,14 @@ export function App() {
   const [agentState, setAgentState] = useState<AgentState | null>(null);
   const [perms, setPerms] = useState<PermissionsReport | null>(null);
   const [backgroundMode, setBackgroundMode] = useState<boolean | null>(null);
+  /**
+   * Top-level view of the main pane. "sessions" is the live-history view
+   * (the original behavior — Convex-backed log of agent_do runs).
+   * "recipes" surfaces every saved automation from ~/.ponder/recipes/ so
+   * the user can browse, replay, and edit recordings without leaving
+   * the app. Switched via the tab strip above the main content.
+   */
+  const [topView, setTopView] = useState<TopView>("sessions");
 
   // Subscribe to provider/warmup state from main so the sidebar pill always
   // shows the live truth (and the active provider is highlighted).
@@ -154,7 +165,7 @@ export function App() {
               boxShadow: "var(--shadow-1)",
             }}
           />
-          <div style={{ fontSize: 14, fontWeight: 600 }}>Holo3 Agent</div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Ponder</div>
         </div>
 
         {/* One-click provider switcher right under the brand. The active
@@ -228,16 +239,84 @@ export function App() {
         )}
       </aside>
       <main>
+        {/* Tab strip — flip between live Sessions (Convex history) and
+            Automations (saved recipes from ~/.ponder/recipes/). The
+            chosen tab is the active styled pill; the other is muted.
+            Keeps the rest of the chrome (perms banner, background hint)
+            below so they stay visible regardless of which view is on. */}
+        <TabStrip view={topView} onChange={setTopView} />
+
         {/* Pinned to the top of the main pane so the user sees missing perms
             before they wonder why the agent isn't moving the cursor. */}
         <PermsBanner perms={perms} />
         <BackgroundModeHint enabled={backgroundMode} />
-        {selected ? (
-          <Detail sessionId={selected} />
+
+        {topView === "sessions" ? (
+          selected ? <Detail sessionId={selected} /> : <Welcome />
         ) : (
-          <Welcome />
+          <RecipesView />
         )}
       </main>
+    </div>
+  );
+}
+
+/**
+ * Two-pill tab strip pinned to the top of the main pane. Mirrors the
+ * Plugins/Skills shape from the Codex reference UI but localized to
+ * Ponder's two top-level surfaces.
+ */
+function TabStrip({
+  view,
+  onChange,
+}: {
+  view: TopView;
+  onChange: (v: TopView) => void;
+}): JSX.Element {
+  const tabs: Array<{ id: TopView; label: string }> = [
+    { id: "sessions", label: "Sessions" },
+    { id: "recipes", label: "Automations" },
+  ];
+  return (
+    <div
+      role="tablist"
+      style={{
+        display: "flex",
+        gap: 4,
+        marginBottom: 16,
+        padding: 4,
+        borderRadius: "var(--r-md)",
+        background: "var(--bg-elev)",
+        border: "1px solid var(--border)",
+        width: "fit-content",
+      }}
+    >
+      {tabs.map((t) => {
+        const active = t.id === view;
+        return (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(t.id)}
+            style={{
+              padding: "6px 14px",
+              fontSize: 13,
+              fontWeight: active ? 600 : 500,
+              color: active ? "var(--text)" : "var(--muted)",
+              background: active ? "var(--bg)" : "transparent",
+              border: "1px solid",
+              borderColor: active ? "var(--border)" : "transparent",
+              borderRadius: "var(--r-sm)",
+              cursor: "pointer",
+              boxShadow: active ? "var(--shadow-1)" : "none",
+              transition: "background 120ms, color 120ms",
+            }}
+          >
+            {t.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -326,7 +405,7 @@ function PermsBanner({ perms }: { perms: PermissionsReport | null }) {
             <br />
             <span style={{ color: "var(--muted)", fontSize: 11.5 }}>
               In dev, look for an entry literally named <code>Electron</code>{" "}
-              (not "Holo3 Agent" — that only exists in packaged builds). If
+              (not "Ponder Agent" — that only exists in packaged builds). If
               it's not in the list, click "Reveal Electron.app in Finder"
               below and drag it into the Privacy panel via the <kbd>+</kbd>{" "}
               button. Then quit the dev process and relaunch.
@@ -495,7 +574,7 @@ function Welcome() {
           letterSpacing: "-0.01em",
         }}
       >
-        Welcome to Holo3 Agent
+        Welcome to Ponder Agent
       </h1>
       <p style={{ color: "var(--muted)", marginTop: 6 }}>
         Press{" "}
@@ -654,6 +733,9 @@ function RetryBar({
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const isRunning = status === "pending" || status === "running";
+  // Shared with Buddy via localStorage (same origin) — entries pushed here
+  // appear when the user hits ⌘E + ArrowUp on the buddy pill, and vice versa.
+  const taskHistory = useTaskHistory();
 
   const fire = async (taskText: string) => {
     if (!taskText.trim() || busy) return;
@@ -664,6 +746,8 @@ function RetryBar({
     } finally {
       setBusy(false);
       setText("");
+      // Push regardless of ok/error so a typo'd prompt is still recallable.
+      taskHistory.push(taskText);
     }
   };
 
@@ -693,12 +777,18 @@ function RetryBar({
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter") void fire(text);
+          if (e.key === "Enter") {
+            void fire(text);
+            return;
+          }
+          // ↑/↓ recalls earlier prompts (this window's + Buddy's, shared
+          // via localStorage). Hook is a no-op for any other key.
+          taskHistory.onKeyDown(e, text, setText);
         }}
         placeholder={
           isRunning
             ? "Agent is running… (cancel from tray)"
-            : "Continue — what next?"
+            : "Continue — what next? (↑↓ to recall)"
         }
         disabled={isRunning || busy}
         style={{ flex: 1 }}
@@ -830,4 +920,403 @@ function relTime(t: number): string {
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+// ── Automations tab ────────────────────────────────────────────────────
+//
+// Surfaces every saved recipe under ~/.ponder/recipes/ as a row list on
+// the left with a detail pane on the right. The .recipe.ts file is the
+// editable artifact; "Open" pops it in $EDITOR via shell.openPath.
+//
+// Data path: window.agent.listRecipes (one-shot index) + window.agent.
+// getRecipe(id) (full manifest). Both go through electron/main.ts IPC
+// handlers → src/agent/recorder.ts (listRecipes / loadRecipe), so the
+// renderer sees the same recipes the CLI / MCP do.
+
+type RecipeListEntry = {
+  id: string;
+  task: string;
+  startedAt: string;
+  steps: number;
+  outcome?: string;
+  durationMs?: number;
+  recipePath: string;
+  jsonPath: string;
+};
+
+type RecipeDetail = {
+  task: string;
+  startedAt: string;
+  durationMs?: number;
+  outcome?: string;
+  surface?: string;
+  provider?: string;
+  steps: Array<{
+    t: number;
+    intent?: string;
+    executed: { type: string; payload: Record<string, unknown> };
+    url?: string;
+  }>;
+};
+
+function RecipesView(): JSX.Element {
+  const [entries, setEntries] = useState<RecipeListEntry[] | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<RecipeDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const refresh = async (): Promise<void> => {
+    setLoading(true);
+    try {
+      const list = (await (window as unknown as {
+        agent: { listRecipes(): Promise<RecipeListEntry[]> };
+      }).agent.listRecipes()) ?? [];
+      setEntries(list);
+      if (!selectedId && list.length > 0) setSelectedId(list[0]!.id);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    // Refresh on focus — when the user records a new recipe from MCP or
+    // the CLI and tabs back, the list catches up without a manual click.
+    const onFocus = (): void => void refresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setDetail(null);
+      return;
+    }
+    void (async () => {
+      const d = await (window as unknown as {
+        agent: { getRecipe(id: string): Promise<RecipeDetail | null> };
+      }).agent.getRecipe(selectedId);
+      setDetail(d);
+    })();
+  }, [selectedId]);
+
+  const filtered = (entries ?? []).filter((e) =>
+    query
+      ? e.task.toLowerCase().includes(query.toLowerCase()) ||
+        e.id.toLowerCase().includes(query.toLowerCase())
+      : true,
+  );
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "320px 1fr",
+        gap: 16,
+        alignItems: "start",
+      }}
+    >
+      {/* Left: search + list */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search automations"
+          style={{
+            padding: "8px 12px",
+            fontSize: 13,
+            border: "1px solid var(--border)",
+            borderRadius: "var(--r-sm)",
+            background: "var(--bg-elev)",
+            color: "var(--text)",
+            outline: "none",
+          }}
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {entries === null && (
+            <div style={{ color: "var(--muted)", fontSize: 12, padding: 8 }}>
+              Loading…
+            </div>
+          )}
+          {entries !== null && filtered.length === 0 && (
+            <div
+              style={{
+                margin: "4px 0",
+                padding: 14,
+                border: "1px dashed var(--border-strong)",
+                borderRadius: "var(--r-md)",
+                color: "var(--muted)",
+                fontSize: 12,
+                lineHeight: 1.5,
+              }}
+            >
+              {entries.length === 0
+                ? "No automations yet. Drive a flow via MCP (browser_*, screen_*, agent_do) and call ponder_recipe_save. The recipe lands at ~/.ponder/recipes/ and appears here."
+                : "No automations match the search."}
+            </div>
+          )}
+          {filtered.map((e) => (
+            <button
+              key={e.id}
+              className={`session-row ${selectedId === e.id ? "active" : ""}`}
+              onClick={() => setSelectedId(e.id)}
+              style={{ textAlign: "left" }}
+            >
+              <div
+                style={{
+                  fontSize: 13,
+                  fontWeight: 500,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {e.task}
+              </div>
+              <div
+                style={{
+                  marginTop: 4,
+                  fontSize: 11,
+                  color: "var(--muted)",
+                  display: "flex",
+                  gap: 6,
+                  alignItems: "center",
+                }}
+              >
+                <span>{relTime(Date.parse(e.startedAt))}</span>
+                <span style={{ color: "var(--muted-2)" }}>·</span>
+                <span>
+                  {e.steps} step{e.steps === 1 ? "" : "s"}
+                </span>
+                {e.durationMs !== undefined && (
+                  <>
+                    <span style={{ color: "var(--muted-2)" }}>·</span>
+                    <span>{(e.durationMs / 1000).toFixed(1)}s</span>
+                  </>
+                )}
+                <span style={{ flex: 1 }} />
+                {e.outcome && <StatusPill status={e.outcome as never} />}
+              </div>
+            </button>
+          ))}
+        </div>
+        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+          {entries
+            ? `${entries.length} automation${entries.length === 1 ? "" : "s"} · refresh on window focus`
+            : ""}
+          {loading && entries && " · refreshing"}
+        </div>
+      </div>
+
+      {/* Right: detail */}
+      <div>
+        {selectedId && detail ? (
+          <RecipeDetailView id={selectedId} detail={detail} />
+        ) : selectedId && !detail ? (
+          <div style={{ color: "var(--muted)", fontSize: 13, padding: 16 }}>
+            Loading recipe…
+          </div>
+        ) : (
+          <div
+            style={{
+              padding: 24,
+              border: "1px dashed var(--border-strong)",
+              borderRadius: "var(--r-md)",
+              color: "var(--muted)",
+              fontSize: 13,
+              lineHeight: 1.6,
+            }}
+          >
+            Pick an automation on the left to see its steps and code.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RecipeDetailView({
+  id,
+  detail,
+}: {
+  id: string;
+  detail: RecipeDetail;
+}): JSX.Element {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* Header */}
+      <div>
+        <div style={{ fontSize: 18, fontWeight: 600, color: "var(--text)" }}>
+          {detail.task}
+        </div>
+        <div
+          style={{
+            marginTop: 6,
+            display: "flex",
+            gap: 10,
+            color: "var(--muted)",
+            fontSize: 12,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <span>{new Date(detail.startedAt).toLocaleString()}</span>
+          <span style={{ color: "var(--muted-2)" }}>·</span>
+          <span>
+            {detail.steps.length} step{detail.steps.length === 1 ? "" : "s"}
+          </span>
+          {detail.durationMs !== undefined && (
+            <>
+              <span style={{ color: "var(--muted-2)" }}>·</span>
+              <span>{(detail.durationMs / 1000).toFixed(1)}s</span>
+            </>
+          )}
+          {detail.provider && (
+            <>
+              <span style={{ color: "var(--muted-2)" }}>·</span>
+              <span>{detail.provider}</span>
+            </>
+          )}
+          {detail.surface && (
+            <>
+              <span style={{ color: "var(--muted-2)" }}>·</span>
+              <span>{detail.surface}</span>
+            </>
+          )}
+          {detail.outcome && <StatusPill status={detail.outcome as never} />}
+        </div>
+        <div
+          style={{
+            marginTop: 4,
+            fontSize: 11,
+            color: "var(--muted-2)",
+            fontFamily: "ui-monospace, monospace",
+          }}
+        >
+          id: {id}
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button
+          onClick={() => {
+            void (window as unknown as {
+              agent: { revealRecipe(id: string): Promise<unknown> };
+            }).agent.revealRecipe(id);
+          }}
+          style={pillBtn(false)}
+        >
+          Open .recipe.ts
+        </button>
+        <button
+          onClick={() => {
+            void navigator.clipboard.writeText(
+              `ponder run ${id}`,
+            );
+          }}
+          style={pillBtn(false)}
+        >
+          Copy `ponder run`
+        </button>
+      </div>
+
+      {/* Steps */}
+      <div>
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--muted)",
+            margin: "10px 0 6px",
+            letterSpacing: 0.4,
+            textTransform: "uppercase",
+          }}
+        >
+          Steps
+        </div>
+        {detail.steps.length === 0 && (
+          <div
+            style={{
+              padding: 14,
+              border: "1px dashed var(--border-strong)",
+              borderRadius: "var(--r-md)",
+              color: "var(--muted)",
+              fontSize: 12,
+            }}
+          >
+            (no recorded steps)
+          </div>
+        )}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            border: "1px solid var(--border)",
+            borderRadius: "var(--r-md)",
+            background: "var(--bg-elev)",
+            padding: 10,
+          }}
+        >
+          {detail.steps.map((s, i) => (
+            <div
+              key={i}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "40px 110px 1fr",
+                alignItems: "start",
+                gap: 10,
+                padding: "8px 10px",
+                background: "var(--bg)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--r-sm)",
+              }}
+            >
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                {i + 1}.
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: "var(--accent)",
+                  fontFamily: "ui-monospace, monospace",
+                }}
+              >
+                {s.executed.type}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text)" }}>
+                {s.intent ?? truncate(JSON.stringify(s.executed.payload), 120)}
+                {s.url && (
+                  <div
+                    style={{
+                      marginTop: 2,
+                      fontSize: 10.5,
+                      color: "var(--muted)",
+                    }}
+                  >
+                    {s.url}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function pillBtn(active: boolean): React.CSSProperties {
+  return {
+    padding: "6px 12px",
+    fontSize: 12.5,
+    fontWeight: 500,
+    color: active ? "var(--text)" : "var(--text-soft)",
+    background: active ? "var(--bg)" : "var(--bg-elev)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--r-sm)",
+    cursor: "pointer",
+  };
 }

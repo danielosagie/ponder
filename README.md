@@ -1,105 +1,99 @@
-# ponder
+# Ponder
 
-Computer-use harness based off farza's clicky. Holo3-35B-A3B planner, hierarchical Ollama subtask manager, Convex for state, Modal for serverless GPU.
+> Drive your real Chrome and your real macOS desktop from an agent — record every flow, hand-edit it, replay it forever.
 
-Cross-platform computer-use agent. Clicky-style cursor overlay for daily use, ollama-style history view in the full app, Holo3-35B-A3B served on Modal as the default backend, with a local Ollama toggle for offline. Convex for state and real-time UI.
+Ponder is a standalone, open-source platform for browser+desktop automation. It bundles:
 
-## Quick start (M1, macOS)
+- An **MCP server** any AI agent (Claude Code, Claude Desktop, claude.ai) can plug into.
+- A **TypeScript SDK** that gives you `page` (real Chrome via Playwriter) plus `screen.*` (OS-level vision-grounded clicks).
+- A **CLI** (`ponder`) for recording, replaying, and editing flows.
+- A **localhost HTTP bridge** at `:7900` your own apps can drive — same surface as the MCP, with per-consumer auth.
+- A **process-wide trace buffer**: every browser_*/screen_*/agent_do call is captured and can be snapshotted into a hand-editable recipe.
 
-```bash
-# 1. Install deps
-npm install
-
-# 2. Bring Convex up — creates a free deployment, writes VITE_CONVEX_URL to .env.local
-npx convex dev   # leave running in its own terminal
-
-# 3. (Once) Deploy Modal app + populate the model volume
-modal secret create holo3-agent-auth TOKEN=<random-strong-string>
-modal run modal_app.py::download_model   # ~20GB, takes a while
-modal deploy modal_app.py
-# Copy the deployed URL (e.g. https://you--holo3-agent-plan-endpoint.modal.run)
-# into MODAL_BASE_URL in .env (use the base, not the per-endpoint URL).
-
-# 4. Start the app
-cp .env.example .env
-# edit .env: MODAL_BASE_URL, MODAL_BEARER_TOKEN, VITE_CONVEX_URL
-npm run dev
-```
-
-The tray icon appears, the AppWindow opens (history view), and Modal warm-up kicks off in the background. Press ⌘⇧Space anywhere to summon the cursor overlay.
-
-## Architecture
-
-```
-Electron (TS)      ┌─ Overlay window (cursor companion + chat)
-                   ├─ App window    (ollama-style history)
-                   └─ Tray + ⌘⇧Space hotkey
-                          │
-                          ▼ in-process agent loop
-                   Brain → Eyes → Action  (ported from holo3-demo main.py)
-                          │
-            ┌─────────────┴─────────────┐
-            │                           │
-       Modal (Python)              Ollama (local)
-       Holo3-35B-A3B-APEX          qwen2.5vl:7b
-            │                           │
-            └─────────────┬─────────────┘
-                          ▼
-                       Convex (sessions, steps, screenshots)
-```
-
-## Files
-
-- `electron/main.ts` — tray, hotkey, IPC, window mgmt, agent kickoff
-- `electron/windows.ts` — overlay (transparent, cursor-anchored) + app windows
-- `src/agent/loop.ts` — Brain→Eyes→Action loop (port of `main.py:366-436`)
-- `src/agent/providers/{remote,local}.ts` — Modal HTTP client / Ollama client
-- `src/agent/warmup.ts` — startup warm-up + request queue
-- `src/screen.ts` — `@nut-tree-fork/nut-js` wrapper (screenshot/click/type)
-- `src/perms.ts` — macOS Accessibility / Screen Recording probes
-- `src/renderer/overlay/Overlay.tsx` — cursor companion UI
-- `src/renderer/app/App.tsx` — sessions list + detail view
-- `convex/schema.ts` + `sessions.ts` + `steps.ts` — schema and functions
-- `modal_app.py` — Modal deployment (only Python file)
-
-## Permissions (macOS)
-
-The app needs three permissions on first launch — System Settings → Privacy & Security:
-1. **Accessibility** — for synthetic clicks/keyboard
-2. **Screen Recording** — for screenshots
-3. **Input Monitoring** — for the global ⌘⇧Space hotkey
-
-The app probes these and surfaces a deep-link if anything is missing.
-
-## Provider toggle
-
-Tray icon → Provider → choose **Remote (Modal · Holo3)** or **Local (Ollama)**. Switching triggers a fresh warm-up; in-flight tasks complete on the previous provider.
-
-## Local provider — always real Holo3
-
-Run once per machine:
+## Ponder in 60 seconds
 
 ```bash
-# default I-Compact (17.3GB) — Windows + 32GB RAM, or 24GB GPUs
-bash scripts/setup-local.sh
-
-# 16GB M1 (tight but possible)
-TIER=I-Mini bash scripts/setup-local.sh
-
-# bigger machine, more accuracy
-TIER=I-Quality bash scripts/setup-local.sh
+npm i -g ponder
+ponder setup                            # probes for Playwriter + walks you through the extension
+ponder doctor                           # green checks across the board?
 ```
 
-This downloads the chosen tier + the `mmproj.gguf` vision sidecar from `mudler/Holo3-35B-A3B-APEX-GGUF` and imports them into Ollama as `holo3` (via `scripts/Holo3.Modelfile`). The local provider always points at this model — no substitute. Override the Ollama model name with `OLLAMA_MODEL` in `.env` if you want to test alternatives.
+From any MCP-aware agent (Claude Code et al.):
 
-## Modal — cheapest GPU
+```
+ponder_browser_ensure({ url: "https://example.com" })  // one tool — handles every cold-start state
+browser_snapshot()                                     // see the [eN] refs
+browser_click("e12")                                   // click something
+ponder_recipe_save({ task: "my flow" })                // freeze it as a replayable recipe
+```
 
-`modal_app.py` uses `gpu="L4"` (cheapest current-gen 24GB GPU, ~$0.80/hr) and `min_containers=0` so you only pay while a request is in flight. `scaledown_window=600` keeps the container warm 10 min after the last call. Default GGUF is **I-Compact** (17.3GB) — fits L4 with room for the KV cache.
-
-## Development
+Replay later from the terminal:
 
 ```bash
-npm run typecheck  # strict TS
-npm run dev        # electron-vite with HMR
-npm run build      # production bundle
+ponder list                             # newest first
+ponder run <id>                         # deterministic replay, no LLM in the loop
+ponder open <id>                        # hand-edit the .recipe.ts when something breaks
 ```
+
+Or from any Node program:
+
+```ts
+import { loadRecipe, replayRecipe } from "ponder";
+
+const recipe = await loadRecipe("2026-05-12_18-30-00-search-marketplace");
+await replayRecipe(recipe!, { reground: true });
+```
+
+Or from any process that can speak HTTP (anorha, custom CLI, Slack bot, whatever):
+
+```bash
+ponder grant my-app --scopes browser:*,recipe:*
+# pndr_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx     ← shown once
+```
+
+```ts
+import { createPonderClient } from "ponder";
+
+const client = createPonderClient({ token: process.env.PONDER_KEY });
+await client.ensureAttached({ url: "https://example.com" });
+const snap = await client.browser.snapshot();
+```
+
+## What Ponder is — and isn't
+
+Ponder is **the platform**: the recorder, the SDK, the bridge, the CLI, the MCP server. It does not ship a UI for end users (other than a tray app for permissions). It expects to be consumed by:
+
+- An AI agent talking to the MCP server.
+- A TypeScript program importing `ponder`.
+- Any HTTP client talking to the bridge.
+
+Apps that build a user-facing product *on top of* Ponder — like [anorha](https://anorha.dev) — live in their own repos and bring their own backend.
+
+## Highlights
+
+- **`ponder_browser_ensure`** — one MCP tool that handles every cold-start state: Chrome not running, extension missing, no green tab, wrong URL. Vision auto-attaches.
+- **Process-wide trace buffer** — direct `browser_click` / `screen_type` / `agent_do` calls all land in the same recipe. Save with `ponder_recipe_save`.
+- **Raw Playwright recipes** — `.recipe.ts` files use `page.getByRole(...)` directly; the `defineRecipe({ run })` shell is 30 lines you can rip out to drop the body into any Playwright project.
+- **Stripe-style auth** — `ponder grant <name>` mints a `pndr_live_<random>` key. Each request goes through localhost bridge middleware that touches `lastUsedAt` and appends an audit row.
+- **Typed errors** — every failure surfaces `{ code, message, hint, docs_url }`. No bare strings.
+
+## Docs
+
+- [`docs/recipes.md`](docs/recipes.md) — record, edit, replay.
+- [`docs/sdk.md`](docs/sdk.md) — TypeScript API surface.
+- [`docs/bridge.md`](docs/bridge.md) — HTTP endpoint reference + auth.
+
+## Examples
+
+- [`examples/record-a-flow.ts`](examples/record-a-flow.ts) — record once with `agent_do`, save.
+- [`examples/replay-via-sdk.ts`](examples/replay-via-sdk.ts) — load + replay.
+- [`examples/drive-via-bridge.ts`](examples/drive-via-bridge.ts) — talk to `:7900` from a separate Node process.
+- [`examples/auto-attach.ts`](examples/auto-attach.ts) — `ensureAttached` then drive a Playwright `Page` directly.
+
+## License
+
+Apache 2.0. See [`LICENSE`](LICENSE).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Pull requests welcome — typecheck (`npm run typecheck`) must be clean before merge.

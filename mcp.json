@@ -1,0 +1,9 @@
+{
+  "_comment": "MCP server config used by the Claude Code Plugin marketplace install path (/plugin install ponder). Plugin contents get cached to ~/.claude/plugins/cache/ WITHOUT node_modules, so we point at a long-running local HTTP server the user starts separately with `pnpm mcp:http` (or `pnpm mcp:setup` for tunnel + URL banner). For the no-extra-process stdio path use `pnpm mcp:install` instead — it writes absolute-path stdio configs into each coding agent's config file (Claude Desktop, Cursor, Claude Code, Windsurf).",
+  "mcpServers": {
+    "ponder": {
+      "type": "http",
+      "url": "http://127.0.0.1:7831/mcp"
+    }
+  }
+}

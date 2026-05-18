@@ -22,9 +22,9 @@
   --text-soft: #2c2e36;
   --muted: #6c6f78;
   --muted-2: #9aa0aa;
-  --accent: #2563eb;                        /* Clicky's blue600 (#2563eb) — verbatim */
-  --accent-hover: #1d4ed8;                  /* Clicky's blue700 */
-  --accent-soft: rgba(37, 99, 235, 0.10);
+  --accent: #7BB304;                        /* Clicky's blue600 (#2563eb) — verbatim */
+  --accent-hover: #5E8E3E;                  /* Clicky's blue700 */
+  --accent-soft: rgba(37, 235, 47, 0.1);
   --accent-2: #8a5bff;
   --good: #2bb673;
   --warn: #d39329;
@@ -234,7 +234,7 @@ body,
   font-size: 12px;
   font-weight: 500;
   color: #fff;
-  background: #3380ff; /* Clicky's overlayCursorBlue */
+  background: #7BB304; /* Clicky's overlayCursorBlue */
   padding: 4px 10px;
   border-radius: 8px;
   white-space: nowrap;

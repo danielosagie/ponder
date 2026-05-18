@@ -1,0 +1,27 @@
+{
+  "name": "ponder",
+  "version": "0.1.0",
+  "description": "Drive the user's real Chrome browser via MCP — open pages, click, type, fill forms, post listings, scrape, automate any web flow. Includes a skill that auto-fires on web tasks plus an MCP server with 15 tools (browser_navigate, browser_click, browser_type, browser_read, screen_click, screen_hotkey, …).",
+  "author": {
+    "name": "Inirha",
+    "email": "admin@inirha.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "browser",
+    "chrome",
+    "automation",
+    "mcp",
+    "playwright",
+    "playwriter",
+    "ponder",
+    "web",
+    "scraping",
+    "marketplace",
+    "form-fill",
+    "agent",
+    "skill"
+  ],
+  "skills": "./skills",
+  "mcpServers": "./mcp.json"
+}

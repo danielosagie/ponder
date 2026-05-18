@@ -1,0 +1,18 @@
+{
+  "name": "ponder",
+  "owner": {
+    "name": "Inirha",
+    "email": "admin@inirha.com"
+  },
+  "metadata": {
+    "description": "Ponder — drive your real Chrome browser via MCP. A skill + 15 tools that let any agent open pages, click, type, fill forms, post listings, scrape content, and automate any web flow.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ponder",
+      "source": ".",
+      "description": "Browser automation skill + MCP server (Playwriter + cliclick). Activates on any web task; covers the full TYPE → CLICK SUGGESTION → CLICK APPLY flow plus mouse/keyboard recovery."
+    }
+  ]
+}

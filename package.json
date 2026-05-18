@@ -1,9 +1,51 @@
 {
-  "name": "holo3-agent",
-  "version": "0.1.0",
-  "description": "Clicky-style computer-use agent backed by Holo3 on Modal",
-  "private": true,
+  "name": "ponder",
+  "version": "0.2.0",
+  "description": "Standalone OSS browser+desktop automation. MCP server + SDK + CLI + localhost HTTP bridge that drives the user's real Chrome (via Playwriter) and macOS desktop (via Holo3 vision). Every action is recorded into a hand-editable recipe.",
+  "license": "Apache-2.0",
+  "homepage": "https://ponder.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anthropics/ponder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anthropics/ponder/issues"
+  },
+  "keywords": [
+    "browser-automation",
+    "playwright",
+    "playwriter",
+    "mcp",
+    "model-context-protocol",
+    "chrome",
+    "agent",
+    "ai-agent",
+    "desktop-automation",
+    "macos",
+    "vision",
+    "recorder",
+    "replay"
+  ],
   "main": "out/main/index.js",
+  "exports": {
+    ".": "./src/cli/sdk.ts",
+    "./sdk": "./src/cli/sdk.ts",
+    "./recorder": "./src/agent/recorder.ts",
+    "./errors": "./src/errors.ts",
+    "./bridge/auth": "./src/bridge/auth.ts"
+  },
+  "bin": {
+    "ponder": "bin/ponder.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "skills",
+    "docs",
+    "examples",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
@@ -11,26 +53,47 @@
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
     "modal:deploy": "modal deploy modal_app.py",
+    "mcp": "tsx src/mcp/server.ts",
+    "mcp:install": "tsx src/mcp/install.ts",
+    "mcp:doctor": "tsx src/mcp/doctor.ts",
+    "mcp:http": "tsx src/mcp/server-http.ts",
+    "mcp:setup": "tsx src/mcp/setup.ts",
+    "mcp:status": "tsx src/mcp/status.ts",
+    "ponder": "tsx src/cli/ponder.ts",
+    "ponder:list": "tsx src/cli/ponder.ts list",
+    "postinstall": "tsx src/cli/postinstall.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@nut-tree-fork/nut-js": "^4.2.2",
+    "chalk": "^4.1.2",
     "convex": "^1.17.0",
     "dotenv": "^17.4.2",
+    "gradient-string": "^2.0.2",
+    "ink": "^3.2.0",
+    "ink-gradient": "^2.0.0",
+    "ink-spinner": "^4.0.3",
+    "ora": "^5.4.1",
     "node-mac-permissions": "^2.5.0",
     "ollama": "^0.5.10",
     "playwright-core": "^1.49.0",
     "playwriter": "^0.1.0",
+    "prompts": "^2.4.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/gradient-string": "^1.1.6",
     "@types/node": "^22.10.0",
+    "@types/prompts": "^2.4.9",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
     "electron-vite": "^2.3.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }

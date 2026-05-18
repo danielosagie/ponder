@@ -1,0 +1,178 @@
+{
+  "case": "calculator",
+  "provider": "hcompany",
+  "bounds": {
+    "x": 1226,
+    "y": 457,
+    "width": 230,
+    "height": 408
+  },
+  "runs": 1,
+  "tolerancePx": 30,
+  "results": [
+    {
+      "target": "the AC button on Calculator",
+      "expected": {
+        "x": 1254.75,
+        "y": 523
+      },
+      "uncropped": {
+        "x": 1312,
+        "y": 614,
+        "err": 107.51075527592577,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1311,
+        "y": 614,
+        "err": 106.98159888504192,
+        "pass": false
+      }
+    },
+    {
+      "target": "the 7 button on Calculator",
+      "expected": {
+        "x": 1254.75,
+        "y": 599
+      },
+      "uncropped": {
+        "x": 1258,
+        "y": 668,
+        "err": 69.07649745029057,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1261,
+        "y": 663,
+        "err": 64.30445163439309,
+        "pass": false
+      }
+    },
+    {
+      "target": "the 8 button on Calculator",
+      "expected": {
+        "x": 1312.25,
+        "y": 599
+      },
+      "uncropped": {
+        "x": 1312,
+        "y": 668,
+        "err": 69.00045289706438,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1312,
+        "y": 663,
+        "err": 64.00048827938737,
+        "pass": false
+      }
+    },
+    {
+      "target": "the 9 button on Calculator",
+      "expected": {
+        "x": 1369.75,
+        "y": 599
+      },
+      "uncropped": {
+        "x": 1368,
+        "y": 669,
+        "err": 70.02187158309896,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1364,
+        "y": 660,
+        "err": 61.27040476445377,
+        "pass": false
+      }
+    },
+    {
+      "target": "the × multiply button on Calculator",
+      "expected": {
+        "x": 1427.25,
+        "y": 599
+      },
+      "uncropped": {
+        "x": 1421,
+        "y": 668,
+        "err": 69.28248335618463,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1422,
+        "y": 664,
+        "err": 65.2116745682857,
+        "pass": false
+      }
+    },
+    {
+      "target": "the 4 button on Calculator",
+      "expected": {
+        "x": 1254.75,
+        "y": 675
+      },
+      "uncropped": {
+        "x": 1256,
+        "y": 722,
+        "err": 47.01661940207952,
+        "pass": false
+      },
+      "cropped": {
+        "x": 1263,
+        "y": 720,
+        "err": 45.75,
+        "pass": false
+      }
+    },
+    {
+      "target": "the + plus button on Calculator",
+      "expected": {
+        "x": 1427.25,
+        "y": 751
+      },
+      "uncropped": {
+        "x": 1421,
+        "y": 774,
+        "err": 23.83406176043018,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1422,
+        "y": 773,
+        "err": 22.617747456367095,
+        "pass": true
+      }
+    },
+    {
+      "target": "the = equals button on Calculator",
+      "expected": {
+        "x": 1427.25,
+        "y": 827
+      },
+      "uncropped": {
+        "x": 1423,
+        "y": 829,
+        "err": 4.697073557013984,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1420,
+        "y": 826,
+        "err": 7.318640584152223,
+        "pass": true
+      }
+    }
+  ],
+  "summary": {
+    "uncropped": {
+      "pass": 2,
+      "total": 8,
+      "meanErrPx": 57.554976910261004
+    },
+    "cropped": {
+      "pass": 2,
+      "total": 8,
+      "meanErrPx": 54.68187577151015
+    }
+  }
+}

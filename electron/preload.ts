@@ -40,6 +40,49 @@ const api = {
       provider: ProviderName;
       backgroundMode: boolean;
     }>,
+  // ── Automations / recipes — list, fetch, reveal in editor.
+  //    All data comes from ~/.ponder/recipes/. The renderer's
+  //    Automations tab uses listRecipes for the index, getRecipe
+  //    for detail, and revealRecipe to pop the .recipe.ts in the
+  //    user's default editor.
+  listRecipes: () =>
+    ipcRenderer.invoke("recipes:list") as Promise<
+      Array<{
+        id: string;
+        task: string;
+        startedAt: string;
+        steps: number;
+        outcome?: string;
+        durationMs?: number;
+        recipePath: string;
+        jsonPath: string;
+      }>
+    >,
+  getRecipe: (id: string) =>
+    ipcRenderer.invoke("recipes:get", id) as Promise<{
+      task: string;
+      startedAt: string;
+      durationMs?: number;
+      outcome?: string;
+      surface?: string;
+      provider?: string;
+      steps: Array<{
+        t: number;
+        intent?: string;
+        executed: { type: string; payload: Record<string, unknown> };
+        url?: string;
+      }>;
+    } | null>,
+  recipePaths: (id: string) =>
+    ipcRenderer.invoke("recipes:paths", id) as Promise<{
+      jsonPath: string;
+      recipePath: string;
+    }>,
+  revealRecipe: (id: string) =>
+    ipcRenderer.invoke("recipes:reveal", id) as Promise<{
+      ok: boolean;
+      error?: string;
+    }>,
 };
 
 export interface AgentStateMsg {

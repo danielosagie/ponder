@@ -54,6 +54,55 @@ import {
   requestScreenRecording,
 } from "../src/perms";
 import {
+  verifyToken,
+  scopeAllowed,
+  touchKeySync,
+  audit,
+  readKeysSync,
+} from "../src/bridge/auth";
+import {
+  loadRecipe,
+  listRecipes,
+  pathsFor as recipePathsFor,
+  saveRecipe,
+  buildRecipeFromTrace,
+  recordAction,
+} from "../src/agent/recorder";
+import { PonderError } from "../src/errors";
+
+/** Shared JSON body reader used by the new /browser/* + /recipe/*
+ *  endpoints. Caps payload at 64KB so a misbehaving client can't OOM
+ *  the bridge. Calls back with the parsed value (or `null` on empty)
+ *  on success; sends a 400 response and skips the callback on error. */
+function readJsonBodyEarly(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cb: (parsed: unknown) => void,
+): void {
+  let body = "";
+  req.on("data", (chunk: Buffer) => {
+    body += chunk.toString();
+    if (body.length > 64_000) {
+      res.writeHead(413);
+      res.end(JSON.stringify({ error: "body too large" }));
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    try {
+      cb(body.length > 0 ? JSON.parse(body) : null);
+    } catch (e) {
+      res.writeHead(400);
+      res.end(
+        JSON.stringify({
+          code: "INTERNAL_ERROR",
+          message: `Bad JSON: ${e instanceof Error ? e.message : String(e)}`,
+        }),
+      );
+    }
+  });
+}
+import {
   createAppWindow,
   createBuddyWindow,
   startBuddyCursorBroadcast,
@@ -754,6 +803,10 @@ function startBridgeServer(): void {
     }
 
     if (method === "GET" && url === "/health") {
+      // isMagicMode reads PONDER_AUTO / PONDER_MAGIC env at request
+      // time so a user can `export PONDER_AUTO=1` after the tray
+      // launched and have it take effect immediately.
+      const { isMagicMode } = require("../src/bridge/auth") as typeof import("../src/bridge/auth");
       res.writeHead(200);
       res.end(
         JSON.stringify({
@@ -761,8 +814,597 @@ function startBridgeServer(): void {
           provider: providerName,
           warmup: warmup.getState(),
           activeSessionId,
+          magicMode: isMagicMode(),
         }),
       );
+      return;
+    }
+
+    // ── Per-consumer auth gate ──────────────────────────────────────
+    //
+    // Every endpoint EXCEPT /version, /health and the legacy
+    // /agent_do path (Electron <-> MCP localhost trust) requires a
+    // valid Bearer token issued via `ponder grant`. Localhost-only
+    // bind stays — auth adds revocability + auditability ON TOP of
+    // localhost trust.
+    //
+    // The /agent_do, /screen/*, /browser/url, /window/* endpoints
+    // pre-date the auth model. They are CONSIDERED localhost-trusted
+    // for backwards compatibility with the existing MCP forwarder
+    // until consumers migrate. New endpoints (/browser/*, /recipe/*,
+    // /attach) require auth from day one.
+    const REQUIRES_AUTH = /^\/(browser\/(?:attach|snapshot|click|type|navigate|set_input_files|scroll|read)|recipe\/.*)/;
+    let authState: ReturnType<typeof verifyToken> | null = null;
+    if (REQUIRES_AUTH.test(url)) {
+      const keyCount = readKeysSync().length;
+      if (keyCount === 0) {
+        // No keys ever issued — surface a clear setup error rather
+        // than a vague 401. This is the common first-call shape.
+        res.writeHead(401);
+        res.end(
+          JSON.stringify({
+            code: "MISSING_AUTH",
+            message:
+              "No Ponder API keys have been issued yet. Run `ponder grant <name>` to mint one.",
+            hint: "Then re-send the request with Authorization: Bearer <key>.",
+            docs_url:
+              process.env.PONDER_DOCS_BASE_URL ??
+              "https://ponder.dev/docs/bridge#auth",
+          }),
+        );
+        return;
+      }
+      authState = verifyToken(req.headers["authorization"]);
+      if (!authState.ok) {
+        res.writeHead(401);
+        res.end(
+          JSON.stringify({
+            code: authState.code,
+            message: authState.message,
+            hint:
+              authState.code === "MISSING_AUTH"
+                ? "Issue a key with `ponder grant <name>` and re-send with Authorization: Bearer <key>."
+                : "Re-issue this consumer's key with `ponder grant <name>` and update the client.",
+            docs_url:
+              process.env.PONDER_DOCS_BASE_URL ??
+              "https://ponder.dev/docs/bridge#auth",
+          }),
+        );
+        return;
+      }
+      // Touch the key + audit on response close so we charge the
+      // right consumer in the audit log regardless of which branch
+      // serves the request.
+      const consumerName = authState.consumer;
+      const startedAt = Date.now();
+      res.on("close", () => {
+        touchKeySync(consumerName);
+        audit({
+          consumer: consumerName,
+          method,
+          path: url,
+          status: res.statusCode || 0,
+          durationMs: Date.now() - startedAt,
+        });
+      });
+    }
+
+    // ── /browser/attach — wraps the ponder_browser_ensure behaviour ──
+    if (method === "POST" && url === "/browser/attach") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as {
+          url?: unknown;
+          tabHint?: unknown;
+          session?: unknown;
+        }) ?? {};
+        void (async () => {
+          try {
+            const wantUrl = typeof p.url === "string" ? p.url : undefined;
+            if (!browserClient || !(await browserClient.available())) {
+              res.writeHead(503);
+              res.end(
+                JSON.stringify({
+                  code: "BROWSER_NOT_ATTACHED",
+                  message:
+                    "Playwriter relay is not ready. The Electron app cannot " +
+                    "vision-attach a tab on behalf of an HTTP consumer.",
+                  hint:
+                    "From the Holo3 app, attach a tab manually OR call " +
+                    "ponder_browser_ensure via the MCP for the cold-start " +
+                    "vision flow.",
+                  docs_url:
+                    process.env.PONDER_DOCS_BASE_URL ??
+                    "https://ponder.dev/docs/errors/browser_not_attached",
+                }),
+              );
+              return;
+            }
+            let snap = await browserClient.snapshot();
+            if (wantUrl && !snap.url.startsWith(wantUrl)) {
+              await browserClient.navigate(wantUrl);
+              await new Promise((r) => setTimeout(r, 600));
+              snap = await browserClient.snapshot();
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ url: snap.url, title: snap.title }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/snapshot ────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/snapshot") {
+      void (async () => {
+        try {
+          if (!browserClient || !(await browserClient.available())) {
+            res.writeHead(503);
+            res.end(
+              JSON.stringify({
+                code: "BROWSER_NOT_ATTACHED",
+                message: "Chrome not attached to Playwriter.",
+                hint: "Click the green Playwriter icon on a Chrome tab.",
+              }),
+            );
+            return;
+          }
+          const snap = await browserClient.snapshot();
+          res.writeHead(200);
+          res.end(JSON.stringify(snap));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      })();
+      return;
+    }
+
+    // ── /browser/navigate ────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/navigate") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { url?: unknown }) ?? {};
+        if (typeof p.url !== "string" || !p.url.trim()) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "url required (string).",
+            }),
+          );
+          return;
+        }
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            await browserClient.navigate(p.url as string);
+            await new Promise((r) => setTimeout(r, 700));
+            const snap = await browserClient.snapshot();
+            recordAction({
+              type: "browser_navigate",
+              payload: { url: p.url as string },
+              url: snap.url,
+              consumer: authState?.ok ? authState.consumer : undefined,
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ url: snap.url, title: snap.title }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/click ───────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/click") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { ref?: unknown }) ?? {};
+        if (typeof p.ref !== "string" || !p.ref) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "ref required (string).",
+            }),
+          );
+          return;
+        }
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            await browserClient.click(p.ref as string);
+            recordAction({
+              type: "browser_click",
+              payload: { ref: p.ref as string },
+              consumer: authState?.ok ? authState.consumer : undefined,
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "REF_NOT_FOUND",
+                message: e instanceof Error ? e.message : String(e),
+                hint: "Call /browser/snapshot to get fresh refs.",
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/type ────────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/type") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as {
+          ref?: unknown;
+          text?: unknown;
+          submit?: unknown;
+        }) ?? {};
+        if (typeof p.ref !== "string" || typeof p.text !== "string") {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "ref + text required.",
+            }),
+          );
+          return;
+        }
+        const submit = p.submit === true;
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            await browserClient.type(p.ref as string, p.text as string, {
+              submit,
+            });
+            recordAction({
+              type: "browser_type",
+              payload: {
+                ref: p.ref as string,
+                text: p.text as string,
+                ...(submit ? { submit: true } : {}),
+              },
+              consumer: authState?.ok ? authState.consumer : undefined,
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/set_input_files ─────────────────────────────────────
+    if (method === "POST" && url === "/browser/set_input_files") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { ref?: unknown; paths?: unknown }) ?? {};
+        if (typeof p.ref !== "string" || !Array.isArray(p.paths)) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "ref + paths[] required.",
+            }),
+          );
+          return;
+        }
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            const paths = (p.paths as unknown[]).map(String);
+            await browserClient.setInputFiles(p.ref as string, paths);
+            recordAction({
+              type: "browser_set_input_files",
+              payload: { ref: p.ref as string, paths },
+              consumer: authState?.ok ? authState.consumer : undefined,
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/scroll ──────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/scroll") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as {
+          direction?: unknown;
+          ref?: unknown;
+          amount?: unknown;
+        }) ?? {};
+        if (p.direction !== "up" && p.direction !== "down") {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "direction must be 'up' or 'down'.",
+            }),
+          );
+          return;
+        }
+        const amount = typeof p.amount === "number" ? p.amount : undefined;
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            if (typeof p.ref === "string" && p.ref) {
+              await browserClient.scrollElement(
+                p.ref,
+                p.direction as "up" | "down",
+                amount,
+              );
+              recordAction({
+                type: "browser_scroll_element",
+                payload: {
+                  ref: p.ref,
+                  dir: p.direction,
+                  ...(amount !== undefined ? { amount } : {}),
+                },
+                consumer: authState?.ok ? authState.consumer : undefined,
+              });
+            } else {
+              await browserClient.scrollPage(
+                p.direction as "up" | "down",
+                amount,
+              );
+              recordAction({
+                type: "browser_scroll_page",
+                payload: {
+                  dir: p.direction,
+                  ...(amount !== undefined ? { amount } : {}),
+                },
+                consumer: authState?.ok ? authState.consumer : undefined,
+              });
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /browser/read ────────────────────────────────────────────────
+    if (method === "POST" && url === "/browser/read") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { ref?: unknown }) ?? {};
+        void (async () => {
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            const text = await browserClient.readText(
+              typeof p.ref === "string" ? p.ref : undefined,
+            );
+            res.writeHead(200);
+            res.end(JSON.stringify({ text }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /recipe/save ─────────────────────────────────────────────────
+    if (method === "POST" && url === "/recipe/save") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { task?: unknown; fromIndex?: unknown }) ?? {};
+        void (async () => {
+          try {
+            const recipe = buildRecipeFromTrace({
+              ...(typeof p.task === "string" ? { task: p.task } : {}),
+              ...(typeof p.fromIndex === "number"
+                ? { fromIndex: p.fromIndex }
+                : {}),
+            });
+            if (recipe.steps.length === 0) {
+              res.writeHead(400);
+              res.end(
+                JSON.stringify({
+                  code: "RECIPE_EMPTY",
+                  message:
+                    "No actions in the trace buffer — nothing to save.",
+                  hint: "Drive some browser_* / screen_* tools first.",
+                }),
+              );
+              return;
+            }
+            const saved = await saveRecipe(recipe);
+            if (!saved) {
+              res.writeHead(500);
+              res.end(
+                JSON.stringify({
+                  code: "RECIPE_SAVE_FAILED",
+                  message: "Disk write failed.",
+                }),
+              );
+              return;
+            }
+            res.writeHead(200);
+            res.end(
+              JSON.stringify({
+                id: saved.id,
+                recipePath: saved.recipePath,
+                jsonPath: saved.jsonPath,
+                steps: recipe.steps.length,
+              }),
+            );
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
+      return;
+    }
+
+    // ── /recipe/list ─────────────────────────────────────────────────
+    if (method === "GET" && url === "/recipe/list") {
+      void (async () => {
+        try {
+          const entries = await listRecipes();
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              recipes: entries.map((e) => ({
+                id: e.id,
+                task: e.task,
+                steps: e.steps,
+                recipePath: e.recipePath,
+                jsonPath: e.jsonPath,
+                ...(e.outcome ? { outcome: e.outcome } : {}),
+              })),
+            }),
+          );
+        } catch (e) {
+          res.writeHead(500);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      })();
+      return;
+    }
+
+    // ── /recipe/:id ──────────────────────────────────────────────────
+    const recipeMatch = url.match(/^\/recipe\/([A-Za-z0-9._:-]+)$/);
+    if (method === "GET" && recipeMatch) {
+      void (async () => {
+        try {
+          const recipe = await loadRecipe(recipeMatch[1]!);
+          if (!recipe) {
+            res.writeHead(404);
+            res.end(
+              JSON.stringify({
+                code: "RECIPE_NOT_FOUND",
+                message: `Recipe "${recipeMatch[1]}" not found.`,
+              }),
+            );
+            return;
+          }
+          res.writeHead(200);
+          res.end(JSON.stringify(recipe));
+        } catch (e) {
+          res.writeHead(500);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      })();
+      return;
+    }
+
+    // ── /recipe/run ──────────────────────────────────────────────────
+    if (method === "POST" && url === "/recipe/run") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as { id?: unknown; reground?: unknown }) ?? {};
+        if (typeof p.id !== "string") {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              code: "INTERNAL_ERROR",
+              message: "id required (string).",
+            }),
+          );
+          return;
+        }
+        void (async () => {
+          try {
+            const recipe = await loadRecipe(p.id as string);
+            if (!recipe) {
+              res.writeHead(404);
+              res.end(
+                JSON.stringify({
+                  code: "RECIPE_NOT_FOUND",
+                  message: `Recipe "${p.id}" not found.`,
+                }),
+              );
+              return;
+            }
+            // Defer to the SDK replay engine in the renderer/CLI path.
+            // The bridge process already owns macOS perms + the
+            // browser client, so we can drive directly here.
+            const { replayRecipe } = await import("../src/cli/sdk");
+            const result = await replayRecipe(recipe, {
+              reground: p.reground === true,
+              browser: browserClient ?? null,
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          }
+        })();
+      });
       return;
     }
     if (method === "POST" && url === "/agent_do") {
@@ -786,9 +1428,16 @@ function startBridgeServer(): void {
               maxSteps?: unknown;
             };
             const task = typeof parsed.task === "string" ? parsed.task : "";
+            // targetApp tri-state:
+            //   undefined / missing key → use auto-detect (loop.ts inferTargetApp)
+            //   "" (explicit empty)     → opt out: no inference, no cropping
+            //   "AppName"               → use that app explicitly
+            // Previously this collapsed "" to undefined, which made the
+            // opt-out promised by loop.ts:452 unreachable. Multi-app bench
+            // tasks (Chrome + Excel) need the explicit empty-string path
+            // so cropping doesn't lock to whichever app gets matched first.
             const targetApp =
-              typeof parsed.targetApp === "string" &&
-              parsed.targetApp.trim().length > 0
+              typeof parsed.targetApp === "string"
                 ? parsed.targetApp.trim()
                 : undefined;
             // Optional per-call action budget. Sanity-clamp to
@@ -874,6 +1523,13 @@ function startBridgeServer(): void {
               height: shot.height,
               offsetX: shot.offsetX,
               offsetY: shot.offsetY,
+              // Surface the PNG-to-logical pixel ratio so MCP-side
+              // consumers (agent_click_sequence's crop path, the
+              // vision-precision bench, anorha, etc.) can scale crop
+              // coords from logical → physical before slicing the
+              // PNG. On non-Retina or nut-js this is 1; on Retina
+              // via desktopCapturer it's 2 (or 3 on some 5K monitors).
+              scaleFactor: shot.scaleFactor,
             }),
           );
         } catch (e) {
@@ -1447,10 +2103,22 @@ function startBridgeServer(): void {
       );
     }
   });
+  // Node 18+ defaults `requestTimeout` to 300_000ms (5 min). Long
+  // bench tasks (e.g. t4-honda-crv with maxSteps=70) take 25-35 min
+  // wall time on rate-limited providers; the 5-min cap kills the
+  // HTTP connection even though the agent is still working. Symptom:
+  // bench/run.ts sees `fetch failed` at ~301s, no transcript, no
+  // outcome — diagnosed 2026-05-11 Run 7. Disable the cap (0 = no
+  // limit) so agent_do can run as long as the harness allows.
+  server.requestTimeout = 0;
+  // Also disable the headers timeout (default 60s) — not currently
+  // a problem, but we send headers immediately so this is just
+  // future-proofing if streaming is added later.
+  server.headersTimeout = 0;
   server.listen(BRIDGE_PORT, "127.0.0.1", () => {
     _bridgeServerStarted = true;
     console.log(
-      `[bridge] listening on http://127.0.0.1:${BRIDGE_PORT} — MCP can now forward agent_do here`,
+      `[bridge] listening on http://127.0.0.1:${BRIDGE_PORT} — MCP can now forward agent_do here (requestTimeout=0)`,
     );
   });
 }
@@ -1803,6 +2471,40 @@ function setupIpc(): void {
     provider: providerName,
     backgroundMode: BACKGROUND_MODE,
   }));
+
+  // ── Recipes (automations) — the renderer's Automations tab pulls
+  //    these from disk so the user can see every saved flow without
+  //    leaving the app. listRecipes/loadRecipe live in src/agent/
+  //    recorder.ts; both read from ~/.ponder/recipes/.
+  ipcMain.handle("recipes:list", async () => {
+    try {
+      return await listRecipes();
+    } catch (e) {
+      console.warn(`[ipc] recipes:list failed: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    }
+  });
+  ipcMain.handle("recipes:get", async (_e, id: string) => {
+    try {
+      return await loadRecipe(id);
+    } catch (e) {
+      console.warn(`[ipc] recipes:get failed: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  });
+  ipcMain.handle("recipes:paths", (_e, id: string) => {
+    return recipePathsFor(id);
+  });
+  // Open the .recipe.ts in the user's $EDITOR / default app.
+  ipcMain.handle("recipes:reveal", async (_e, id: string) => {
+    try {
+      const paths = recipePathsFor(id);
+      await shell.openPath(paths.recipePath);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
 }
 
 function buildTray(): void {

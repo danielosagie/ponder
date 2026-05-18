@@ -41,8 +41,21 @@ export interface SubtaskPlan {
   note: string;
 }
 
+/** Optional snapshot of what's CURRENTLY on screen, passed to the planner
+ *  so it can skip already-completed setup steps (don't decompose
+ *  "Open Chrome" if Chrome is already on the right URL). All fields
+ *  optional — provide what's known. */
+export interface PlannerContext {
+  /** Active Chrome URL, if Chrome is the foreground app. */
+  browserUrl?: string;
+  /** Active Chrome page title, if available. */
+  browserTitle?: string;
+  /** Frontmost OS app name (e.g., "Chrome", "Finder", "Calculator"). */
+  frontmostApp?: string;
+}
+
 export interface PlannerClient {
-  plan(task: string): Promise<SubtaskPlan>;
+  plan(task: string, context?: PlannerContext): Promise<SubtaskPlan>;
   /** Cheap probe — true if the model responds at all. */
   available(): Promise<boolean>;
 }
@@ -56,9 +69,22 @@ Rules:
 - Each subtask is ONE focused phase of work: "Open Chrome", "Search Google for 'X'", "Open the most relevant non-ad result and skim the page".
 - Phrase as imperative actions in present tense.
 - DO NOT decompose into individual clicks, key presses, or coordinates — the lower-level vision model handles those.
+- Plan in SCOPES, from outermost to innermost — this prevents the lower-level model from confusing the OS launcher, the browser address bar, and an in-page search bar (a common failure that wastes 10+ steps):
+   1. OS scope — open or focus the right APP (Chrome, Slack, Finder, etc.).
+   2. App scope — navigate to the right WINDOW / TAB / URL inside that app.
+   3. Page scope — use the page's OWN controls (its search bar, its filter buttons, its result cards) to do the specific thing. NOT the OS search. NOT the browser address bar.
 - The first subtask usually opens an app or focuses the right window.
 - The last subtask reports the answer / confirms completion.
-- If the task names specific criteria ("for a Dell SE2719HR", "rotating monitors"), preserve those words in the relevant subtask so the lower-level model has them too.
+- If the task names specific criteria ("for a Dell SE2719HR", "rotating monitors", "in Marietta GA"), preserve those words in the relevant subtask so the lower-level model has them too.
+- DEFAULT TOOL PREFERENCE: the lower-level executor leans ~70% keyboard / CLI-style verbs (browser.navigate, browser.type, hotkey, press) and ~30% mouse (browser.click, click) — that's already wired into its system prompt, you don't need to repeat it. Only override when the user explicitly states a different ratio in the task ("use cli 90% of the time", "no keyboard shortcuts", etc.) — in that case, preserve the user's wording verbatim in the relevant subtask. If the user says nothing about tool preference, say nothing.
+
+Worked example — "find a 1997 Toyota Camry on Facebook Marketplace in Marietta GA under $3k":
+  1. Open or switch to Chrome
+  2. Navigate to facebook.com/marketplace
+  3. Use the Marketplace search bar to search for "1997 Toyota Camry"
+  4. Set the location filter to Marietta, GA and the price filter to under $3000
+  5. Open the top matching listings and report their details
+  DONE
 
 Output format — exactly this, no preamble, no commentary:
 1. <subtask>
@@ -122,16 +148,45 @@ export function createOllamaPlanner(cfg: PlannerConfig = {}): PlannerClient {
   const timeoutMs = cfg.timeoutMs ?? Number(process.env.PLANNER_TIMEOUT_MS ?? 8000);
 
   return {
-    async plan(task: string): Promise<SubtaskPlan> {
+    async plan(task: string, context?: PlannerContext): Promise<SubtaskPlan> {
       const t0 = Date.now();
+      // Build a CURRENT-STATE block so the planner can skip subtasks
+      // that are already satisfied. Without this the planner blindly
+      // decomposes "add a photo to the listing" into "Open Chrome /
+      // Navigate to URL / Click Add" even when Chrome is ALREADY on
+      // the listing edit page — wasting 2 subtasks (and worse, the
+      // first "Open Chrome" subtask sometimes navigates AWAY from the
+      // listing back to the marketplace homepage).
+      const stateBits: string[] = [];
+      if (context?.frontmostApp) {
+        stateBits.push(`Frontmost app: ${context.frontmostApp}`);
+      }
+      if (context?.browserUrl) {
+        stateBits.push(`Active Chrome URL: ${context.browserUrl}`);
+      }
+      if (context?.browserTitle) {
+        stateBits.push(`Active Chrome title: ${context.browserTitle}`);
+      }
+      const stateBlock =
+        stateBits.length > 0
+          ? `\n\nCurrent state:\n${stateBits.join("\n")}\n\nIMPORTANT: skip any setup subtask that's already satisfied by the current state above. If Chrome is already on the right URL, do NOT decompose "Open Chrome" or "Navigate to URL" as subtasks — start from the next thing to do.`
+          : "";
       try {
         const result = await Promise.race([
           ollama.chat({
             model,
             messages: [
               { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: `Task: ${task}` },
+              { role: "user", content: `Task: ${task}${stateBlock}` },
             ],
+            // think: false — disable Qwen3 reasoning at the API level.
+            // Without this, qwen3.5:0.8b emits a 5-9s <think> block on
+            // every prompt, which is why the planner kept hitting
+            // "planner timeout" → "running flat" in every trace. With
+            // reasoning off the same call returns in ~300-800ms and the
+            // 8s timeout becomes generous headroom rather than a
+            // permanent ceiling. Same fix the router and extractor got.
+            think: false,
             // temperature: low so the plan is deterministic; we don't want
             // creativity here, we want the SHORTEST sensible decomposition.
             // num_predict: 256 is plenty for 6 subtasks at ~30 tokens each.

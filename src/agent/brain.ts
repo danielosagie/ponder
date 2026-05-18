@@ -69,27 +69,26 @@ export async function think(
   // OPEN/SWITCH to it before doing anything else.
   //
   // Kept tight (~20 lines) because the small model loses focus on
-  // long preambles. The two rules are the bench-evidenced ones; no
-  // speculative additions.
+  // long preambles. Rules 1-2 are from the 2026-05-11 honda-crv
+  // bench Runs 1-2.
+  //
+  // A Rule 3 ("after Spotlight, emit `wait 2s` once") was tried in
+  // Run 4 to fix the Class D post-Spotlight screenshot race, then
+  // removed in Run 5 because the small model dropped the conditional
+  // and emitted `wait 2s` UNCONDITIONALLY as the very first action,
+  // bailing by no-op-spam in 20s without ever launching anything.
+  // The Class D race is now handled deterministically in loop.ts via
+  // SPOTLIGHT_LAUNCH_SETTLE_MS — no preamble cost, no brain cooperation.
+  // Tightened from the original 20-line version (2026-05-13). The
+  // earlier preamble was ~231 tokens of instruction text prepended to
+  // every brain call, plausibly degrading grounding accuracy on the
+  // small vision model. The same two bench-evidenced rules can be
+  // expressed in 4 lines (~55 tokens) without losing the protection;
+  // the verbose rationale lives in the comment block above.
   const TASK_PRIORITY_PREAMBLE =
-    `[TASK PRIORITY — read before looking at the screenshot]\n` +
-    `Your TASK TEXT below is the authority. The screenshot shows what's\n` +
-    `visible right now — these can differ. Two rules:\n` +
-    `\n` +
-    `1. FOLLOW TASK ORDER. If the task says "first do X, then Y", do X\n` +
-    `   before Y — even if Y looks easier from the current screen. If\n` +
-    `   the task says "Open <App>" and <App> isn't visible: your FIRST\n` +
-    `   action is to open it (cmd+space → type <App> → enter via\n` +
-    `   Spotlight). Don't tidy up unrelated apps/tabs/dialogs you see —\n` +
-    `   ignore them.\n` +
-    `\n` +
-    `2. DON'T CLICK IMAGINARY UI. If you describe a button/dialog/icon\n` +
-    `   and your prior action with the same description produced NO\n` +
-    `   screen change, that element is NOT on screen — your description\n` +
-    `   is a hallucination. STOP, re-observe, change strategy (try a\n` +
-    `   keyboard shortcut, press escape, or describe a different\n` +
-    `   visible element). Never emit the same hallucinated description\n` +
-    `   a third time.\n` +
+    `[TASK PRIORITY]\n` +
+    `1. Task text > screen state. Do task steps in the order written. If step 1 names an app that isn't visible, open it (cmd+space → type → enter) BEFORE anything else; ignore unrelated tabs/dialogs.\n` +
+    `2. If a described element produced no screen change in your last action, it's not there — change the description (or strategy), don't re-emit.\n` +
     `\n` +
     `[TASK TEXT]\n`;
   task = TASK_PRIORITY_PREAMBLE + task;

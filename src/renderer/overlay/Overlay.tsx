@@ -221,7 +221,7 @@ function IdleBody({
 }) {
   const placeholder =
     warmupState === "ready"
-      ? "Tell Holo3 what to do…"
+      ? "Tell Ponder what to do…"
       : warmupState === "warming"
         ? "Warming up…"
         : warmupState === "error"

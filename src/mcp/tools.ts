@@ -33,6 +33,34 @@ import type {
   ProviderClient,
 } from "../agent/types.js";
 import type { RouterClient } from "../agent/router.js";
+import {
+  createRecipeRecorder,
+  createSessionRecorder,
+  recordFromBridgeTranscript,
+  renderRecipeScript,
+  saveRecipe,
+  saveSession,
+  listRecipes,
+  listSessions,
+  loadRecipe,
+  loadSession,
+  pathsFor,
+  RECIPES_DIR,
+  SESSIONS_DIR,
+  recordAction,
+  snapshotTrace,
+  traceLength,
+  startNewTrace,
+  getTraceMeta,
+  buildRecipeFromTrace,
+  type RecipeRecorder,
+  type SessionRecorder,
+  type RecordedRecipe,
+  type RecordedSession,
+  type RecordedStep,
+} from "../agent/recorder.js";
+import { replaySession } from "../cli/sdk.js";
+import { PonderError } from "../errors.js";
 import { BUILD_INFO } from "./build-info.js";
 
 const stderrLog = (...args: unknown[]): void => {
@@ -198,6 +226,27 @@ async function ensureAttached(): Promise<string | null> {
   );
 }
 
+// ── Browser-ensure cache + Ponder session leases ─────────────────────
+//
+// `ponder_browser_ensure` short-circuits when the same session has
+// already been attached successfully — saves a snapshot round-trip on
+// every subsequent browser_* call. The cache is per-process and only
+// flags "attached"; the actual freshness check happens via
+// `browser.available()` inside the tool. Keys are Ponder session
+// names (default = "default"; HTTP bridge consumers will pass their
+// own key-derived name once auth lands).
+
+const browserEnsureCache = new Map<string, { attached: boolean }>();
+const ponderSessions = new Set<string>(["default"]);
+let defaultPonderSession = "default";
+
+/** Render a recipe script inline (no header), for embedding in tool
+ *  replies as a copy-paste block. Uses the same recorder codegen so
+ *  the output matches what's persisted to disk. */
+function renderRecipeScriptInline(recipe: RecordedRecipe): string {
+  return renderRecipeScript(recipe);
+}
+
 // ── Concurrency mutex for agent_do ───────────────────────────────────
 //
 // `agent_do` runs for tens of seconds and drives the user's ONE Chrome
@@ -333,6 +382,118 @@ async function tryBridgeScreenCall<T>(
   }
 }
 
+// ── Session-recorder helpers (shared between bridge + local path) ────
+//
+// Both paths through agent_do produce a RecordedSession (the local
+// path streams events into the recorder live; the bridge path parses
+// the returned transcript). We render the script block the same way
+// in both — that's what the orchestrator gets back in the MCP tool
+// reply, ready to copy-paste into the user's own Playwright suite OR
+// to feed into ponder_session_replay.
+//
+// renderScriptBlockFromRecorder uses the recorder's live state
+// (refLabels populated from real snapshots); renderScriptBlockFromSession
+// works off a RecordedSession reconstructed from a transcript (refLabels
+// best-effort).
+
+function renderScriptBlockFromRecorder(
+  recorder: SessionRecorder,
+  saved: { id: string; jsonPath: string; sessionPath: string } | null,
+): string {
+  return formatScriptBlock(
+    recorder.toSessionScript(),
+    saved,
+    recorder.getSession(),
+  );
+}
+
+function renderScriptBlockFromSession(
+  session: RecordedSession,
+  saved: { id: string; jsonPath: string; sessionPath: string } | null,
+): string {
+  // Reconstruct refLabels by feeding synthesized AX lines back into a
+  // transient recorder — keeps the generated script identical to the
+  // one persisted on disk regardless of which path produced the
+  // session.
+  const rec = createSessionRecorder({
+    task: session.task,
+    ...(session.provider ? { provider: session.provider } : {}),
+    ...(session.surface ? { surface: session.surface } : {}),
+  });
+  for (const step of session.steps) {
+    if (step.intent) rec.onHistory(step.intent);
+    if (step.refLabel) {
+      const refId =
+        typeof step.executed.payload.ref === "string"
+          ? (step.executed.payload.ref as string)
+          : "e1";
+      rec.onBrowserSnapshot({
+        url: step.url ?? "",
+        title: "",
+        ax: `[${refId}] ${step.refLabel.role}${step.refLabel.name ? ` "${step.refLabel.name}"` : ""}`,
+      });
+    }
+    rec.onAction(step.executed);
+  }
+  if (session.outcome) {
+    rec.setOutcome(session.outcome, session.error);
+  }
+  return formatScriptBlock(rec.toSessionScript(), saved, session);
+}
+
+function formatScriptBlock(
+  script: string,
+  saved: {
+    id: string;
+    jsonPath: string;
+    sessionPath: string;
+  } | null,
+  session: RecordedSession,
+): string {
+  if (session.steps.length === 0) {
+    return (
+      "\n\n— Session script —\n" +
+      "(no actions recorded — the run didn't emit any actions before " +
+      "terminating; nothing to replay)"
+    );
+  }
+  const lines: string[] = [];
+  lines.push("");
+  lines.push("");
+  lines.push("— Ponder session (Playwriter-flavored, defineSession()) —");
+  if (saved) {
+    lines.push(`Saved as id="${saved.id}":`);
+    lines.push(`  • code      ${saved.sessionPath}     (edit this file)`);
+    lines.push(`  • manifest  ${saved.jsonPath}     (source of truth)`);
+    lines.push("");
+    lines.push("Reuse / re-run / edit:");
+    lines.push(
+      `  ponder run    ${saved.id}          ${"".padEnd(0)}# terminal CLI`,
+    );
+    lines.push(
+      `  ponder run    ${saved.id} --watch  ${"".padEnd(0)}# edit-and-replay loop`,
+    );
+    lines.push(
+      `  ponder open   ${saved.id}          ${"".padEnd(0)}# open in $EDITOR`,
+    );
+    lines.push(
+      `  npx tsx       ${saved.sessionPath}   # run directly (no CLI)`,
+    );
+    lines.push(
+      `  ponder_session_replay({ id: "${saved.id}" })  # MCP tool, no LLM`,
+    );
+  } else {
+    lines.push(
+      "(disk persistence failed — script is below; copy it manually to reuse)",
+    );
+  }
+  lines.push("");
+  lines.push("```ts");
+  lines.push(script.trimEnd());
+  lines.push("```");
+  return lines.join("\n");
+}
+
 // MCP tool replies can mix text and image content parts. ok() / fail()
 // produce text-only results, but agent_do and screen_screenshot also
 // return images, so widen the type to admit both shapes.
@@ -346,13 +507,19 @@ type ToolResult =
 
 /** Forward an agent_do task to the Electron bridge. Returns:
  *   - { isError, payload } when the bridge handled the call
- *   - null when the bridge isn't reachable (caller should fall back) */
+ *   - null when the bridge isn't reachable (caller should fall back)
+ *
+ * `opts.surface` is recorded on the script preamble so the user sees
+ * what kind of OS surface the run was driving. `opts.rawTask` (vs
+ * `task` which has the [Surface: …] framing appended) is what the
+ * recorded session pins to disk — keeps the saved spec / id clean. */
 async function tryForwardToBridge(
   task: string,
   sendProgress: (msg: string) => Promise<void>,
-  opts?: { targetApp?: string },
+  opts?: { targetApp?: string; surface?: string; rawTask?: string },
 ): Promise<{ isError: boolean; payload: ToolResult } | null> {
   if (!(await bridgeAvailable())) return null;
+  const bridgeStartedAt = Date.now();
 
   await sendProgress(
     `Forwarding to Electron bridge at :${BRIDGE_PORT} (Holo3 app handles the work)` +
@@ -392,6 +559,28 @@ async function tryForwardToBridge(
         : result.outcome === "cancelled"
           ? "NOTE: 'cancelled' means the run stopped mid-flight (timeout or user stop). The final state is unknown until observed — call browser_snapshot AND screen_screenshot before deciding the next move."
           : null;
+    // Reconstruct a RecordedSession from the bridge's transcript so we
+    // can persist a Playwright script + JSON manifest the user can
+    // replay/edit later. The bridge doesn't currently forward
+    // onBrowserSnapshot or onHistory separately, so refLabels are best-
+    // effort (the parser only recovers the structured action lines +
+    // any thought lines preceding them). Still useful as a starting
+    // point — the user can refine the resulting script by hand.
+    const recordedSession = recordFromBridgeTranscript(
+      opts?.rawTask ?? task,
+      result.transcript,
+      {
+        outcome: result.outcome,
+        durationMs: Date.now() - bridgeStartedAt,
+        ...(result.finalUrl ? { finalUrl: result.finalUrl } : {}),
+        ...(opts?.surface ? { surface: opts.surface } : {}),
+        provider: "via-bridge",
+        ...(result.errorMessage ? { error: result.errorMessage } : {}),
+      },
+    );
+    const saved = await saveSession(recordedSession);
+    const scriptBlock = renderScriptBlockFromSession(recordedSession, saved);
+
     const header = [
       `Outcome: ${result.outcome} (via Electron bridge)`,
       `Steps: ${result.steps}`,
@@ -405,7 +594,7 @@ async function tryForwardToBridge(
       result.transcript.length > 0
         ? `\n\nTranscript:\n${result.transcript.join("\n")}`
         : "\n\n(no events emitted)";
-    const text = header + body;
+    const text = header + body + scriptBlock;
     if (result.outcome === "error") {
       return { isError: true, payload: fail(text) };
     }
@@ -735,7 +924,7 @@ export function registerTools(server: McpServer): void {
         const bridgeResult = await tryForwardToBridge(
           augmentedTask,
           sendProgress,
-          { targetApp },
+          { targetApp, surface, rawTask: task },
         );
         if (bridgeResult !== null) {
           stderrLog(
@@ -883,6 +1072,20 @@ export function registerTools(server: McpServer): void {
         let lastPng: Buffer | undefined;
         let stepCount = 0;
 
+        // Session recorder — captures every emitted action + the
+        // natural-language intent + the AX snapshot at the time of the
+        // action, so we can render a self-contained Playwright spec
+        // file at end-of-run. The user gets the script inline in the
+        // MCP reply AND on disk under ~/.holo3-agent/sessions/, so
+        // they can replay it later via ponder_session_replay or paste
+        // it into their own Playwright suite. The recorder is purely
+        // observational — it never changes runTask's behavior.
+        const recorder = createSessionRecorder({
+          task,
+          provider: provider.name,
+          surface,
+        });
+
         const events: AgentEvents = {
           onStatus: async (text) => {
             transcript.push(`${elapsed()} status: ${text}`);
@@ -906,6 +1109,11 @@ export function registerTools(server: McpServer): void {
             transcript.push(`${elapsed()} action: ${action.type}${payload}`);
             await sendProgress(`action: ${action.type}${payload}`);
             await persistStep({ kind: "action", action });
+            // Record the structured action so the post-run script
+            // generator can emit a Playwright statement for it. The
+            // recorder consumes the most recent onHistory text as the
+            // step's "intent" comment.
+            recorder.onAction(action);
           },
           onScreenshot: async (png) => {
             // Latch the latest frame for the final tool reply.
@@ -992,6 +1200,16 @@ export function registerTools(server: McpServer): void {
             shouldCancel: cancelled,
             onBrowserSnapshot: (snap) => {
               lastSnapshot = snap;
+              // Feed the snapshot to the recorder so it can resolve
+              // [eN] refs to role+name labels for the Playwright export.
+              recorder.onBrowserSnapshot(snap);
+            },
+            // Capture the brain's natural-language action text. This is
+            // what the recorder pairs with the next onAction event so
+            // each generated Playwright statement gets an "// click on
+            // the Open button"-style intent comment.
+            onHistory: (entry) => {
+              recorder.onHistory(entry);
             },
           });
           if (timedOut) outcome = "cancelled";
@@ -1036,7 +1254,22 @@ export function registerTools(server: McpServer): void {
             ? `\n\nTranscript:\n${transcript.join("\n")}`
             : "\n\n(no events emitted)";
 
-        const finalText = header + body;
+        // Finalize the recorder + persist to disk. We do this BEFORE
+        // building the response so the script block is part of the
+        // text the orchestrator (and the user) see in the tool reply.
+        // saveSession is best-effort — when it fails (disk full, perms
+        // denied) we still embed the script inline so the run isn't
+        // wasted.
+        recorder.setOutcome(outcome, errorMsg);
+        const saved = await saveSession(recorder);
+        if (saved) {
+          stderrLog(
+            `[mcp] agent_do session saved: id="${saved.id}" steps=${recorder.getSession().steps.length}`,
+          );
+        }
+        const scriptBlock = renderScriptBlockFromRecorder(recorder, saved);
+
+        const finalText = header + body + scriptBlock;
 
         // Persist the final agent_do response as a "result" step so the
         // History page shows what the orchestrator received. This is
@@ -1307,6 +1540,11 @@ export function registerTools(server: McpServer): void {
         await new Promise((r) => setTimeout(r, 800));
         const snap = await browser.snapshot();
         const note = snap.url !== url ? " (redirected)" : "";
+        recordAction({
+          type: "browser_navigate",
+          payload: { url },
+          url: snap.url,
+        });
         return ok(`Navigated to ${snap.url}${note}\nTitle: ${snap.title}`);
       } catch (e) {
         return fail(
@@ -1374,6 +1612,20 @@ export function registerTools(server: McpServer): void {
       if (not) return fail(not);
       try {
         await (await getBrowser()).click(ref);
+        // Record into the trace buffer with NO post-click snapshot.
+        // Earlier versions of this handler did a snapshot() right after
+        // the click to extract the [eN]'s role+name for the recipe
+        // codegen — but that:
+        //   1) added ~200-500ms latency to every click,
+        //   2) returned the POST-click page state (where the ref is
+        //      typically gone — clicks navigate or close modals),
+        //   3) raced with any navigation the click triggered.
+        // For direct MCP browser_click calls, the recipe codegen
+        // falls back to the `[data-holo-ref="eN"]` selector. The
+        // agent_do path still captures full refLabels via its own
+        // recorder.onBrowserSnapshot hook (see the agent_do handler
+        // below), where the snapshot was already taken anyway.
+        recordAction({ type: "browser_click", payload: { ref } });
         return ok(`Clicked ${ref}`);
       } catch (e) {
         return fail(
@@ -1427,6 +1679,10 @@ export function registerTools(server: McpServer): void {
         const names = paths
           .map((p) => p.split("/").pop() || p)
           .join(", ");
+        recordAction({
+          type: "browser_set_input_files",
+          payload: { ref, paths },
+        });
         return ok(
           `Attached ${paths.length} file${paths.length === 1 ? "" : "s"} to ${ref}: ${names}. ` +
             "Call browser_snapshot to verify the page accepted the upload " +
@@ -1484,6 +1740,10 @@ export function registerTools(server: McpServer): void {
         // the next snapshot the client takes. Matches the loop's
         // POST_TYPE_SETTLE_MS (1400ms).
         await new Promise((r) => setTimeout(r, 1400));
+        recordAction({
+          type: "browser_type",
+          payload: { ref, text, ...(submit ? { submit: true } : {}) },
+        });
         return ok(
           `Typed "${text}" into ${ref}${submit ? " and pressed Enter" : ""}. ` +
             "Call browser_snapshot next — autocomplete suggestions may have appeared.",
@@ -1522,9 +1782,24 @@ export function registerTools(server: McpServer): void {
         const browser = await getBrowser();
         if (ref) {
           await browser.scrollElement(ref, direction, amount);
+          recordAction({
+            type: "browser_scroll_element",
+            payload: {
+              ref,
+              dir: direction,
+              ...(amount !== undefined ? { amount } : {}),
+            },
+          });
           return ok(`Scrolled element ${ref} ${direction}`);
         } else {
           await browser.scrollPage(direction, amount);
+          recordAction({
+            type: "browser_scroll_page",
+            payload: {
+              dir: direction,
+              ...(amount !== undefined ? { amount } : {}),
+            },
+          });
           return ok(`Scrolled page ${direction}`);
         }
       } catch (e) {
@@ -1817,6 +2092,23 @@ export function registerTools(server: McpServer): void {
       }
       const tExec = Date.now() - t0 - tGround;
 
+      // Record into the trace buffer. The recorded type maps onto the
+      // codegen verbs (click / double_click / triple_click / right_click)
+      // so the generated recipe emits the right `screen.click(...)` call.
+      const recordType =
+        clickMode === "double"
+          ? "double_click"
+          : clickMode === "triple"
+            ? "triple_click"
+            : clickMode === "right"
+              ? "right_click"
+              : "click";
+      recordAction({
+        type: recordType,
+        payload: { x: screenX, y: screenY },
+        intent: target,
+      });
+
       // 5. Brief settle, then capture post-click screenshot for verification.
       await screen.sleep(300);
       let postPng: Buffer | undefined;
@@ -1974,6 +2266,12 @@ export function registerTools(server: McpServer): void {
       }
       const tExec = Date.now() - tExecStart;
 
+      recordAction({
+        type: "drag",
+        payload: { from: { x: fromX, y: fromY }, to: { x: toX, y: toY } },
+        intent: `drag "${from}" → "${to}"`,
+      });
+
       // 4. Post-drag screenshot for verification.
       await screen.sleep(300);
       let postPng: Buffer | undefined;
@@ -2111,18 +2409,37 @@ export function registerTools(server: McpServer): void {
         height: number;
         offsetX: number;
         offsetY: number;
+        scaleFactor?: number;
       }>("/screen/screenshot", {});
       let png: Buffer;
       let width: number;
       let height: number;
       let offsetX: number;
       let offsetY: number;
+      // scaleFactor = PNG physical pixels / logical pixels. Defaults to
+      // 1 (or auto-detected from PNG header) when the bridge is too old
+      // to surface it. Used below to scale crop coords from logical to
+      // physical so the server-side PIL crop hits the right region —
+      // without it, the server crops the top-left ¼ of where the target
+      // window actually is (the 2026-05-13 Retina regression).
+      let scaleFactor: number;
       if (bridgeShot) {
         png = Buffer.from(bridgeShot.pngBase64, "base64");
         width = bridgeShot.width;
         height = bridgeShot.height;
         offsetX = bridgeShot.offsetX;
         offsetY = bridgeShot.offsetY;
+        if (typeof bridgeShot.scaleFactor === "number") {
+          scaleFactor = bridgeShot.scaleFactor;
+        } else {
+          // Old bridge — derive from PNG bytes. PNG IHDR width is at
+          // offset 16 (big-endian uint32).
+          try {
+            scaleFactor = Math.max(1, png.readUInt32BE(16) / width);
+          } catch {
+            scaleFactor = 1;
+          }
+        }
       } else {
         try {
           const shot = await screen.screenshot();
@@ -2131,6 +2448,7 @@ export function registerTools(server: McpServer): void {
           height = shot.height;
           offsetX = shot.offsetX;
           offsetY = shot.offsetY;
+          scaleFactor = shot.scaleFactor;
         } catch (e) {
           return fail(
             `Screenshot failed: ${e instanceof Error ? e.message : String(e)}. ` +
@@ -2153,8 +2471,14 @@ export function registerTools(server: McpServer): void {
       // 1b. Optional window-bounds crop (defends against the embedded-
       //     screenshot decoy — see schema description for `targetApp`).
       //     We resolve the crop rect HERE so the same rect can be:
-      //       (a) sent to provider.groundBatch via its `crop` arg, AND
-      //       (b) used for client-side bounds validation of returned coords.
+      //       (a) sent to provider.groundBatch via its `crop` arg
+      //          (in PHYSICAL pixel coords — the server PIL-crops the
+      //          raw PNG bytes which are at physical resolution on
+      //          Retina), AND
+      //       (b) used for client-side bounds validation of returned
+      //          coords (in CROPPED-image LOGICAL space, since the
+      //          server returns coords normalized against the logical
+      //          crop size we tell it).
       //     If anything fails (non-darwin, perms denied, app not running,
       //     window-bounds query times out), we set `crop = null` and the
       //     rest of the pipeline behaves exactly like the un-targetApp path.
@@ -2183,7 +2507,17 @@ export function registerTools(server: McpServer): void {
             Math.min(height - clampedY, bounds.height + (cropY - clampedY)),
           );
           if (clampedW > 0 && clampedH > 0) {
-            crop = { x: clampedX, y: clampedY, w: clampedW, h: clampedH };
+            // Send the PHYSICAL crop rect to the server so its PIL crop
+            // slices the right region from the raw PNG bytes. Without
+            // this multiplication, on a Retina Mac we'd slice the
+            // top-left ¼ of where the target window actually is — the
+            // 2026-05-13 vision-quality regression.
+            crop = {
+              x: Math.round(clampedX * scaleFactor),
+              y: Math.round(clampedY * scaleFactor),
+              w: Math.round(clampedW * scaleFactor),
+              h: Math.round(clampedH * scaleFactor),
+            };
           } else {
             stderrLog(
               `[agent_click_sequence] targetApp="${targetApp}" window is fully offscreen ` +
@@ -2345,15 +2679,29 @@ export function registerTools(server: McpServer): void {
         const step = steps[i]!;
         const r = groundResults[i]!;
         // ground errors filtered above — r.x / r.y safe here.
-        // When `crop` was applied (batch path only — the parallel-
-        // fallback ignores crop because single ground() has no such
-        // arg), the returned coords are in CROPPED-image space. Add
-        // the crop offset to translate back into the captured frame,
-        // then add the display offset to translate into screen space.
-        const xInFrame = crop && groundPath === "batch" ? r.x + crop.x : r.x;
-        const yInFrame = crop && groundPath === "batch" ? r.y + crop.y : r.y;
-        const screenX = xInFrame + offsetX;
-        const screenY = yInFrame + offsetY;
+        //
+        // Two coord systems:
+        //   • CROPPED batch path: `crop` is in PHYSICAL pixels (server
+        //     PIL-cropped the raw PNG bytes at physical resolution).
+        //     The model returned r.x/r.y in PHYSICAL coords within the
+        //     cropped image (since we passed `screen=[crop.w, crop.h]`
+        //     where those are physical). Translate by adding the
+        //     physical crop offset, then divide by scaleFactor to get
+        //     LOGICAL pixels, then add the logical display offset.
+        //   • UNCROPPED / parallel fallback: r.x/r.y are already LOGICAL
+        //     (server saw the full PNG, we told it `screen=[logical]`).
+        //     Just add the display offset.
+        let screenX: number;
+        let screenY: number;
+        if (crop && groundPath === "batch") {
+          const xPhysInFrame = r.x + crop.x;
+          const yPhysInFrame = r.y + crop.y;
+          screenX = xPhysInFrame / scaleFactor + offsetX;
+          screenY = yPhysInFrame / scaleFactor + offsetY;
+        } else {
+          screenX = r.x + offsetX;
+          screenY = r.y + offsetY;
+        }
         const clickMode = step.mode ?? "single";
         const bridgedClick = await tryBridgeScreenCall<{ ok: boolean }>(
           "/screen/click",
@@ -2389,6 +2737,19 @@ export function registerTools(server: McpServer): void {
           screenX,
           screenY,
           viaBridge: !!bridgedClick?.ok,
+        });
+        const recordType =
+          clickMode === "double"
+            ? "double_click"
+            : clickMode === "triple"
+              ? "triple_click"
+              : clickMode === "right"
+                ? "right_click"
+                : "click";
+        recordAction({
+          type: recordType,
+          payload: { x: screenX, y: screenY },
+          intent: step.target,
         });
         // Don't delay after the LAST click — we go straight to the post-shot
         // settle, no point doubling the wait. Per-step override beats the
@@ -2468,6 +2829,781 @@ export function registerTools(server: McpServer): void {
         });
       }
       return { content: responseContent };
+    },
+  );
+
+  // ── BROWSER ENSURE: one entry point for "make a tab driveable" ────
+  //
+  // Today, half a dozen failure modes happen between "agent calls a
+  // tool" and "a tab is driving" — Chrome not running, extension not
+  // installed, no green tab, wrong URL. Roll them all into ONE entry
+  // point so the agent never has to reason about them. The vision
+  // model handles the green-icon click; the OS launchers handle the
+  // "Chrome isn't even running" case; the URL/tab matching handles
+  // the rest.
+
+  server.registerTool(
+    "ponder_browser_ensure",
+    {
+      title: `${MCP_BRAND}: Ensure a Chrome tab is attached and ready`,
+      description:
+        "One-shot cold-start: makes sure Chrome is running, the Playwriter " +
+        "extension is installed, a tab is attached (vision will click the green " +
+        "icon if needed), and — if `url` is supplied — that tab is on the " +
+        "right page (navigates or switches tabs as needed). Returns " +
+        "{ url, title, viaLaunch?, viaAttach? }. ALWAYS call this before any " +
+        "browser_* tool in a fresh session — replaces the old 'click the green " +
+        "Playwriter icon yourself' instruction. Caches success for the lifetime " +
+        "of this MCP process so subsequent calls short-circuit." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        url: z
+          .string()
+          .optional()
+          .describe(
+            "Optional URL to ensure the attached tab is on. If a different tab " +
+              "matches, switches to it; otherwise navigates the current one.",
+          ),
+        tabHint: z
+          .string()
+          .optional()
+          .describe(
+            "Optional URL substring to prefer when multiple tabs are attached.",
+          ),
+        launch: z
+          .enum(["user", "managed"])
+          .optional()
+          .describe(
+            "Where to launch Chrome from when it isn't running. 'user' " +
+              "(default) opens the user's Chrome with their profile + extensions. " +
+              "'managed' spawns a clean Playwriter-managed Chromium for isolation.",
+          ),
+        session: z
+          .string()
+          .optional()
+          .describe(
+            "Optional Ponder session name. Defaults to 'default'. Used for " +
+              "isolation across parallel agent flows in the same process.",
+          ),
+      },
+    },
+    async ({ url, tabHint, launch, session: sessionName }) => {
+      const session = sessionName ?? "default";
+      const launchMode = launch ?? "user";
+      const wantUrl = url ?? null;
+      const wantHint = tabHint ?? null;
+
+      // State 1: already attached on the right tab → return immediately.
+      const cached = browserEnsureCache.get(session);
+      if (cached && cached.attached) {
+        try {
+          const browser = await getBrowser();
+          if (await browser.available()) {
+            const snap = await browser.snapshot();
+            if (
+              !wantUrl ||
+              snap.url === wantUrl ||
+              snap.url.startsWith(wantUrl)
+            ) {
+              return ok(
+                `Already attached to ${snap.url} (session "${session}"). ` +
+                  `Title: ${snap.title}`,
+              );
+            }
+          }
+        } catch {
+          /* fall through to full state machine */
+        }
+      }
+
+      // State 2/3/4: try to attach. We use a lightweight, mostly best-
+      // effort flow:
+      //   • Try browser.available() first.
+      //   • If false, try opening Chrome (state 2) — `open -a "Google Chrome"`.
+      //   • Then dispatch a vision agent_do to "Click the green Playwriter
+      //     icon" — vision handles the wait + click.
+      //   • Poll available() for up to ~6s.
+      const browser = await getBrowser();
+      let viaLaunch: string | undefined;
+      let viaAttach = false;
+
+      if (!(await browser.available())) {
+        if (launchMode === "user" && process.platform === "darwin") {
+          try {
+            const { spawn } = await import("node:child_process");
+            spawn("open", ["-a", "Google Chrome"], { detached: true }).unref();
+            viaLaunch = "user";
+          } catch {
+            /* best-effort */
+          }
+        } else if (launchMode === "managed") {
+          // Managed Chromium = spawn a Playwriter `browser start` here in
+          // a follow-up; for now we surface that the user can `playwriter
+          // browser start` themselves. Auto-launching managed Chromium
+          // requires `playwriter` CLI on PATH (gated by `ponder setup`).
+          viaLaunch = "managed";
+        }
+        for (let i = 0; i < 25; i++) {
+          await screen.sleep(200);
+          if (await browser.available()) break;
+        }
+      }
+
+      if (!(await browser.available())) {
+        // Bridge-based vision click: the agent_do "click the green
+        // Playwriter icon" prompt is the user-gesture proxy.
+        viaAttach = true;
+        try {
+          const bridged = await tryForwardToBridge(
+            "Click the green Playwriter extension icon in Chrome's toolbar to attach this tab to Playwriter. " +
+              (wantHint ? `Prefer the tab whose URL contains "${wantHint}". ` : "") +
+              "Surface: menu-bar.",
+            async () => {},
+            { surface: "menu-bar" },
+          );
+          if (bridged && !bridged.isError) {
+            // Vision flow ran — give the relay 2-3s to register.
+            for (let i = 0; i < 15; i++) {
+              await screen.sleep(200);
+              if (await browser.available()) break;
+            }
+          }
+        } catch {
+          /* swallow — handled by available() check below */
+        }
+      }
+
+      if (!(await browser.available())) {
+        const env = new PonderError("BROWSER_NOT_ATTACHED", {
+          message:
+            "Could not attach a Chrome tab to Playwriter even after auto-attach.",
+          hint:
+            "Verify the Playwriter extension is installed at " +
+            "https://playwriter.dev. Then re-call ponder_browser_ensure.",
+        }).toEnvelope();
+        return fail(PonderError.format(env));
+      }
+
+      // Optional URL targeting.
+      let snap = await browser.snapshot();
+      if (wantUrl && !snap.url.startsWith(wantUrl)) {
+        // Try switching to a matching tab first.
+        let switched = false;
+        try {
+          const tabs = await browser.listTabs();
+          const match = tabs.find(
+            (t) =>
+              t.url === wantUrl ||
+              t.url.startsWith(wantUrl) ||
+              (wantHint && t.url.toLowerCase().includes(wantHint.toLowerCase())),
+          );
+          if (match && !match.isCurrent) {
+            await browser.switchTab({ index: match.index });
+            snap = await browser.snapshot();
+            switched = true;
+          }
+        } catch {
+          /* fall through */
+        }
+        if (!switched) {
+          await browser.navigate(wantUrl);
+          await screen.sleep(700);
+          snap = await browser.snapshot();
+        }
+      }
+
+      browserEnsureCache.set(session, { attached: true });
+
+      const parts: string[] = [];
+      parts.push(`Attached. URL: ${snap.url}`);
+      parts.push(`Title: ${snap.title}`);
+      parts.push(`Session: ${session}`);
+      if (viaLaunch) parts.push(`viaLaunch: ${viaLaunch}`);
+      if (viaAttach) parts.push(`viaAttach: true (vision)`);
+      return ok(parts.join("\n"));
+    },
+  );
+
+  // ── PONDER SESSIONS (lightweight names over Playwriter sessions) ──
+  //
+  // A Ponder session is a logical name a consumer (the MCP process,
+  // or an HTTP bridge consumer like anorha) uses to isolate its
+  // browser state. One process can hold many named sessions; the
+  // default session is "default".
+  //
+  // These tools are intentionally thin — Playwriter still owns the
+  // execution-sandbox abstraction; Ponder just labels the lease so
+  // parallel agents don't stomp on each other's tabs.
+
+  server.registerTool(
+    "ponder_session_new",
+    {
+      title: `${MCP_BRAND}: Create a named Ponder session`,
+      description:
+        "Reserve a named session for isolation. Multiple sessions can run " +
+        "in parallel without sharing tabs/cookies." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        name: z
+          .string()
+          .min(1)
+          .max(40)
+          .regex(/^[a-zA-Z0-9_-]+$/)
+          .describe("Session name. Letters, digits, '-' and '_' only."),
+      },
+    },
+    async ({ name }) => {
+      ponderSessions.add(name);
+      return ok(`Created session "${name}". Pass session: "${name}" to ponder_browser_ensure.`);
+    },
+  );
+
+  server.registerTool(
+    "ponder_session_use",
+    {
+      title: `${MCP_BRAND}: Switch the default Ponder session`,
+      description:
+        "Change which named session subsequent ponder_browser_ensure / " +
+        "browser_* calls default to when no `session` is passed." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        name: z.string().min(1).max(40).regex(/^[a-zA-Z0-9_-]+$/),
+      },
+    },
+    async ({ name }) => {
+      defaultPonderSession = name;
+      ponderSessions.add(name);
+      return ok(`Default Ponder session is now "${name}".`);
+    },
+  );
+
+  server.registerTool(
+    "ponder_session_list",
+    {
+      title: `${MCP_BRAND}: List active Ponder sessions`,
+      description:
+        "Enumerate the named sessions reserved in this MCP process. " +
+        "Marks the current default with *." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {},
+    },
+    async () => {
+      if (ponderSessions.size === 0) {
+        return ok(`No named sessions reserved. Default is "${defaultPonderSession}".`);
+      }
+      const lines = [...ponderSessions].map(
+        (s) => `  ${s === defaultPonderSession ? "*" : " "} ${s}`,
+      );
+      return ok(`Active Ponder sessions:\n${lines.join("\n")}`);
+    },
+  );
+
+  // ── RECIPE BUFFER: control the process-wide trace buffer ──────────
+  //
+  // Every browser_* / screen_* tool call (and every agent_do internal
+  // action) is appended to a single rolling trace buffer (see
+  // recordAction in src/agent/recorder.ts). These tools control that
+  // buffer:
+  //
+  //   • ponder_recipe_start  — clear the buffer; mark "I'm starting a flow"
+  //   • ponder_recipe_buffer — read the current buffer (no save)
+  //   • ponder_recipe_save   — snapshot the buffer into a saved recipe
+
+  server.registerTool(
+    "ponder_recipe_start",
+    {
+      title: `${MCP_BRAND}: Mark the start of a new recipe recording`,
+      description:
+        "Clear the process-wide trace buffer and mark this point as the " +
+        "start of a new logical flow. OPTIONAL — every action is recorded " +
+        "regardless; calling start just gives you a clean buffer + a task " +
+        "label for the eventual ponder_recipe_save. Use it at the top of " +
+        "any multi-step flow you intend to save as a reusable recipe." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        task: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Human-readable description of the flow. Surfaced as the recipe " +
+              "title when saved.",
+          ),
+      },
+    },
+    async ({ task }) => {
+      startNewTrace({ ...(task ? { task } : {}) });
+      const meta = getTraceMeta();
+      return ok(
+        `Started recipe trace at ${meta.startedAt}. ` +
+          `Task: ${meta.task}. Call ponder_recipe_save when the flow finishes.`,
+      );
+    },
+  );
+
+  server.registerTool(
+    "ponder_recipe_buffer",
+    {
+      title: `${MCP_BRAND}: Peek at the current trace buffer`,
+      description:
+        "Read the current process-wide trace buffer without saving. Returns " +
+        "the action count + a compact list of recent actions. Useful when " +
+        "the orchestrator wants to inspect what's been captured before " +
+        "deciding whether to ponder_recipe_save." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        fromIndex: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Optional starting index — slice from this offset to the end.",
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Cap on entries shown in the reply (default 25)."),
+      },
+    },
+    async ({ fromIndex, limit }) => {
+      const steps = snapshotTrace(fromIndex);
+      const meta = getTraceMeta();
+      const cap = limit ?? 25;
+      const shown = steps.slice(-cap);
+      const lines = shown.map((s, i) => {
+        const idx = (steps.length - shown.length + i + 1).toString().padStart(3);
+        const payload = JSON.stringify(s.executed.payload).slice(0, 80);
+        return `  ${idx}. ${s.executed.type} ${payload}${
+          s.intent ? `  // ${s.intent.slice(0, 60)}` : ""
+        }`;
+      });
+      return ok(
+        `Trace buffer: ${steps.length} action${steps.length === 1 ? "" : "s"} ` +
+          `(task="${meta.task}", started ${meta.startedAt}).\n` +
+          (lines.length > 0
+            ? `Last ${shown.length}:\n${lines.join("\n")}`
+            : "(empty — nothing captured yet)"),
+      );
+    },
+  );
+
+  server.registerTool(
+    "ponder_recipe_save",
+    {
+      title: `${MCP_BRAND}: Save the current trace as a reusable recipe`,
+      description:
+        "Snapshot the process-wide trace buffer (or a slice starting at " +
+        "fromIndex) into a saved recipe on disk under ~/.ponder/recipes/. " +
+        "Returns the recipe id + paths + a code block with the generated " +
+        "Playwright body. The recipe is replayable via ponder_recipe_replay " +
+        "or `ponder run <id>` (no LLM in the loop)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional id override. By default we derive it from the task " +
+              "title + start timestamp.",
+          ),
+        task: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional task description. Falls back to the value set in " +
+              "ponder_recipe_start (or 'ponder-trace').",
+          ),
+        fromIndex: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Optional starting index — save only the slice from here to the end.",
+          ),
+      },
+    },
+    async ({ task, fromIndex }) => {
+      const recipe = buildRecipeFromTrace({
+        ...(task ? { task } : {}),
+        ...(fromIndex !== undefined ? { fromIndex } : {}),
+      });
+      if (recipe.steps.length === 0) {
+        return fail(
+          PonderError.format(
+            new PonderError("RECIPE_EMPTY", {
+              message: "No actions in the trace buffer — nothing to save.",
+              hint:
+                "Call a browser_* or screen_* tool first, then re-try " +
+                "ponder_recipe_save. (Or call ponder_recipe_start to clear " +
+                "an old buffer.)",
+            }).toEnvelope(),
+          ),
+        );
+      }
+      const saved = await saveRecipe(recipe);
+      if (!saved) {
+        return fail(
+          PonderError.format(
+            new PonderError("RECIPE_SAVE_FAILED", {
+              message: "Disk write failed; recipe was NOT persisted.",
+              hint:
+                `Verify ~/.ponder/recipes/ is writable. Recipe in-memory still ` +
+                `intact (${recipe.steps.length} steps).`,
+            }).toEnvelope(),
+          ),
+        );
+      }
+      const script = renderRecipeScriptInline(recipe);
+      return ok(
+        `Saved recipe "${saved.id}" (${recipe.steps.length} step${
+          recipe.steps.length === 1 ? "" : "s"
+        }).\n` +
+          `  • code      ${saved.recipePath}\n` +
+          `  • manifest  ${saved.jsonPath}\n\n` +
+          `Re-run via:\n` +
+          `  ponder run    ${saved.id}\n` +
+          `  ponder_recipe_replay({ id: "${saved.id}" })\n\n` +
+          `\`\`\`ts\n${script.trimEnd()}\n\`\`\``,
+      );
+    },
+  );
+
+  // ── RECIPE STORE: list / show / replay (recipe-named) ─────────────
+  //
+  // Renamed from ponder_session_*. The legacy names stay registered
+  // below as redirect stubs so old orchestrator code keeps working.
+
+  server.registerTool(
+    "ponder_recipe_list",
+    {
+      title: `${MCP_BRAND}: List recorded recipes`,
+      description:
+        "Enumerate every recipe recorded to disk under ~/.ponder/recipes/. " +
+        "Each entry shows the recipe id, the original task, when it ran, the " +
+        "outcome, the step count, and the absolute paths to the JSON manifest " +
+        "and the .recipe.ts Playwright script. Use this when the user says " +
+        "'show me my recordings', 'what have I run?', 'find the upload from " +
+        "yesterday', etc. Newest first." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("Cap on rows returned (default 25)."),
+        contains: z
+          .string()
+          .optional()
+          .describe(
+            "Case-insensitive substring filter on the task text.",
+          ),
+      },
+    },
+    async ({ limit, contains }) => {
+      const entries = await listRecipes();
+      const filtered = contains
+        ? entries.filter((e) =>
+            e.task.toLowerCase().includes(contains.toLowerCase()),
+          )
+        : entries;
+      const max = limit ?? 25;
+      const shown = filtered.slice(0, max);
+      if (shown.length === 0) {
+        return ok(
+          contains
+            ? `No recipes match "${contains}". (${entries.length} total in ${RECIPES_DIR})`
+            : `No recipes recorded yet — run agent_do or any browser_*/screen_* ` +
+                `tool and call ponder_recipe_save when the flow finishes. ` +
+                `Recipes land in ${RECIPES_DIR}.`,
+        );
+      }
+      const rows = shown.map((e) => {
+        const dur =
+          e.durationMs !== undefined
+            ? ` ${(e.durationMs / 1000).toFixed(1)}s`
+            : "";
+        const outcome = e.outcome ? ` [${e.outcome}]` : "";
+        return (
+          `• ${e.id}\n` +
+          `    task: ${e.task.slice(0, 100)}${e.task.length > 100 ? "…" : ""}\n` +
+          `    ${e.startedAt}${outcome}${dur}  ${e.steps} step${e.steps === 1 ? "" : "s"}\n` +
+          `    code:     ${e.recipePath}\n` +
+          `    manifest: ${e.jsonPath}`
+        );
+      });
+      const footer =
+        filtered.length > shown.length
+          ? `\n\n…and ${filtered.length - shown.length} more (raise \`limit\` to see them).`
+          : "";
+      return ok(
+        `${shown.length} of ${filtered.length} recipe(s) ` +
+          `from ${RECIPES_DIR}:\n\n${rows.join("\n\n")}${footer}\n\n` +
+          `Open a recipe with ponder_recipe_show({ id: "..." }) ` +
+          `or replay one with ponder_recipe_replay({ id: "..." }). ` +
+          `From the terminal: \`ponder run <id>\`.`,
+      );
+    },
+  );
+
+  server.registerTool(
+    "ponder_recipe_show",
+    {
+      title: `${MCP_BRAND}: Show a recorded recipe (.recipe.ts or .json)`,
+      description:
+        "Read a saved recipe's contents — the editable .recipe.ts file " +
+        "(default) or the JSON manifest. Returns the file in a fenced code " +
+        "block so the orchestrator can echo, edit, or extract pieces." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        id: z
+          .string()
+          .min(1)
+          .describe(
+            "Recipe id from ponder_recipe_list.",
+          ),
+        format: z
+          .enum(["code", "json", "both"])
+          .optional()
+          .describe(
+            "'code' = the editable .recipe.ts file (default). " +
+              "'json' = the manifest. 'both' = concatenated.",
+          ),
+      },
+    },
+    async ({ id, format }) => {
+      const { jsonPath, recipePath } = pathsFor(id);
+      const want = format ?? "code";
+      const fsp = await import("node:fs/promises");
+      const out: string[] = [];
+      if (want === "code" || want === "both") {
+        try {
+          const code = await fsp.readFile(recipePath, "utf-8");
+          out.push(
+            `# ${recipePath}\n\n\`\`\`ts\n${code.trimEnd()}\n\`\`\``,
+          );
+        } catch (e) {
+          return fail(
+            `Could not read recipe code at ${recipePath}: ${
+              e instanceof Error ? e.message : String(e)
+            }. Call ponder_recipe_list to see available ids.`,
+          );
+        }
+      }
+      if (want === "json" || want === "both") {
+        try {
+          const json = await fsp.readFile(jsonPath, "utf-8");
+          out.push(`# ${jsonPath}\n\n\`\`\`json\n${json.trimEnd()}\n\`\`\``);
+        } catch (e) {
+          if (want === "json") {
+            return fail(
+              `Could not read manifest at ${jsonPath}: ${
+                e instanceof Error ? e.message : String(e)
+              }. Call ponder_recipe_list to see available ids.`,
+            );
+          }
+          out.push(
+            `# ${jsonPath}\n\n(manifest missing — recipe may have been edited or pruned)`,
+          );
+        }
+      }
+      return ok(out.join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "ponder_recipe_replay",
+    {
+      title: `${MCP_BRAND}: Replay a recipe — no LLM in the loop`,
+      description:
+        "Re-execute every step from a saved recipe manifest, in order, " +
+        "natively through the same executors agent_do uses (Playwright for " +
+        "browser_* actions, screen.* primitives for OS-level mouse / " +
+        "keyboard). NO vision model, NO planner, NO router — deterministic " +
+        "script. " +
+        "For OS-level coordinate clicks, pass `reground: true` to re-ground " +
+        "via the vision model using the step's intent text (recommended for " +
+        "any replay across sessions)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        id: z
+          .string()
+          .min(1)
+          .describe("Recipe id from ponder_recipe_list."),
+        reground: z
+          .boolean()
+          .optional()
+          .describe(
+            "Re-ground OS-level coordinate clicks via the vision model. " +
+              "Recommended for cross-session replay.",
+          ),
+        stepDelayMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(10_000)
+          .optional()
+          .describe("Pause between steps in ms. Default 400."),
+      },
+    },
+    async ({ id, reground, stepDelayMs }) => {
+      const recipe = await loadRecipe(id);
+      if (!recipe) {
+        return fail(
+          PonderError.format(
+            new PonderError("RECIPE_NOT_FOUND", {
+              message: `Recipe "${id}" not found.`,
+              hint: `Call ponder_recipe_list to see available ids (or check ${RECIPES_DIR}).`,
+            }).toEnvelope(),
+          ),
+        );
+      }
+      if (recipe.steps.length === 0) {
+        return ok(`Recipe "${id}" has 0 recorded steps — nothing to replay.`);
+      }
+      const browser = await getBrowserOrNull();
+      let provider: ProviderClient | null = null;
+      if (reground) {
+        try {
+          ({ provider } = await getProviderWarmed());
+        } catch (e) {
+          return fail(
+            `reground=true requires a configured provider: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        }
+      }
+
+      const lines: string[] = [];
+      const t0 = Date.now();
+      const result = await replaySession(recipe, {
+        reground: !!reground,
+        ...(stepDelayMs !== undefined ? { stepDelayMs } : {}),
+        browser,
+        provider,
+        onStep: ({ index, step, status, error, ms }) => {
+          const label = step.intent
+            ? `"${step.intent.slice(0, 60)}"`
+            : step.executed.type;
+          if (status === "ok") {
+            lines.push(
+              `  ${index + 1}. ${step.executed.type} ${label} → ok (${ms}ms)`,
+            );
+          } else {
+            lines.push(
+              `  ${index + 1}. ${step.executed.type} ${label} → FAILED: ${(error ?? "").slice(0, 160)}`,
+            );
+          }
+        },
+      });
+      const summary =
+        `Replayed recipe "${id}": ` +
+        `${result.ok}/${recipe.steps.length} steps ok, ${result.failed} failed ` +
+        `(${((Date.now() - t0) / 1000).toFixed(1)}s).\n\n` +
+        `Per-step results:\n${lines.join("\n")}\n\n` +
+        (result.failed > 0
+          ? `Replay halted at the first failure. Edit ${pathsFor(id).jsonPath} ` +
+            `or re-record.`
+          : `All steps succeeded. The recipe is reusable as-is.`);
+      if (result.failed > 0) return fail(summary);
+      return ok(summary);
+    },
+  );
+
+  // ── Legacy aliases (ponder_session_*) — redirect to ponder_recipe_*
+  //
+  // Old orchestrator code may still call ponder_session_show / _replay.
+  // We keep them registered so the calls succeed; each just delegates to
+  // the recipe-named equivalent. `ponder_session_list` is NOT aliased
+  // because the new Ponder-session lease tool now owns that name (it
+  // lists active leases, not recipes — callers wanting the old behavior
+  // should switch to `ponder_recipe_list`).
+
+  server.registerTool(
+    "ponder_session_show",
+    {
+      title: `${MCP_BRAND}: Show recording (alias for ponder_recipe_show)`,
+      description:
+        "Legacy alias for ponder_recipe_show. Same behavior; prefer the new name." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        id: z.string().min(1),
+        format: z.enum(["code", "json", "both"]).optional(),
+      },
+    },
+    async ({ id, format }) => {
+      const { jsonPath, recipePath } = pathsFor(id);
+      const want = format ?? "code";
+      const fsp = await import("node:fs/promises");
+      const out: string[] = [];
+      if (want === "code" || want === "both") {
+        try {
+          const code = await fsp.readFile(recipePath, "utf-8");
+          out.push(`# ${recipePath}\n\n\`\`\`ts\n${code.trimEnd()}\n\`\`\``);
+        } catch (e) {
+          return fail(`Could not read recipe code at ${recipePath}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (want === "json" || want === "both") {
+        try {
+          const json = await fsp.readFile(jsonPath, "utf-8");
+          out.push(`# ${jsonPath}\n\n\`\`\`json\n${json.trimEnd()}\n\`\`\``);
+        } catch (e) {
+          if (want === "json") {
+            return fail(`Could not read manifest at ${jsonPath}: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      }
+      return ok(out.join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "ponder_session_replay",
+    {
+      title: `${MCP_BRAND}: Replay recording (alias for ponder_recipe_replay)`,
+      description:
+        "Legacy alias for ponder_recipe_replay. Same behavior; prefer the new name." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        id: z.string().min(1),
+        reground: z.boolean().optional(),
+        stepDelayMs: z.number().int().min(0).max(10_000).optional(),
+      },
+    },
+    async ({ id, reground, stepDelayMs }) => {
+      const recipe = await loadRecipe(id);
+      if (!recipe) return fail(`Recipe "${id}" not found.`);
+      if (recipe.steps.length === 0) return ok(`Recipe "${id}" has 0 steps.`);
+      const browser = await getBrowserOrNull();
+      let provider: ProviderClient | null = null;
+      if (reground) {
+        try {
+          ({ provider } = await getProviderWarmed());
+        } catch (e) {
+          return fail(
+            `reground=true requires a configured provider: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      const result = await replaySession(recipe, {
+        reground: !!reground,
+        ...(stepDelayMs !== undefined ? { stepDelayMs } : {}),
+        browser,
+        provider,
+      });
+      const summary = `Replayed "${id}": ${result.ok}/${recipe.steps.length} steps ok, ${result.failed} failed.`;
+      if (result.failed > 0) return fail(summary);
+      return ok(summary);
     },
   );
 
@@ -2653,6 +3789,10 @@ export function registerTools(server: McpServer): void {
         { text, ...(thenPress ? { thenPress } : {}) },
       );
       if (bridged?.ok) {
+        recordAction({
+          type: "type",
+          payload: { text, ...(thenPress ? { thenPress } : {}) },
+        });
         return ok(
           `typed "${text.length > 60 ? text.slice(0, 57) + "..." : text}"` +
             (thenPress ? ` and pressed ${thenPress}` : "") +
@@ -2665,6 +3805,10 @@ export function registerTools(server: McpServer): void {
           await screen.sleep(120);
           await screen.pressCombo(thenPress);
         }
+        recordAction({
+          type: "type",
+          payload: { text, ...(thenPress ? { thenPress } : {}) },
+        });
         return ok(
           `typed "${text.length > 60 ? text.slice(0, 57) + "..." : text}"` +
             (thenPress ? ` and pressed ${thenPress}` : ""),
@@ -2705,10 +3849,12 @@ export function registerTools(server: McpServer): void {
         { combo },
       );
       if (bridged?.ok) {
+        recordAction({ type: "key", payload: { combo } });
         return ok(`pressed ${combo} (via Electron bridge)`);
       }
       try {
         await screen.pressCombo(combo);
+        recordAction({ type: "key", payload: { combo } });
         return ok(`pressed ${combo}`);
       } catch (e) {
         return fail(
@@ -2747,6 +3893,10 @@ export function registerTools(server: McpServer): void {
         { direction, ...(amount !== undefined ? { amount } : {}) },
       );
       if (bridged?.ok) {
+        recordAction({
+          type: "scroll",
+          payload: { direction, amount: bridged.ticks },
+        });
         return ok(
           `scrolled ${direction} ${bridged.ticks} ticks (via Electron bridge)`,
         );
@@ -2756,6 +3906,10 @@ export function registerTools(server: McpServer): void {
         const ticks = Math.max(SCROLL_FLOOR, amount ?? SCROLL_FLOOR);
         const signed = direction === "up" ? ticks : -ticks;
         await screen.scroll(signed);
+        recordAction({
+          type: "scroll",
+          payload: { direction, amount: ticks },
+        });
         return ok(`scrolled ${direction} ${ticks} ticks`);
       } catch (e) {
         return fail(
@@ -2787,6 +3941,7 @@ export function registerTools(server: McpServer): void {
     },
     async ({ ms }) => {
       await screen.sleep(ms);
+      recordAction({ type: "wait", payload: { ms } });
       return ok(`waited ${ms}ms`);
     },
   );
@@ -2897,6 +4052,12 @@ export function registerTools(server: McpServer): void {
 export const TOOL_NAMES = [
   // High-level: hand off a focused subtask to the inner Holo3 loop
   "agent_do",
+  // Cold-start one-shot: ensure Chrome + extension + tab are ready
+  "ponder_browser_ensure",
+  // Ponder session management (lightweight names over Playwriter sessions)
+  "ponder_session_new",
+  "ponder_session_use",
+  "ponder_session_list",
   // In-page browser control (Playwriter / Chrome accessibility refs)
   "browser_status",
   "browser_list_tabs",
@@ -2919,13 +4080,22 @@ export const TOOL_NAMES = [
   "screen_hotkey",
   "screen_scroll_os",
   "screen_wait",
-  // Redirect stubs — registered so the orchestrator's hallucinated
-  // tool names hit a friendly handler instead of "tool not found".
-  // They never execute; they return a redirect to the real agent_*
-  // primitive with the same args.
+  // Redirect stubs
   "screen_click",
   "screen_drag",
   "screen_observe",
+  // Recipe recording — process-wide trace buffer + saved recipe store.
+  // Every browser_* / screen_* / agent_do action flows through the same
+  // buffer; ponder_recipe_save snapshots it into a replayable recipe.
+  "ponder_recipe_start",
+  "ponder_recipe_buffer",
+  "ponder_recipe_save",
+  "ponder_recipe_list",
+  "ponder_recipe_show",
+  "ponder_recipe_replay",
+  // Legacy aliases for ponder_recipe_* — kept registered so old code works.
+  "ponder_session_show",
+  "ponder_session_replay",
   // Diagnostic
   "holo3_version",
 ] as const;

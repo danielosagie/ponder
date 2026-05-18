@@ -57,13 +57,16 @@ try {
 
 export const BACKGROUND_MODE = cliclickPath !== null;
 
+// Use console.error so the line stays out of stdout — important for
+// CLI consumers piping output (e.g. `ponder show <id> --json | jq`).
+// It's purely informational; never load-bearing.
 if (cliclickPath) {
-  console.log(
+  console.error(
     `[screen] cliclick detected at ${cliclickPath} — BACKGROUND MODE: ` +
       "agent clicks fire at coordinates without moving your cursor.",
   );
 } else if (process.platform === "darwin") {
-  console.log(
+  console.error(
     "[screen] cliclick not found. Agent will move your cursor on each " +
       "click (foreground mode). Run `brew install cliclick` to switch to " +
       "background mode where your mouse stays put.",
@@ -77,9 +80,12 @@ async function cliclickRun(...args: string[]): Promise<void> {
 
 export interface Screenshot {
   png: Buffer;
-  /** Logical width of the captured display (NOT the user's whole desktop). */
+  /** Logical width of the captured display (NOT the user's whole desktop).
+   *  This is the coordinate system click coords use, NOT the PNG byte
+   *  dimensions — on Retina the PNG is `width * scaleFactor` pixels wide. */
   width: number;
-  /** Logical height of the captured display. */
+  /** Logical height of the captured display. PNG is `height * scaleFactor`
+   *  pixels tall on Retina. */
   height: number;
   /** Display-bounds X in screen-space. 0 for primary / single-display setups.
    *  On multi-monitor setups where the focused display is to the RIGHT of the
@@ -89,6 +95,23 @@ export interface Screenshot {
   /** Display-bounds Y in screen-space. Non-zero when the focused display is
    *  ABOVE the primary in the macOS arrangement (rare). */
   offsetY: number;
+  /**
+   * Ratio of PNG physical pixels to logical pixels. 1 on non-Retina or
+   * nut-js (which always returns logical). 2 (or 3 on some external 5K
+   * displays) on Retina via desktopCapturer — Electron's NativeImage
+   * encodes `.toPNG()` at native resolution regardless of resize, so the
+   * PNG bytes are always at `width * scaleFactor` × `height * scaleFactor`.
+   *
+   * Crop-callers (maybeCropToTargetApp) MUST multiply logical bounds by
+   * this scale factor when slicing the PNG, otherwise they get the
+   * top-left ¼ of the intended region (the vision-quality regression we
+   * fixed 2026-05-13).
+   *
+   * Vision-grounding callers don't have to worry about this — they pass
+   * `screen: [width, height]` (logical) to provider.ground; the model
+   * normalizes 0-1000 → logical, returns logical click coords.
+   */
+  scaleFactor: number;
 }
 
 export async function size(): Promise<{ width: number; height: number }> {
@@ -486,9 +509,84 @@ export function findDisplayForRect(rect: {
   }
 }
 
+/**
+ * Best-effort: the display containing the frontmost app's main
+ * window. On macOS we ask System Events via osascript (the bridge
+ * process has Accessibility granted; other processes return null).
+ *
+ * Why this exists: `getFocusedDisplay` historically returned the
+ * cursor's display, which is the WRONG one when the user's cursor
+ * is on Display A (desktop wallpaper) while their active app is
+ * maximized on Display B (or on a different Space of Display A
+ * where the visible content is the wallpaper). Vision-grounded
+ * tools then got a screenshot of the wallpaper instead of the app,
+ * grounded against random pixels, and clicked nothing useful.
+ *
+ * Cached per-second so we don't spawn an osascript per screenshot
+ * — that would add ~50-150ms to every vision call. macOS frontmost
+ * doesn't change faster than a human can switch apps.
+ *
+ * Returns null on non-darwin, on perm denial, or any error. Caller
+ * falls back to the cursor's display.
+ */
+let _frontWinCache: { display: ElectronDisplay | null; at: number } | null = null;
+const FRONT_WIN_TTL_MS = 1000;
+function getFrontmostWindowDisplay(): ElectronDisplay | null {
+  if (process.platform !== "darwin") return null;
+  const e = getElectron();
+  if (!e?.screen) return null;
+  if (_frontWinCache && Date.now() - _frontWinCache.at < FRONT_WIN_TTL_MS) {
+    return _frontWinCache.display;
+  }
+  try {
+    // execFileSync is synchronous; we cap it at 200ms so a perm-denied
+    // hang doesn't stall the screenshot path.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+    const script =
+      `tell application "System Events"\n` +
+      `  set frontApp to name of first application process whose frontmost is true\n` +
+      `  tell process frontApp\n` +
+      `    if (count of windows) is 0 then return "0,0,0,0"\n` +
+      `    set p to position of front window\n` +
+      `    set s to size of front window\n` +
+      `    return (item 1 of p as integer) & "," & (item 2 of p as integer) & "," & (item 1 of s as integer) & "," & (item 2 of s as integer)\n` +
+      `  end tell\n` +
+      `end tell`;
+    const out = execFileSync("/usr/bin/osascript", ["-e", script], {
+      timeout: 200,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // AppleScript's & on integers produces a LIST with comma-strings.
+    // Pull signed integers out via regex (same pattern as /window/bounds
+    // in electron/main.ts).
+    const nums = (out.match(/-?\d+/g) ?? []).map(Number);
+    if (nums.length < 4 || nums.some((n) => !Number.isFinite(n))) {
+      _frontWinCache = { display: null, at: Date.now() };
+      return null;
+    }
+    const [x, y, width, height] = nums as [number, number, number, number];
+    if (width <= 0 || height <= 0) {
+      _frontWinCache = { display: null, at: Date.now() };
+      return null;
+    }
+    const display = findDisplayForRect({ x, y, width, height });
+    _frontWinCache = { display, at: Date.now() };
+    return display;
+  } catch {
+    _frontWinCache = { display: null, at: Date.now() };
+    return null;
+  }
+}
+
 function getFocusedDisplay(): ElectronDisplay | null {
   const e = getElectron();
   if (!e?.screen) return null;
+  // Prefer the frontmost window's display (macOS Accessibility-gated).
+  // Falls back to the cursor's display on non-darwin or perm failure.
+  const front = getFrontmostWindowDisplay();
+  if (front) return front;
   try {
     const pt = e.screen.getCursorScreenPoint();
     return e.screen.getDisplayNearestPoint(pt);
@@ -515,12 +613,38 @@ export async function captureViaDesktopCapturer(
       (s) => Number(s.display_id) === d.id,
     );
     if (!matching) return null;
+    // Retina/HiDPI handling (2026-05-13): Electron's NativeImage on
+    // macOS encodes `.toPNG()` at the NATIVE pixel resolution (e.g.
+    // 3024×1964 for a 1512×982 logical display) regardless of the
+    // `thumbnailSize` hint or any `.resize({...})` call — internally
+    // it serializes the highest-resolution NSImage representation.
+    //
+    // Rather than fight the API (lossy CPU resize via sips), we
+    // surface the actual ratio as `scaleFactor` on the returned
+    // Screenshot. Every consumer that touches the PNG bytes (crop in
+    // maybeCropToTargetApp) multiplies logical coords by scaleFactor
+    // before slicing. Consumers that only do logical-coord math
+    // (click translation, provider.ground screen=[logical]) ignore
+    // scaleFactor entirely.
+    //
+    // Detect the actual PNG size by reading the IHDR chunk: 8-byte
+    // signature + 4-byte chunk length + 4-byte 'IHDR' + 4-byte width
+    // (big-endian) at offset 16, then height at offset 20.
+    const png = matching.thumbnail.toPNG();
+    const pngWidth = png.readUInt32BE(16);
+    const pngHeight = png.readUInt32BE(20);
+    const scaleX = pngWidth / d.bounds.width;
+    const scaleY = pngHeight / d.bounds.height;
+    // On macOS scale factors are uniform (1, 2, or 3). If x and y
+    // disagree we still proceed with the average; never crashes.
+    const scaleFactor = (scaleX + scaleY) / 2;
     return {
-      png: matching.thumbnail.toPNG(),
+      png,
       width: d.bounds.width,
       height: d.bounds.height,
       offsetX: d.bounds.x,
       offsetY: d.bounds.y,
+      scaleFactor,
     };
   } catch (e) {
     console.warn(
@@ -547,14 +671,13 @@ export async function screenshot(): Promise<Screenshot> {
   }
 
   // Fast path: primary display via nut-js. No multi-monitor offset.
+  // nut-js always returns at logical pixels — no Retina double-up — so
+  // scaleFactor is 1 here.
   const { width, height } = await size();
   const region = new Region(0, 0, width, height);
   const img = await nutScreen.grabRegion(region);
-  // nut-js returns its own image; encode to PNG via toRGB + sharp-less path:
-  // The library exposes `image.toRGB()` raw bytes. We rely on its toRGB() helper
-  // through the screen.captureRegion signature when available, else fallback.
   const png = await imageToPng(img);
-  return { png, width, height, offsetX: 0, offsetY: 0 };
+  return { png, width, height, offsetX: 0, offsetY: 0, scaleFactor: 1 };
 }
 
 async function imageToPng(img: unknown): Promise<Buffer> {

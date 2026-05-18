@@ -16,6 +16,7 @@
  * window forwards mouse events to whatever is below.
  */
 import { useEffect, useRef, useState } from "react";
+import { useTaskHistory } from "../shared/taskHistory";
 
 // Clicky's exact offsets from BlueCursorView L121–L123, L439–L440.
 const TRIANGLE_OFFSET_X = 35;
@@ -27,7 +28,7 @@ const BUBBLE_OFFSET_Y = 18;
 // SwiftUI's .spring(response: 0.2, dampingFraction: 0.6).
 const LERP_T = 0.25;
 
-const WELCOME_TEXT = "hey! i'm holo3";
+const WELCOME_TEXT = "hey! i'm ponder";
 
 type BubbleKind =
   | "thought"
@@ -74,6 +75,10 @@ export function Buddy() {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Shell-style up/down task history. Recalls past prompts entered in this
+  // window OR in the App window (both share localStorage under the same
+  // origin). Push happens after a successful runTask.
+  const taskHistory = useTaskHistory();
 
   // ---------------------------------------------------------------------------
   // Subscribe to main → renderer push channels.
@@ -238,15 +243,27 @@ export function Buddy() {
     e.preventDefault();
     if (!prompt.trim() || busy) return;
     setBusy(true);
-    const r = await window.agent.runTask(prompt);
+    const submitted = prompt;
+    const r = await window.agent.runTask(submitted);
     setBusy(false);
     setPrompt("");
+    // Add to recall list AFTER the runTask returns, regardless of ok/error —
+    // the user typed it, they may want to recall it whether it succeeded
+    // or not (e.g. to fix a typo and resubmit).
+    taskHistory.push(submitted);
     void window.agent.dismissInputMode();
     if (!r.ok) console.error(r.error);
   };
 
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") void window.agent.dismissInputMode();
+  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") {
+      taskHistory.reset();
+      void window.agent.dismissInputMode();
+      return;
+    }
+    // Arrow-up / arrow-down recall. The hook only consumes those keys; any
+    // other key falls through to the input's normal behavior.
+    taskHistory.onKeyDown(e, prompt, setPrompt);
   };
 
   const triX = renderPos.x + TRIANGLE_OFFSET_X;
@@ -300,7 +317,6 @@ export function Buddy() {
           />
           <form
             onSubmit={submit}
-            onKeyDown={onKey}
             className="buddy-input"
             style={{ left: renderPos.x, top: renderPos.y }}
           >
@@ -314,11 +330,12 @@ export function Buddy() {
               translate="no"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Tell Holo3 what to do…"
+              onKeyDown={onKey}
+              placeholder="Tell Ponder what to do…"
               disabled={busy}
             />
             <span className="buddy-input__hint" aria-hidden>
-              <kbd>↵</kbd> send · <kbd>Esc</kbd> dismiss
+              <kbd>↵</kbd> send · <kbd>↑↓</kbd> recall · <kbd>Esc</kbd> dismiss
             </span>
           </form>
         </>
@@ -330,7 +347,7 @@ export function Buddy() {
 // ---------------------------------------------------------------------------
 
 function Triangle({ x, y }: { x: number; y: number }) {
-  // Clicky's blue (#3380FF), -35° rotation, soft halo.
+  // Clicky's blue (#7BB304), -35° rotation, soft halo.
   return (
     <svg
       width="20"
@@ -347,7 +364,7 @@ function Triangle({ x, y }: { x: number; y: number }) {
       }}
       aria-hidden
     >
-      <polygon points="10,2 18,16 2,16" fill="#3380FF" />
+      <polygon points="10,2 18,16 2,16" fill="#7BB304" />
     </svg>
   );
 }
@@ -392,7 +409,7 @@ function ClickHalo({ x, y }: { x: number; y: number }) {
         height: 36,
         pointerEvents: "none",
         borderRadius: "50%",
-        border: "2px solid #3380FF",
+        border: "2px solid #7BB304",
         opacity: 0.6,
         animation: "agent-halo 750ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
       }}

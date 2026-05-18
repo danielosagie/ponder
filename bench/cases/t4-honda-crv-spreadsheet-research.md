@@ -10,6 +10,11 @@ axes:
 expected_actions: 35
 max_steps: 70
 infeasible: false
+# Multi-app task: cropping to ANY single app (Chrome OR Excel) breaks
+# the handoff. Auto-detect would lock to "Google Chrome" (first match)
+# and Excel would be invisible behind Chrome's crop forever — diagnosed
+# 2026-05-11 Run 6. Empty string disables both auto-detect and cropping.
+targetApp: ""
 ---
 
 # T4 — Honda CR-V Marketplace Research → Excel Spreadsheet

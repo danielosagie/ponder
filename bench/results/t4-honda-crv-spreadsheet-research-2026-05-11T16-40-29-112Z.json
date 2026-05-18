@@ -1,0 +1,77 @@
+{
+  "id": "t4-honda-crv-spreadsheet-research-2026-05-11T16:39:04.845Z",
+  "case": "t4-honda-crv-spreadsheet-research",
+  "tier": "T4",
+  "axes": [
+    "multi-app-handoff",
+    "state-reading",
+    "long-horizon",
+    "modal-dialog",
+    "grounding-precision"
+  ],
+  "started_at": "2026-05-11T16:39:04.845Z",
+  "ended_at": "2026-05-11T16:40:29.099Z",
+  "elapsed_ms": 84254,
+  "repo_head_short": "ac2c8873edaa",
+  "bridge_version": {
+    "commit": "ac2c8873edaafa9aec50e8ac453417ba3e8a10bc",
+    "commitShort": "ac2c8873edaa",
+    "dirty": true,
+    "builtAt": "2026-05-11T16:38:58.935Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": 70,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. Open Microsoft Excel and create a new spreadsheet with these column headers in row 1: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Save the file to the Desktop with the name `honda-crv-research.xlsx`. Then switch to Google Chrome and navigate to `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000`. For at least 3 listings from the results, open the listing, read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to Excel and add one row per listing under the headers, filling URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. Save the spreadsheet again when you've added all the rows.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "excel_version=16.108.3\nsetup_done_at=2026-05-11T16:39:07Z\nfacebook_login_expectation=user must be logged into facebook.com in the frontmost Chrome profile; otherwise marketplace search returns a login wall\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "exhausted",
+    "duration_ms": 81542,
+    "steps": 9,
+    "response": {
+      "outcome": "exhausted",
+      "sessionId": "j578pjs9pj8c2kf73nj7jfn16d86hpyr",
+      "steps": 9,
+      "transcript": [
+        "[t=11.1s] thought: hotkey cmd+space",
+        "[t=11.9s] action: key {\"combo\":\"cmd+space\"}",
+        "[t=18.5s] thought: type \"microsoft excel\" and press enter to open Excel",
+        "[t=23.2s] action: type {\"text\":\"microsoft excel\",\"thenPress\":\"enter\"}",
+        "[t=31.4s] thought: click the Google Chrome tab labeled \"bash terminal\"",
+        "[t=36.9s] action: click {\"x\":303,\"y\":151}",
+        "[t=42.4s] thought: click the Google Chrome tab labeled \"bash terminal\"",
+        "[t=44.8s] action: click {\"x\":319,\"y\":190}",
+        "[t=50.4s] thought: click the Google Chrome tab labeled \"bash terminal\"",
+        "[t=52.9s] action: click {\"x\":302,\"y\":151}",
+        "[t=58.2s] thought: click the Google Chrome tab labeled \"bash terminal\"",
+        "[t=60.4s] action: click {\"x\":318,\"y\":190}",
+        "[t=65.6s] thought: click the Google Chrome tab labeled \"bash terminal\"",
+        "[t=67.9s] action: click {\"x\":303,\"y\":151}",
+        "[t=72.0s] thought: press esc",
+        "[t=72.1s] action: key {\"combo\":\"esc\"}",
+        "[t=77.1s] thought: press esc",
+        "[t=77.2s] action: key {\"combo\":\"esc\"}",
+        "[t=80.8s] thought: press esc",
+        "[t=80.9s] error: Brain emitted no-op-like actions (wait / press enter / press escape) 3 times in a row — either it's stalled, OR the goal already landed and it didn't notice. Look at the current screenshot AND the URL — has the page navigated? Has a result/dialog appeared? If yes, emit DONE. If no, the prior action didn't fire — pick a different verb (click on a specific labeled element instead of blindly pressing keys)."
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-spreadsheet-research-2026-05-11T16-40-29-112Z-final.png",
+      "finalScreenshotSidecarSha256": "7f07b569978b32c3"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx",
+    "exit_code": 0,
+    "stdout": "FAIL: no spreadsheet at /Users/dosagie/Desktop/honda-crv-research.xlsx\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "exhausted",
+  "disagreement": false
+}

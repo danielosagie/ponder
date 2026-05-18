@@ -1,0 +1,81 @@
+{
+  "id": "t4-honda-crv-google-sheets-research-2026-05-11T21:51:00.466Z",
+  "case": "t4-honda-crv-google-sheets-research",
+  "tier": "T4",
+  "axes": [
+    "long-horizon",
+    "state-reading",
+    "browser-only"
+  ],
+  "started_at": "2026-05-11T21:51:00.466Z",
+  "ended_at": "2026-05-11T21:55:12.652Z",
+  "elapsed_ms": 252186,
+  "repo_head_short": "ac2c8873edaa",
+  "bridge_version": {
+    "commit": "ac2c8873edaafa9aec50e8ac453417ba3e8a10bc",
+    "commitShort": "ac2c8873edaa",
+    "dirty": true,
+    "builtAt": "2026-05-11T18:26:17.714Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": "Google Chrome",
+  "max_steps": 150,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. In Google Chrome, press cmd+t to open a new tab, then in the URL bar type `https://sheets.new` and press enter — this opens a fresh Google Sheet. Once the sheet loads, click cell A1 and type these headers across row 1, pressing Tab between each one: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Then press cmd+t again and in the URL bar type the full URL `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000` and press enter. For at least 10 listings from the results, open the listing (cmd+click or middle-click to open in a new tab is fine), read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to the Google Sheets tab (cmd+1 through cmd+9 jump to specific tabs by position, or cmd+shift+a opens the tab search) and add one row per listing under the headers — fill URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. When you've added all 10 rows, in the Google Sheets tab press cmd+a to select all the data, then cmd+c to copy it to the clipboard so I can verify the contents. Then emit DONE.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "frontmost_app=Google Chrome\nsetup_done_at=2026-05-11T21:51:02Z\nexpectations:\n  - user is signed into google.com in this Chrome profile (else sheets.new lands on a sign-in page)\n  - user is signed into facebook.com (else marketplace search returns a login wall)\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "exhausted",
+    "duration_ms": 250493,
+    "steps": 12,
+    "response": {
+      "outcome": "exhausted",
+      "sessionId": "j57877va5ewbf35g7bft4z68ex86gvxf",
+      "steps": 12,
+      "transcript": [
+        "[t=37.9s] thought: hotkey cmd+t",
+        "[t=38.8s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=45.1s] thought: type \"https://sheets.new\"\npress enter",
+        "[t=50.6s] action: type {\"text\":\"https://sheets.new\"}",
+        "[t=56.9s] thought: wait 1s",
+        "[t=58.0s] action: wait {\"ms\":1000}",
+        "[t=63.8s] thought: click cell A1",
+        "[t=72.5s] action: click {\"x\":105,\"y\":144}",
+        "[t=80.2s] thought: type \"URL\\tAsking Price\\tYear\\tMileage\\tLocation\\tCondition Notes\\tMessaged\\t\"",
+        "[t=101.7s] action: type {\"text\":\"URL\\\\tAsking Price\\\\tYear\\\\tMileage\\\\tLocation\\\\tCondition Notes\\\\tMessaged\\\\t\"}",
+        "[t=108.1s] thought: press cmd+t",
+        "[t=108.8s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=121.9s] thought: type \"https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000\"",
+        "[t=151.1s] action: type {\"text\":\"https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000\"}",
+        "[t=164.0s] thought: press enter",
+        "[t=164.2s] action: key {\"combo\":\"enter\"}",
+        "[t=179.3s] thought: press cmd+tab",
+        "[t=180.0s] action: key {\"combo\":\"cmd+tab\"}",
+        "[t=199.3s] thought: press cmd+tab",
+        "[t=200.0s] action: key {\"combo\":\"cmd+tab\"}",
+        "[t=217.4s] thought: press cmd+tab",
+        "[t=218.2s] action: key {\"combo\":\"cmd+tab\"}",
+        "[t=235.9s] thought: press cmd+t",
+        "[t=236.6s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=249.4s] thought: type \"https://sheets.new\"",
+        "[t=249.5s] error: Already attempted \"https://sheets.new\" earlier — same text typed 11 steps ago and we're back to retry. The field may not be accepting input — try clicking a different field first, or use 'click on the X' (vision) instead of browser.type if the ref keeps failing."
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-google-sheets-research-2026-05-11T21-55-12-718Z-final.png",
+      "finalScreenshotSidecarSha256": "7d8c4e34b3d76888"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: only 0 data rows in clipboard, expected at least 10 (total rows incl. header: 1)",
+    "exit_code": 1,
+    "stdout": "--- clipboard (first 800 chars) ---\nhttps://github.com/pingdotgg/lawn\n--- end clipboard preview ---\n  diagnostic: header missing expected term 'URL' — got: https://github.com/pingdotgg/lawn\n  diagnostic: header missing expected term 'Price' — got: https://github.com/pingdotgg/lawn\n  diagnostic: header missing expected term 'Year' — got: https://github.com/pingdotgg/lawn\nFAIL: only 0 data rows in clipboard, expected at least 10 (total rows incl. header: 1)\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "exhausted",
+  "disagreement": false
+}

@@ -1,0 +1,73 @@
+{
+  "id": "t4-honda-crv-google-sheets-research-2026-05-11T22:03:28.097Z",
+  "case": "t4-honda-crv-google-sheets-research",
+  "tier": "T4",
+  "axes": [
+    "long-horizon",
+    "state-reading",
+    "browser-only"
+  ],
+  "started_at": "2026-05-11T22:03:28.097Z",
+  "ended_at": "2026-05-11T22:05:49.572Z",
+  "elapsed_ms": 141475,
+  "repo_head_short": "ac2c8873edaa",
+  "bridge_version": {
+    "commit": "ac2c8873edaafa9aec50e8ac453417ba3e8a10bc",
+    "commitShort": "ac2c8873edaa",
+    "dirty": true,
+    "builtAt": "2026-05-11T22:03:21.198Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": "Google Chrome",
+  "max_steps": 150,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. In Google Chrome, press cmd+t to open a new tab, then in the URL bar type `https://sheets.new` and press enter — this opens a fresh Google Sheet. Once the sheet loads, click cell A1 and type these headers across row 1, pressing Tab between each one: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Then press cmd+t again and in the URL bar type the full URL `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000` and press enter. For at least 10 listings from the results, open the listing (cmd+click or middle-click to open in a new tab is fine), read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to the Google Sheets tab (cmd+1 through cmd+9 jump to specific tabs by position, or cmd+shift+a opens the tab search) and add one row per listing under the headers — fill URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. When you've added all 10 rows, in the Google Sheets tab press cmd+a to select all the data, then cmd+c to copy it to the clipboard so I can verify the contents. Then emit DONE.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "frontmost_app=Google Chrome\nsetup_done_at=2026-05-11T22:03:30Z\nexpectations:\n  - user is signed into google.com in this Chrome profile (else sheets.new lands on a sign-in page)\n  - user is signed into facebook.com (else marketplace search returns a login wall)\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "exhausted",
+    "duration_ms": 139316,
+    "steps": 6,
+    "response": {
+      "outcome": "exhausted",
+      "sessionId": "j57450wxeqzt39dczc08pyg9f186hr11",
+      "steps": 6,
+      "transcript": [
+        "[t=14.8s] thought: hotkey cmd+t",
+        "[t=15.5s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=28.3s] thought: type \"https://sheets.new\"",
+        "[t=33.8s] action: type {\"text\":\"https://sheets.new\"}",
+        "[t=46.8s] thought: press enter",
+        "[t=47.0s] action: key {\"combo\":\"enter\"}",
+        "[t=59.8s] thought: click cell A1",
+        "[t=73.1s] error: Click at (101,346) was outside Google Chrome's window — refused. Re-grounding next step.",
+        "[t=86.3s] thought: click cell A1",
+        "[t=96.6s] error: Click at (101,351) was outside Google Chrome's window — refused. Re-grounding next step.",
+        "[t=109.5s] thought: press esc",
+        "[t=109.6s] action: key {\"combo\":\"esc\"}",
+        "[t=121.9s] thought: press esc",
+        "[t=122.1s] action: key {\"combo\":\"esc\"}",
+        "[t=125.5s] thought: press cmd+t",
+        "[t=126.2s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=138.4s] thought: type \"https://sheets.new\"",
+        "[t=138.5s] error: Already attempted \"https://sheets.new\" earlier — same text typed 7 steps ago and we're back to retry. The field may not be accepting input — try clicking a different field first, or use 'click on the X' (vision) instead of browser.type if the ref keeps failing."
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-google-sheets-research-2026-05-11T22-05-49-612Z-final.png",
+      "finalScreenshotSidecarSha256": "0515ceb4a70104f1"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: clipboard is empty — agent never executed the final cmd+a + cmd+c step (or the copy didn't land)",
+    "exit_code": 1,
+    "stdout": "FAIL: clipboard is empty — agent never executed the final cmd+a + cmd+c step (or the copy didn't land)\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "exhausted",
+  "disagreement": false
+}

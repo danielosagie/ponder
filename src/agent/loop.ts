@@ -53,6 +53,19 @@ const PREFETCH_SETTLE_MS = 250;
 // timeout. We pay the wait once on the typing step and recoup it many
 // times over by avoiding a wrong-action retry loop.
 const POST_TYPE_SETTLE_MS = 1400;
+// Spotlight launch sequence: cmd+space (step N) → type+enter (step N+1)
+// to open an app via Spotlight. The launched app's window can take 2-3s
+// to draw (Excel ~3s, most native apps ~1s). Without extra settle, the
+// next screenshot still shows the PREVIOUS frontmost app, and the brain
+// interprets that as a failed launch. Observed in
+// t4-honda-crv-spreadsheet-research Run 3 (brain abandoned the launch
+// and started clicking in Chrome) and Run 4 (brain emitted cmd+tab × 7
+// trying to "find" Excel that hadn't drawn yet, bailed by same-action
+// guard). 2500ms covers Excel reliably; only fires once per launch.
+// Override with HOLO3_SPOTLIGHT_LAUNCH_SETTLE_MS.
+const SPOTLIGHT_LAUNCH_SETTLE_MS = Number(
+  process.env.HOLO3_SPOTLIGHT_LAUNCH_SETTLE_MS ?? 2500,
+);
 
 export interface RunOptions {
   task: string;
@@ -367,16 +380,23 @@ async function maybeCropToTargetApp(
 
   const tCrop = Date.now();
   try {
+    // Scale logical bounds → physical pixels for the actual PNG slice.
+    // On Retina the desktopCapturer PNG is `width*sf × height*sf` even
+    // though `shot.width/height` are logical. NativeImage.crop walks
+    // physical pixel offsets, so we have to translate before slicing
+    // or we get the top-left ¼ of the intended region — the 2026-05-13
+    // vision-quality regression.
+    const sf = shot.scaleFactor || 1;
     const img = nativeImage.createFromBuffer(shot.png);
     const cropped = img.crop({
-      x: cropX,
-      y: cropY,
-      width: bounds.width,
-      height: bounds.height,
+      x: Math.round(cropX * sf),
+      y: Math.round(cropY * sf),
+      width: Math.round(bounds.width * sf),
+      height: Math.round(bounds.height * sf),
     });
     const croppedPng = cropped.toPNG();
     console.log(
-      `[loop] 🪟 cropped to ${targetApp} (${bounds.width}×${bounds.height} @ ${cropX},${cropY} in screenshot): ` +
+      `[loop] 🪟 cropped to ${targetApp} (${bounds.width}×${bounds.height} logical @ ${cropX},${cropY}; scaleFactor=${sf}): ` +
         `bounds=${Date.now() - tBounds}ms, crop=${Date.now() - tCrop}ms, ` +
         `${shot.png.length}→${croppedPng.length} bytes ` +
         `(~${Math.round(((shot.width * shot.height) / (bounds.width * bounds.height)) * 10) / 10}× fewer pixels)`,
@@ -391,6 +411,9 @@ async function maybeCropToTargetApp(
       // cropping — it's transparent to the rest of the loop.
       offsetX: shot.offsetX + cropX,
       offsetY: shot.offsetY + cropY,
+      // Cropped PNG keeps the original scale factor — its physical
+      // dimensions are bounds.width*sf × bounds.height*sf.
+      scaleFactor: sf,
     };
   } catch (e) {
     console.log(
@@ -516,7 +539,22 @@ export async function runTask(
   // doesn't get a shot at decomposing "calculate on the calculator"
   // into "Open Chrome → web calculator". For already-flat paths, this
   // is a no-op.
-  const inferredApp = !opts.targetApp ? inferTargetApp(task) : null;
+  // Tri-state for opts.targetApp:
+  //   undefined/null    → run inference (default behavior)
+  //   "" (explicit)     → opt out (no inference, no cropping) — used by
+  //                       multi-app tasks like t4-honda-crv where Chrome
+  //                       AND Excel must both be visible across the run.
+  //                       maybeCropToTargetApp's `if (!targetApp)` guard
+  //                       (line 223) skips cropping for "" automatically.
+  //   "AppName"         → use that app explicitly, skip inference.
+  // Previously `!opts.targetApp` treated "" as falsy and triggered
+  // inference anyway, locking the run to whichever app matched first
+  // (e.g. Chrome). The line 452 comment promised "" was the opt-out,
+  // but the implementation never honored it until 2026-05-11 Run 7.
+  const inferredApp =
+    opts.targetApp === undefined || opts.targetApp === null
+      ? inferTargetApp(task)
+      : null;
   if (inferredApp) {
     console.log(
       `[loop] 🪟 inferred targetApp="${inferredApp}" from task text → enabling crop${opts.flat ? "" : " and forcing flat mode (skips the hierarchical planner that would otherwise decompose into wrong subtasks)"}`,
@@ -801,6 +839,13 @@ async function runOneSubtask(
   // it overlaps with the inter-step pause; by the time the next iteration
   // starts, the bytes are already in memory and we skip a 50-200ms grab+encode.
   let prefetched: Promise<screen.Screenshot> | null = null;
+  // Remembers the previous step's executed action so we can detect
+  // multi-step compound sequences. Currently used only for Spotlight
+  // launch detection (cmd+space → type+enter): the trailing step needs
+  // extra settle for the launched app's window to draw before the next
+  // snapshot. Updated only on successful execute so a failed/skipped
+  // step doesn't poison the next iteration's compound check.
+  let prevExecuted: Awaited<ReturnType<typeof executeAction>> = null;
   // Caller can override (agent_do passes 1500ms to keep total runtime
   // inside the MCP client's request timeout). Falls back to the
   // provider-aware default: 6500ms for hcompany rate-limit safety,
@@ -1834,7 +1879,39 @@ async function runOneSubtask(
     // OS-level `type` action and the structured `browser.type` qualify.
     const wasType =
       executed?.type === "type" || executed?.type === "browser_type";
-    const settleMs = wasType ? POST_TYPE_SETTLE_MS : PREFETCH_SETTLE_MS;
+    // Compound-sequence detection: cmd+space (prev step) → type+enter
+    // (this step) = Spotlight launch. The launched app needs ~2-3s to
+    // draw its window. Without this, the next screenshot shows the
+    // previous app and the brain abandons the launch (Run 3 of the
+    // honda bench) or cycles cmd+tab trying to find the launched app
+    // (Run 4). Pattern matches the brain's actual emission shape:
+    // `key {combo:"cmd+space"}` followed by
+    // `type {text:"...",thenPress:"enter"}`.
+    const prevWasSpotlight =
+      prevExecuted?.type === "key" &&
+      /cmd\+space/i.test(JSON.stringify(prevExecuted.payload ?? {}));
+    const isSpotlightLaunch =
+      prevWasSpotlight &&
+      wasType &&
+      /thenpress["\s:]+["']?enter/i.test(
+        JSON.stringify(executed?.payload ?? {}),
+      );
+    const settleMs = isSpotlightLaunch
+      ? SPOTLIGHT_LAUNCH_SETTLE_MS
+      : wasType
+        ? POST_TYPE_SETTLE_MS
+        : PREFETCH_SETTLE_MS;
+    if (isSpotlightLaunch) {
+      console.log(
+        `[loop] 🚀 Spotlight launch detected (cmd+space → type+enter); settling ${SPOTLIGHT_LAUNCH_SETTLE_MS}ms before next snapshot`,
+      );
+    }
+    // Update prevExecuted only when the action actually ran. A failed/
+    // skipped step keeps the previous prevExecuted so the next real
+    // step still sees the correct prior context for compound detection.
+    if (executed) {
+      prevExecuted = executed;
+    }
 
     const effectivePause = usedRouter ? settleMs : Math.max(stepPause, settleMs);
     if (cancelled()) return "cancelled";
@@ -1988,7 +2065,51 @@ async function executeAction(
   // type the literal string `({"text":"X"}) and press enter` into the box.
   const typed = parseTypeAction(a);
   if (typed) {
-    await screen.typeText(typed.text);
+    // URL auto-submit heuristic: when the brain types a URL into a
+    // focused field (typically Chrome's URL bar after cmd+t) it often
+    // forgets to compose `and press enter` to navigate. Observed in 3
+    // of 4 honda-sheets bench runs (2026-05-11): brain emits
+    // `type "https://sheets.new"` then moves on to clicking, but the
+    // URL was never submitted so the page never loaded, and clicks
+    // landed on Chrome's empty new-tab page instead of the Sheets UI.
+    //
+    // When the typed text is unambiguously a URL (starts with http://
+    // or https://) AND the brain didn't already specify a thenPress,
+    // auto-compose enter. Browser context is overwhelmingly the case
+    // for typed URLs; for the rare case of typing a URL into a doc
+    // cell, enter just commits the cell which is also usually correct.
+    if (!typed.thenPress && /^https?:\/\//i.test(typed.text)) {
+      typed.thenPress = "enter";
+      console.log(
+        `[loop] ⌨️  auto-composed thenPress:"enter" — typed text starts with http(s):// (URL navigation pattern; brain often forgets to submit)`,
+      );
+    }
+    // Expand `\t` / `\n` escape sequences into Tab / Enter key presses
+    // interleaved with the surrounding text. The small Holo3 brain often
+    // emits `type "URL\tAsking Price\tYear"` thinking the executor will
+    // interpret `\t` as Tab — but `screen.typeText` types the literal
+    // backslash + t. Observed in t4-honda-crv-google-sheets Run 1
+    // (2026-05-11): brain mangled all 7 column headers into a single
+    // cell instead of typing one header per column with Tab between.
+    // Single-segment input (no escapes) is a no-op pass-through.
+    const segments = expandTypeEscapes(typed.text);
+    if (segments.length > 1) {
+      console.log(
+        `[loop] ⌨️  type-with-escapes: expanded ${segments.length} segments from "${typed.text.length > 80 ? typed.text.slice(0, 77) + "..." : typed.text}"`,
+      );
+    }
+    for (const seg of segments) {
+      if (seg.kind === "text") {
+        await screen.typeText(seg.value);
+      } else {
+        // Settle so the previous text segment commits before the key
+        // press lands. Tab/Enter on an actively-typing field can otherwise
+        // eat the trailing character (same reason the thenPress path
+        // sleeps 120ms below).
+        await screen.sleep(80);
+        await screen.pressCombo(seg.value);
+      }
+    }
     if (typed.thenPress) {
       // Tiny pause so the focused field commits the typed text before we
       // press Enter on top of it. Without this, fast inputs eat the last char.
@@ -2147,6 +2268,52 @@ function looksLikeFieldTarget(action: string): boolean {
  *
  * Returns null if the action isn't a "type" action.
  */
+/**
+ * Walk a brain-emitted type-text string and split it into ordered
+ * text/key segments wherever `\t` or `\n` escape sequences appear.
+ * The brain often emits these intending Tab / Enter key presses
+ * between text runs (e.g. `URL\tAsking Price\tYear` to type 3 column
+ * headers separated by Tab); without this expansion `screen.typeText`
+ * would type the literal backslash + letter into a single cell.
+ *
+ * Single-segment input (no escapes) returns a one-element array, so
+ * the executor's loop is a no-op pass-through for ordinary type calls.
+ *
+ * Currently recognized escapes: `\t` → tab, `\n` → enter. `\\t` (double
+ * backslash + t) is intentionally NOT a literal-backslash-then-tab
+ * escape — the brain practically never emits that, and supporting it
+ * would require a more complex state machine. If a use-case appears,
+ * extend here.
+ */
+type TypeSegment =
+  | { kind: "text"; value: string }
+  | { kind: "key"; value: string };
+function expandTypeEscapes(text: string): TypeSegment[] {
+  const out: TypeSegment[] = [];
+  let buf = "";
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\\" && i + 1 < text.length) {
+      const next = text[i + 1];
+      if (next === "t" || next === "n") {
+        if (buf) {
+          out.push({ kind: "text", value: buf });
+          buf = "";
+        }
+        out.push({ kind: "key", value: next === "t" ? "tab" : "enter" });
+        i++; // consume the second char of the escape
+        continue;
+      }
+    }
+    buf += text[i];
+  }
+  if (buf) out.push({ kind: "text", value: buf });
+  // Edge case: empty string in → return one empty text segment so the
+  // executor still emits the action (records it in history) instead of
+  // silently no-op'ing.
+  if (out.length === 0) out.push({ kind: "text", value: "" });
+  return out;
+}
+
 function parseTypeAction(
   raw: string,
 ): { text: string; thenPress?: string } | null {

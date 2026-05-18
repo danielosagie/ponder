@@ -1,46 +1,50 @@
 /**
  * Extractor — the agent's "answer."
  *
- * The narrator gives an 18-word friendly sentence ("Done — Marketplace is
- * loaded"). That's not what the user asked for when they said "report back
- * with which items I have for sale." The extractor is the missing piece: it
- * runs once at end-of-run, reads the final page state (Playwriter snapshot
- * if Chrome was active, last screenshot otherwise), and answers the
- * original task in plain text.
+ * Runs once at end-of-run, reads the final page state (Playwriter
+ * snapshot + last screenshot + action history), and produces the
+ * conversational reply to the user's original question.
  *
- * Output is variable-length on purpose. A list-question gets a list. A
- * yes/no question gets a sentence. A procedural task gets a one-liner
- * confirming what was done.
+ * Two transports, in priority order:
  *
- * Reuses the planner's `provider.plan()` transport — no new HTTP code, no
- * new auth, the existing AbortController hooks Stop into the extract call
- * the same way it does into ground/plan calls. Cancellable via the loop's
- * shared signal, but NOT raced against a timeout — this is the deliverable,
- * not a flourish.
+ *   1. Local Ollama (PRIMARY).
+ *      Fast (~1s), free, never rate-limits, always returns SOMETHING.
+ *      Text-only, so it leans on the browser snapshot + action history
+ *      when those are present. For non-browser tasks (no snapshot) it
+ *      still produces a sensible "I did X, Y" answer from history alone.
+ *
+ *   2. Holo3 / hcompany via provider.plan() (FALLBACK).
+ *      Multimodal — only used if Ollama isn't available AND we have a
+ *      screenshot worth showing. Hcompany is rate-limited and slow, so
+ *      we treat it as the resort, not the default.
+ *
+ * Last-resort: if BOTH transports fail (Ollama down, hcompany rate-
+ * limited), we emit a templated sentence from the action history alone
+ * so the user always sees something conversational. The buddy bubble
+ * never goes silent.
  */
 
+import { Ollama } from "ollama";
 import type { ProviderClient } from "./types";
 import type { BrowserSnapshot } from "./browser/types";
 
 export interface ExtractInput {
   /** The original user prompt, exactly as typed. */
   task: string;
-  /** Every action emitted during the run, in order. Helps the model
-   *  understand what "the agent just did" so its answer is grounded. */
+  /** Every action emitted during the run, in order. */
   history: string[];
-  /** Final-frame screenshot. Always present even when Playwriter wired in,
-   *  because some tasks (Figma, native apps) won't have a browserSnapshot. */
+  /** Final-frame screenshot. */
   lastScreenshotB64: string;
-  /** Accessibility tree of the active Chrome tab, when available. The
-   *  extractor strongly prefers this when present — it's structured text,
-   *  cheaper than a screenshot, and the planner is already trained to read
-   *  similar formats. */
+  /** Accessibility tree of the active Chrome tab, when available. */
   browserSnapshot?: BrowserSnapshot;
-  /** Final outcome bucket, so the system prompt can shape the answer
-   *  ("done" → answer the question; "exhausted" → say what's missing). */
+  /** Plain text scrape of the active page, when available. The
+   *  accessibility tree only carries roles+names — not the actual
+   *  copy/prices/listing content. Without this, the closer can only
+   *  describe "what's interactable" rather than "what was found". */
+  pageText?: string;
+  /** Final outcome bucket. */
   outcome: "done" | "cancelled" | "exhausted" | "error";
-  /** Cancel signal threaded from the agent loop's AbortController so a
-   *  Stop press kills the extract HTTP call along with everything else. */
+  /** Cancel signal. */
   signal?: AbortSignal;
 }
 
@@ -49,90 +53,242 @@ export interface ExtractorClient {
 }
 
 export interface ExtractorConfig {
-  /** Hard cap on history lines included in the prompt. Earlier lines are
-   *  rarely useful for the answer; the final state matters most. */
   historyLimit?: number;
-  /** Hard cap on a11y snapshot size. Beyond ~30KB the planner starts losing
-   *  focus and answer quality drops. */
   snapshotLimit?: number;
+  /** Ollama host. Defaults to OLLAMA_HOST env or 127.0.0.1:11434. */
+  ollamaHost?: string;
+  /** Ollama model. Defaults to EXTRACTOR_MODEL or qwen3.5:0.8b. */
+  ollamaModel?: string;
+  /** Hard cap on local-LLM call. */
+  ollamaTimeoutMs?: number;
 }
 
-const SYSTEM_PROMPT = `You are the answerer of a computer-use agent. The agent has finished a task. Using ONLY the final page/screen state and the action history, answer the user's original question.
+const SYSTEM_PROMPT = `You are the closing voice of a computer-use agent. The agent just FINISHED a task — your job is the POST-MORTEM, not a re-statement of the request.
 
-Style rules:
-- If the question is informational ("what items…", "list…", "find…", "how much…", "which…", "is there…"): produce a concise plain-text answer with concrete details from the screen — names, prices, counts, dates. If it's a list, use a bulleted list with one line per item. No more than 12 items unless the user asked for more.
-- If the question is procedural ("open X", "click Y", "navigate to Z"): confirm what was done in one or two sentences.
-- If the agent ran out of steps or was cancelled before the answer was reachable: say what's visible right now and what's missing.
-- If you cannot answer from the available state: say so explicitly. Do NOT invent details. Better to say "couldn't find the listings page" than to make up items.
+HARD RULE — NEVER restate, paraphrase, or re-plan the original request. The user already typed it; they don't need to hear it back. Skip phrases like "I will…", "Let me…", "I'm going to…", "First I'll…", or any forward-looking plan. Your reply describes what HAPPENED, in past tense, and what was FOUND.
+
+Three cases — pick exactly one and write the reply for it:
+
+A. INFORMATIONAL request was answered (the user asked for items / prices / facts and the page text contains them):
+   • Lead with the answer. First sentence is the headline ("Found 3 listings under $3000:").
+   • Then a hyphen-bulleted list pulled from the PAGE TEXT — title, price, location, link if you have one. Up to 12 items.
+   • If you have fewer items than asked, say so in the headline ("Found 2 of the 3 you wanted because…").
+
+B. PROCEDURAL task succeeded (the user asked you to navigate / configure / click and the action history confirms it):
+   • One short past-tense sentence: "Opened Marketplace and applied the Marietta + $2.5k–$3k filters."
+   • No list needed unless the user asked you to verify multiple things.
+
+C. RUN STOPPED early (outcome is exhausted / cancelled / error, OR the page text doesn't contain the answer):
+   • Lead with what blocked you in past tense: "Got stuck on the location filter — Apply stayed disabled because the dropdown suggestion didn't render in time."
+   • Then describe what's visibly on the page right now (1 sentence).
+   • Then ONE concrete suggestion the user can try: "Try the same prompt again — Marketplace's autocomplete is sometimes laggy on first load." Don't suggest more than one.
+   • If the failure-annotated history shows clicked-disabled / overlay-intercepted / ref-vanished events, mention them — they're the diagnostic.
 
 Format:
-- Plain text. No markdown headers. Bullet lists are OK for inventories.
-- No "I observed", "I saw", "the agent did X". Speak directly to the user.
-- No emojis. No quotes wrapping the whole answer.`;
+- Plain text. No markdown headers, no asterisks, no code blocks, no emojis, no outer quotes.
+- Hyphen bullets for lists.
+- Speak as the agent in first person past tense ("I found…", "I tried…"). Never "the agent…".
+- Procedural confirmations: 1–2 sentences. Informational answers: headline + up to 12 bullets. Failure post-mortems: 2–4 sentences total.
+- Source the bullets from PAGE TEXT (the actual copy on the page), not from the action history. The action history is for diagnosing failure, not for listing results.
+
+If you catch yourself starting with "I will" / "Let me" / "First, I'll" — STOP. Rewrite in past tense.`;
+
+function templatedFallback(args: ExtractInput): string {
+  // Last-resort line when both LLM paths fail. Use the action history
+  // and outcome to say SOMETHING useful instead of going silent.
+  const recent = args.history.filter((h) => h !== "(empty)").slice(-5);
+  const lastAction = recent.at(-1);
+  if (args.outcome === "exhausted") {
+    return `I got stuck before finishing "${args.task}". Last thing I tried was: ${lastAction ?? "(no actions)"}. Try again with a more specific prompt.`;
+  }
+  if (args.outcome === "cancelled") {
+    return `Stopped "${args.task}" mid-run.`;
+  }
+  if (args.outcome === "error") {
+    return `Hit an error working on "${args.task}". The action history was: ${recent.join(" → ") || "(none)"}.`;
+  }
+  return `Done — ${recent.join(" → ") || "no actions recorded"}.`;
+}
+
+function buildUserMessage(
+  args: ExtractInput,
+  cfg: Required<Pick<ExtractorConfig, "historyLimit" | "snapshotLimit">>,
+): string {
+  const recent = args.history.slice(-cfg.historyLimit);
+  const historyBlock =
+    recent.length === 0
+      ? "(no actions recorded)"
+      : recent.map((h, i) => `${i + 1}. ${h}`).join("\n");
+
+  // Page text comes FIRST in the user message (after the outcome): for
+  // informational tasks this is the answer source. The accessibility
+  // tree alone carries roles + names ("button 'Search'") but no listing
+  // copy or prices — without pageText the closer falls back to history,
+  // which is what was making it sound like a plan re-statement.
+  let pageTextBlock = "";
+  if (args.pageText && args.pageText.trim()) {
+    const text = args.pageText.trim();
+    // The page text is potentially huge (50KB cap from readText); we
+    // give the closer a generous window because this is THE source of
+    // listing details, but still cap it so a runaway page doesn't blow
+    // the model's context.
+    const cap = Math.max(cfg.snapshotLimit, 30_000);
+    const trimmed = text.length > cap ? text.slice(0, cap) + "\n…(truncated)" : text;
+    pageTextBlock = `\nPAGE TEXT (final, this is your source for listings/prices/facts):\n${trimmed}\n`;
+  }
+
+  let snapshotBlock = "";
+  if (args.browserSnapshot) {
+    const ax = args.browserSnapshot.ax;
+    const trimmed =
+      ax.length > cfg.snapshotLimit
+        ? ax.slice(0, cfg.snapshotLimit) + "\n…(truncated)"
+        : ax;
+    snapshotBlock =
+      `\nFinal page: ${args.browserSnapshot.title} (${args.browserSnapshot.url})\n` +
+      `Interactive elements still on screen:\n${trimmed}\n`;
+  }
+
+  const outcomeLabel =
+    args.outcome === "done"
+      ? "OUTCOME: done — the run completed normally."
+      : args.outcome === "cancelled"
+        ? "OUTCOME: cancelled — the user stopped the run mid-flight. Describe the partial state."
+        : args.outcome === "exhausted"
+          ? "OUTCOME: exhausted — the run hit the step budget before finishing. Diagnose what blocked it from the failure-annotated history (look for `(failed: ...)` and `(rejected: ...)` entries)."
+          : "OUTCOME: error — something threw during the run. Best-effort summary, mention the error if visible in history.";
+
+  // Order is deliberate: OUTCOME → PAGE TEXT → SNAPSHOT → HISTORY → TASK.
+  // The model's attention bias is strongest on what comes first; putting
+  // the original task last (and labeled as context, not a request) is
+  // what stops the closer from treating this prompt as "execute the
+  // task" and emitting plan-style "I will open Chrome…" prose instead
+  // of a post-mortem.
+  return (
+    `${outcomeLabel}\n` +
+    pageTextBlock +
+    snapshotBlock +
+    `\nWhat the agent actually did (most recent ${recent.length} of ${args.history.length} actions; entries with "(failed: …)" / "(rejected: …)" are diagnostic):\n${historyBlock}\n` +
+    `\n--- context only, do NOT restate ---\n` +
+    `Original task the user typed: ${args.task}\n` +
+    `\nWrite the post-mortem reply now. Past tense. No plan, no "I will". If informational, lead with the answer; if procedural, confirm what was done; if stuck, diagnose + one suggestion.`
+  );
+}
+
+function stripThink(text: string): string {
+  // Qwen3 emits <think>...</think> reasoning when enabled. Strip it so
+  // the answer doesn't include the model's internal monologue.
+  let out = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const open = out.indexOf("<think>");
+  if (open !== -1) out = out.slice(0, open);
+  return out
+    .replace(/^\s*<\/think>\s*/i, "")
+    .trim()
+    .replace(/^["'“]+|["'”]+$/g, "")
+    .trim();
+}
 
 export function createExtractor(
-  provider: ProviderClient,
+  provider: ProviderClient | null,
   cfg: ExtractorConfig = {},
 ): ExtractorClient {
   const historyLimit = cfg.historyLimit ?? 30;
   const snapshotLimit = cfg.snapshotLimit ?? 30_000;
+  const ollama = new Ollama({
+    host:
+      cfg.ollamaHost ??
+      process.env.EXTRACTOR_HOST ??
+      process.env.OLLAMA_HOST ??
+      "http://127.0.0.1:11434",
+  });
+  const ollamaModel =
+    cfg.ollamaModel ??
+    process.env.EXTRACTOR_MODEL ??
+    process.env.NARRATOR_MODEL ??
+    "qwen3.5:0.8b";
+  const ollamaTimeoutMs =
+    cfg.ollamaTimeoutMs ??
+    Number(process.env.EXTRACTOR_TIMEOUT_MS ?? 30_000);
 
-  return {
-    async extract(args: ExtractInput): Promise<string> {
-      const recent = args.history.slice(-historyLimit);
-      const historyBlock =
-        recent.length === 0
-          ? "(no actions recorded)"
-          : recent.map((h, i) => `${i + 1}. ${h}`).join("\n");
+  async function tryOllama(args: ExtractInput): Promise<string | null> {
+    const userMsg = buildUserMessage(args, { historyLimit, snapshotLimit });
+    try {
+      const result = await Promise.race([
+        ollama.chat({
+          model: ollamaModel,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: userMsg },
+          ],
+          // think: false — disable Qwen3 reasoning at the API level. The
+          // closer was producing empty / cut-off replies because the
+          // <think> block burned the full num_predict budget before any
+          // visible content emerged (same root cause as the router
+          // empty-response bug, fixed there in the previous patch). With
+          // reasoning off, the post-mortem text comes out cleanly and we
+          // can keep num_predict at 512 for proper list-style answers.
+          think: false,
+          // Higher temperature than the router because we want a
+          // conversational tone, not a one-line decision.
+          options: { temperature: 0.5, num_predict: 512 },
+        }),
+        new Promise<never>((_, rej) =>
+          setTimeout(
+            () => rej(new Error("extractor (ollama) timeout")),
+            ollamaTimeoutMs,
+          ),
+        ),
+      ]);
+      const raw = (result as { message: { content: string } }).message.content;
+      const cleaned = stripThink(raw);
+      console.log(
+        `[extract] ollama (${ollamaModel}) → ${cleaned.length}b`,
+      );
+      return cleaned || null;
+    } catch (e) {
+      console.warn(
+        `[extract] ollama failed (${e instanceof Error ? e.message : String(e)}) — trying fallback`,
+      );
+      return null;
+    }
+  }
 
-      // Prefer the structured snapshot when present. The provider's plan()
-      // accepts a screenshot in its dedicated slot, so we still pass the
-      // last screenshot bytes — that gives the model both signals when
-      // Chrome was active. Snapshot text goes in the user-content text
-      // alongside the question.
-      let snapshotBlock = "";
-      if (args.browserSnapshot) {
-        const ax = args.browserSnapshot.ax;
-        const trimmed =
-          ax.length > snapshotLimit
-            ? ax.slice(0, snapshotLimit) + "\n…(truncated)"
-            : ax;
-        snapshotBlock =
-          `\nPage URL: ${args.browserSnapshot.url}\n` +
-          `Page title: ${args.browserSnapshot.title}\n` +
-          `Page accessibility tree:\n${trimmed}\n`;
-      }
-
-      const outcomeNote =
-        args.outcome === "done"
-          ? ""
-          : args.outcome === "cancelled"
-            ? "\nNote: the agent was cancelled before finishing — answer based on the partial state shown."
-            : args.outcome === "exhausted"
-              ? "\nNote: the agent ran out of steps before fully completing the task — say what's visible and what's missing."
-              : "\nNote: the agent hit an error during the run — answer best-effort from the partial state.";
-
-      const userText =
-        `ORIGINAL USER REQUEST: ${args.task}\n\n` +
-        `Action history (${recent.length} of ${args.history.length} most recent):\n${historyBlock}\n` +
-        snapshotBlock +
-        outcomeNote +
-        "\n\nAnswer the user's request now.";
-
-      // We hijack provider.plan() because it already speaks the right HTTP
-      // dialect with the right auth and the right cancellation wiring. The
-      // "task" field carries our extractor system prompt + the assembled
-      // user message; the screenshot slot carries the final frame. Empty
-      // history because the planner's history is for *its* per-step
-      // self-context, not relevant here.
+  async function tryProvider(args: ExtractInput): Promise<string | null> {
+    if (!provider) return null;
+    const userMsg = buildUserMessage(args, { historyLimit, snapshotLimit });
+    try {
       const result = await provider.plan({
-        task: SYSTEM_PROMPT + "\n\n---\n\n" + userText,
+        task: SYSTEM_PROMPT + "\n\n---\n\n" + userMsg,
         history: [],
         screenshotB64: args.lastScreenshotB64,
         screen: [0, 0],
         signal: args.signal,
       });
-      return result.action.trim();
+      const text = result.action.trim();
+      console.log(`[extract] provider(${provider.name}) → ${text.length}b`);
+      return text || null;
+    } catch (e) {
+      console.warn(
+        `[extract] provider failed (${e instanceof Error ? e.message : String(e)})`,
+      );
+      return null;
+    }
+  }
+
+  return {
+    async extract(args: ExtractInput): Promise<string> {
+      // Try Ollama first — fast, local, conversational, no rate limits.
+      const ollamaAnswer = await tryOllama(args);
+      if (ollamaAnswer) return ollamaAnswer;
+
+      // Fall back to the cloud provider — multimodal, slower, can fail
+      // on rate limits or oversized screenshots.
+      const providerAnswer = await tryProvider(args);
+      if (providerAnswer) return providerAnswer;
+
+      // Last resort: templated. The buddy NEVER goes silent.
+      console.warn("[extract] both LLM paths failed — using templated fallback");
+      return templatedFallback(args);
     },
   };
 }

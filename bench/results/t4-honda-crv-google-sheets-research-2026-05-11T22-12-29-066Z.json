@@ -1,0 +1,63 @@
+{
+  "id": "t4-honda-crv-google-sheets-research-2026-05-11T22:11:27.443Z",
+  "case": "t4-honda-crv-google-sheets-research",
+  "tier": "T4",
+  "axes": [
+    "long-horizon",
+    "state-reading",
+    "browser-only"
+  ],
+  "started_at": "2026-05-11T22:11:27.443Z",
+  "ended_at": "2026-05-11T22:12:29.017Z",
+  "elapsed_ms": 61574,
+  "repo_head_short": "ac2c8873edaa",
+  "bridge_version": {
+    "commit": "ac2c8873edaafa9aec50e8ac453417ba3e8a10bc",
+    "commitShort": "ac2c8873edaa",
+    "dirty": true,
+    "builtAt": "2026-05-11T22:03:21.198Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": "",
+  "max_steps": 150,
+  "task_prompt": "Help me research used 2010 Honda CR-Vs in the $3,000 to $5,000 price range on Facebook Marketplace. In Google Chrome, press cmd+t to open a new tab, then in the URL bar type `https://sheets.new` and press enter — this opens a fresh Google Sheet. Once the sheet loads, click cell A1 and type these headers across row 1, pressing Tab between each one: URL, Asking Price, Year, Mileage, Location, Condition Notes, Messaged. Then press cmd+t again and in the URL bar type the full URL `https://www.facebook.com/marketplace/search?query=2010%20honda%20crv&minPrice=3000&maxPrice=5000` and press enter. For at least 10 listings from the results, open the listing (cmd+click or middle-click to open in a new tab is fine), read the asking price (a plain number, e.g. `4200`, not `$4,200`), year, mileage, and location. Switch back to the Google Sheets tab (cmd+1 through cmd+9 jump to specific tabs by position, or cmd+shift+a opens the tab search) and add one row per listing under the headers — fill URL, Asking Price, Year, Mileage, and Location. Leave Condition Notes and Messaged blank. When you've added all 10 rows, in the Google Sheets tab press cmd+a to select all the data, then cmd+c to copy it to the clipboard so I can verify the contents. Then emit DONE.",
+  "setup": {
+    "exit_code": 0,
+    "stdout": "frontmost_app=Google Chrome\nsetup_done_at=2026-05-11T22:11:30Z\nexpectations:\n  - user is signed into google.com in this Chrome profile (else sheets.new lands on a sign-in page)\n  - user is signed into facebook.com (else marketplace search returns a login wall)\n",
+    "stderr": ""
+  },
+  "agent": {
+    "called": true,
+    "outcome": "cancelled",
+    "duration_ms": 58334,
+    "steps": 4,
+    "response": {
+      "outcome": "cancelled",
+      "sessionId": "j5740svb6fyya7aetrhmp7r60s86h651",
+      "steps": 4,
+      "transcript": [
+        "[t=13.6s] thought: press esc",
+        "[t=13.8s] action: key {\"combo\":\"esc\"}",
+        "[t=26.0s] thought: press esc",
+        "[t=26.1s] action: key {\"combo\":\"esc\"}",
+        "[t=37.9s] thought: hotkey cmd+t",
+        "[t=38.7s] action: key {\"combo\":\"cmd+t\"}",
+        "[t=50.6s] thought: type \"https://sheets.new\"",
+        "[t=56.1s] action: type {\"text\":\"https://sheets.new\"}"
+      ],
+      "finalScreenshotSidecarPath": "t4-honda-crv-google-sheets-research-2026-05-11T22-12-29-066Z-final.png",
+      "finalScreenshotSidecarSha256": "10e3a70f40cfd4eb"
+    }
+  },
+  "scoring": {
+    "verdict": "FAIL",
+    "verdict_line": "FAIL: clipboard is empty — agent never executed the final cmd+a + cmd+c step (or the copy didn't land)",
+    "exit_code": 1,
+    "stdout": "FAIL: clipboard is empty — agent never executed the final cmd+a + cmd+c step (or the copy didn't land)\n",
+    "stderr": ""
+  },
+  "deterministic_score": "FAIL",
+  "agent_self_reported_outcome": "cancelled",
+  "disagreement": false
+}

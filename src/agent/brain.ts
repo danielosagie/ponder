@@ -85,10 +85,17 @@ export async function think(
   // small vision model. The same two bench-evidenced rules can be
   // expressed in 4 lines (~55 tokens) without losing the protection;
   // the verbose rationale lives in the comment block above.
+  // Rule 3 is conditional (the brain.ts comment above warns conditional
+  // rules can be dropped by the small model). It is SAFE here only
+  // because loop.ts gates every INFEASIBLE on verifyInfeasible() — an
+  // unconditional / premature INFEASIBLE gets rejected for lack of a
+  // concrete blocker and the loop keeps going, so the worst case is one
+  // wasted verifier call, not a falsely-abandoned task.
   const TASK_PRIORITY_PREAMBLE =
     `[TASK PRIORITY]\n` +
     `1. Task text > screen state. Do task steps in the order written. If step 1 names an app that isn't visible, open it (cmd+space → type → enter) BEFORE anything else; ignore unrelated tabs/dialogs.\n` +
     `2. If a described element produced no screen change in your last action, it's not there — change the description (or strategy), don't re-emit.\n` +
+    `3. Only if the task is truly impossible — a permission-denied / read-only / error dialog or a system message blocks it (NOT merely a hard or fiddly step) — reply exactly: INFEASIBLE: <one-line reason>. Never use this to give up on a hard-but-doable task.\n` +
     `\n` +
     `[TASK TEXT]\n`;
   task = TASK_PRIORITY_PREAMBLE + task;
@@ -275,7 +282,7 @@ export function needsCoordinates(action: string): boolean {
 // treated as invalid — the loop pushes a `[note: …]` to history and
 // re-prompts, bailing after two consecutive invalids.
 const VALID_ACTION_VERB =
-  /^(?:click\b|double\s+click\b|triple\s+click\b|right\s+click\b|type\b|press\b|hotkey\b|drag\b|scroll\b|wait\b|done\b|browser\.)/i;
+  /^(?:click\b|double\s+click\b|triple\s+click\b|right\s+click\b|type\b|press\b|hotkey\b|drag\b|scroll\b|wait\b|done\b|infeasible\b|browser\.)/i;
 
 export function isValidAction(action: string): boolean {
   return VALID_ACTION_VERB.test(action.trim());
@@ -289,6 +296,23 @@ export function isValidAction(action: string): boolean {
 // must be the first token.
 export function isDone(action: string): boolean {
   return /^DONE\b/i.test(action.trim());
+}
+
+// INFEASIBLE detection, line-anchored like isDone. The brain emits
+// `INFEASIBLE: <reason>` when a concrete barrier (permission denied,
+// read-only, system "can't do that" dialog) makes the task impossible.
+// loop.ts gates this on verifyInfeasible() before terminating, so a
+// loose or premature INFEASIBLE doesn't strand a doable task.
+export function isInfeasible(action: string): boolean {
+  return /^INFEASIBLE\b/i.test(action.trim());
+}
+
+/** Pull the one-line reason out of an `INFEASIBLE: <reason>` action.
+ *  Falls back to a generic string when the model emits a bare token. */
+export function infeasibleReason(action: string): string {
+  const m = action.trim().match(/^INFEASIBLE\s*[:\-]?\s*(.+)$/is);
+  const reason = m?.[1]?.trim();
+  return reason && reason.length > 0 ? reason : "no reason given";
 }
 
 /**

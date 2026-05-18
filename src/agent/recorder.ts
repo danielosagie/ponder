@@ -97,7 +97,7 @@ export interface RecordedRecipe {
   /** Wall-clock duration in ms. */
   durationMs?: number;
   /** Terminal outcome. */
-  outcome?: "done" | "cancelled" | "exhausted" | "error";
+  outcome?: "done" | "cancelled" | "exhausted" | "infeasible" | "error";
   /** Best-effort error string when outcome="error". */
   error?: string;
   /** Provider that ran the loop, for the script-header preamble. */
@@ -231,7 +231,7 @@ export function buildRecipeFromTrace(opts: {
   fromIndex?: number;
   provider?: string;
   surface?: string;
-  outcome?: "done" | "cancelled" | "exhausted" | "error";
+  outcome?: "done" | "cancelled" | "exhausted" | "infeasible" | "error";
   error?: string;
 }): RecordedRecipe {
   const steps = snapshotTrace(opts.fromIndex);
@@ -272,7 +272,7 @@ export interface RecipeRecorder {
   onBrowserSnapshot(snap: BrowserSnapshot): void;
   /** Finalize: stamp outcome + duration. */
   setOutcome(
-    outcome: "done" | "cancelled" | "exhausted" | "error",
+    outcome: "done" | "cancelled" | "exhausted" | "infeasible" | "error",
     error?: string,
   ): void;
   /** The raw recipe record. */
@@ -378,7 +378,7 @@ export function recordFromBridgeTranscript(
   task: string,
   transcript: string[],
   opts: {
-    outcome?: "done" | "cancelled" | "exhausted" | "error";
+    outcome?: "done" | "cancelled" | "exhausted" | "infeasible" | "error";
     durationMs?: number;
     finalUrl?: string;
     provider?: string;

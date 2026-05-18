@@ -52,6 +52,13 @@ import {
 } from "../src/agent/factory.js";
 import * as screen from "../src/screen.js";
 import type { ProviderClient } from "../src/agent/types.js";
+import { cropAndScalePng, pngDimensions } from "../src/agent/imageops.js";
+
+// Mirror eyes.ts refine defaults so the bench measures the SAME config
+// the live loop would use under PONDER_GROUND_REFINE. Sweep these env
+// vars to tune the box/scale and watch the `refined` column move.
+const REFINE_BOX_LOGICAL = Number(process.env.PONDER_GROUND_REFINE_BOX ?? 320);
+const REFINE_SCALE = Number(process.env.PONDER_GROUND_REFINE_SCALE ?? 2);
 
 // ── Test cases ───────────────────────────────────────────────────────
 
@@ -122,18 +129,26 @@ interface Args {
   runs: number;
   skipCropped: boolean;
   skipUncropped: boolean;
+  skipRefined: boolean;
   saveShotsDir?: string;
 }
 
 function parseArgs(): Args {
   const argv = process.argv.slice(2);
-  const a: Args = { caseId: "calculator", runs: 1, skipCropped: false, skipUncropped: false };
+  const a: Args = {
+    caseId: "calculator",
+    runs: 1,
+    skipCropped: false,
+    skipUncropped: false,
+    skipRefined: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--case") a.caseId = argv[++i] ?? a.caseId;
     else if (arg === "--runs") a.runs = Math.max(1, parseInt(argv[++i] ?? "1", 10));
     else if (arg === "--skip-cropped") a.skipCropped = true;
     else if (arg === "--skip-uncropped") a.skipUncropped = true;
+    else if (arg === "--skip-refined") a.skipRefined = true;
     else if (arg === "--save-shots") a.saveShotsDir = argv[++i];
   }
   return a;
@@ -242,6 +257,7 @@ async function run(): Promise<number> {
     expected: { x: number; y: number };
     uncropped?: { x: number; y: number; err: number; pass: boolean };
     cropped?: { x: number; y: number; err: number; pass: boolean };
+    refined?: { x: number; y: number; err: number; pass: boolean };
   }> = [];
 
   for (let run = 0; run < args.runs; run++) {
@@ -397,6 +413,70 @@ async function run(): Promise<number> {
         }
       }
 
+      // Refined = coarse→fine: reuse the uncropped ground as the
+      // coarse point (that IS what eyes.ts uses as coarse in the live
+      // path), crop a tight box around it, upscale, ground again.
+      // Falls back to a dedicated coarse ground if uncropped was
+      // skipped so the variant still measures standalone.
+      if (!args.skipRefined) {
+        let coarse: { x: number; y: number } | null = row.uncropped
+          ? { x: row.uncropped.x - shot.offsetX, y: row.uncropped.y - shot.offsetY }
+          : null;
+        if (!coarse) {
+          const c = await provider.ground({
+            instruction: t.description,
+            screenshotB64: shot.png.toString("base64"),
+            screen: [shot.width, shot.height],
+          });
+          if (!c.error) coarse = { x: c.x, y: c.y };
+        }
+        if (coarse) {
+          const half = REFINE_BOX_LOGICAL / 2;
+          const bx = Math.max(
+            0,
+            Math.min(coarse.x - half, shot.width - REFINE_BOX_LOGICAL),
+          );
+          const by = Math.max(
+            0,
+            Math.min(coarse.y - half, shot.height - REFINE_BOX_LOGICAL),
+          );
+          const boxW = Math.min(REFINE_BOX_LOGICAL, shot.width);
+          const boxH = Math.min(REFINE_BOX_LOGICAL, shot.height);
+          try {
+            const pd = pngDimensions(shot.png);
+            if (pd) {
+              const sX = pd.width / shot.width;
+              const sY = pd.height / shot.height;
+              const zoomed = await cropAndScalePng(
+                shot.png,
+                { x: bx * sX, y: by * sY, w: boxW * sX, h: boxH * sY },
+                REFINE_SCALE,
+              );
+              const fr = await provider.ground({
+                instruction: t.description,
+                screenshotB64: zoomed.toString("base64"),
+                screen: [boxW, boxH],
+              });
+              if (!fr.error && fr.x >= 0 && fr.y >= 0 && fr.x < boxW && fr.y < boxH) {
+                const screenX = bx + fr.x + shot.offsetX;
+                const screenY = by + fr.y + shot.offsetY;
+                const err = Math.hypot(screenX - expected.x, screenY - expected.y);
+                row.refined = {
+                  x: screenX,
+                  y: screenY,
+                  err,
+                  pass: err <= testCase.toleranceP,
+                };
+              }
+            }
+          } catch (e) {
+            console.warn(
+              `[warn] refined ground failed for "${t.description}": ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }
+      }
+
       results.push(row);
     }
   }
@@ -405,15 +485,23 @@ async function run(): Promise<number> {
   console.log("");
   console.log(`Tolerance: ±${testCase.toleranceP}px from expected center`);
   console.log("");
-  const header = "target".padEnd(40) + "expected".padEnd(16) + "uncropped".padEnd(20) + "cropped".padEnd(20);
+  const header =
+    "target".padEnd(40) +
+    "expected".padEnd(16) +
+    "uncropped".padEnd(20) +
+    "cropped".padEnd(20) +
+    "refined".padEnd(20);
   console.log(header);
   console.log("-".repeat(header.length));
   let uncroppedPass = 0;
   let uncroppedTotal = 0;
   let croppedPass = 0;
   let croppedTotal = 0;
+  let refinedPass = 0;
+  let refinedTotal = 0;
   let uncroppedErrSum = 0;
   let croppedErrSum = 0;
+  let refinedErrSum = 0;
   for (const r of results) {
     const exp = `(${Math.round(r.expected.x)},${Math.round(r.expected.y)})`;
     const u = r.uncropped
@@ -422,7 +510,12 @@ async function run(): Promise<number> {
     const c = r.cropped
       ? `${r.cropped.pass ? "✓" : "✗"} (${Math.round(r.cropped.x)},${Math.round(r.cropped.y)}) ${Math.round(r.cropped.err)}px`
       : "—";
-    console.log(r.target.padEnd(40) + exp.padEnd(16) + u.padEnd(20) + c.padEnd(20));
+    const rf = r.refined
+      ? `${r.refined.pass ? "✓" : "✗"} (${Math.round(r.refined.x)},${Math.round(r.refined.y)}) ${Math.round(r.refined.err)}px`
+      : "—";
+    console.log(
+      r.target.padEnd(40) + exp.padEnd(16) + u.padEnd(20) + c.padEnd(20) + rf.padEnd(20),
+    );
     if (r.uncropped) {
       uncroppedTotal++;
       uncroppedErrSum += r.uncropped.err;
@@ -432,6 +525,11 @@ async function run(): Promise<number> {
       croppedTotal++;
       croppedErrSum += r.cropped.err;
       if (r.cropped.pass) croppedPass++;
+    }
+    if (r.refined) {
+      refinedTotal++;
+      refinedErrSum += r.refined.err;
+      if (r.refined.pass) refinedPass++;
     }
   }
   console.log("-".repeat(header.length));
@@ -443,6 +541,11 @@ async function run(): Promise<number> {
   if (croppedTotal > 0) {
     console.log(
       `cropped:    ${croppedPass}/${croppedTotal} (${Math.round((croppedPass / croppedTotal) * 100)}%)  mean_err=${Math.round(croppedErrSum / croppedTotal)}px`,
+    );
+  }
+  if (refinedTotal > 0) {
+    console.log(
+      `refined:    ${refinedPass}/${refinedTotal} (${Math.round((refinedPass / refinedTotal) * 100)}%)  mean_err=${Math.round(refinedErrSum / refinedTotal)}px  [box=${REFINE_BOX_LOGICAL} scale=${REFINE_SCALE}]`,
     );
   }
   console.log("");
@@ -461,6 +564,7 @@ async function run(): Promise<number> {
         bounds,
         runs: args.runs,
         tolerancePx: testCase.toleranceP,
+        refineConfig: { boxLogical: REFINE_BOX_LOGICAL, scale: REFINE_SCALE },
         results,
         summary: {
           uncropped: {
@@ -472,6 +576,11 @@ async function run(): Promise<number> {
             pass: croppedPass,
             total: croppedTotal,
             meanErrPx: croppedTotal > 0 ? croppedErrSum / croppedTotal : null,
+          },
+          refined: {
+            pass: refinedPass,
+            total: refinedTotal,
+            meanErrPx: refinedTotal > 0 ? refinedErrSum / refinedTotal : null,
           },
         },
       },

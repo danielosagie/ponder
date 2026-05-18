@@ -288,7 +288,7 @@ const BRIDGE_RUN_TIMEOUT_MS = Number(
 );
 
 interface BridgeRunResult {
-  outcome: "done" | "cancelled" | "exhausted" | "error";
+  outcome: "done" | "cancelled" | "exhausted" | "infeasible" | "error";
   sessionId: string | null;
   steps: number;
   finalUrl?: string;
@@ -558,7 +558,9 @@ async function tryForwardToBridge(
         ? "NOTE: 'exhausted' is NOT the same as failure. The goal may already be partially or fully achieved — the inner brain sometimes emits useless actions after success because it can't always recognize completion from the screen alone. Before retrying or reporting failure, call browser_snapshot AND screen_screenshot, then check whether the goal is already done."
         : result.outcome === "cancelled"
           ? "NOTE: 'cancelled' means the run stopped mid-flight (timeout or user stop). The final state is unknown until observed — call browser_snapshot AND screen_screenshot before deciding the next move."
-          : null;
+          : result.outcome === "infeasible"
+            ? "NOTE: 'infeasible' is a DELIBERATE verdict — the agent verified a concrete blocker (permission denied, read-only, login wall, system 'can't do that') makes this impossible. This is the CORRECT answer for a trap/impossible task; do NOT just retry. The blocker is in the transcript as 'INFEASIBLE: …' — report it to the user."
+            : null;
     // Reconstruct a RecordedSession from the bridge's transcript so we
     // can persist a Playwright script + JSON manifest the user can
     // replay/edit later. The bridge doesn't currently forward
@@ -737,7 +739,10 @@ export function registerTools(server: McpServer): void {
         "can't finish in ~8 steps the orchestrator should re-plan with fresh state " +
         "via browser_snapshot / screen_screenshot. Auto-forwards to the Electron " +
         "Holo3 app's bridge when running so your tray-menu provider + perms are in " +
-        "effect. Returns a transcript + outcome (done | exhausted | cancelled)." +
+        "effect. Returns a transcript + outcome (done | exhausted | " +
+        "cancelled | infeasible). 'infeasible' is a deliberate, verified " +
+        "verdict that a concrete blocker makes the task impossible — treat " +
+        "it as a real answer, not a failure to retry." +
         BRAND_TAG_SUFFIX,
       inputSchema: {
         task: z
@@ -1155,7 +1160,7 @@ export function registerTools(server: McpServer): void {
         const cancelled = (): boolean =>
           timedOut || (extra?.signal?.aborted ?? false);
 
-        let outcome: "done" | "cancelled" | "exhausted" | "error" = "error";
+        let outcome: "done" | "cancelled" | "exhausted" | "infeasible" | "error" = "error";
         let errorMsg: string | undefined;
         const timeoutHandle = setTimeout(() => {
           timedOut = true;
@@ -1235,7 +1240,9 @@ export function registerTools(server: McpServer): void {
             ? "NOTE: 'exhausted' is NOT the same as failure. The goal may already be partially or fully achieved — the inner brain sometimes emits useless actions after success because it can't always recognize completion from the screen alone. Before retrying or reporting failure, call browser_snapshot AND screen_screenshot, then check whether the goal is already done."
             : outcome === "cancelled"
               ? "NOTE: 'cancelled' means the run stopped mid-flight (timeout or user stop). The final state is unknown until observed — call browser_snapshot AND screen_screenshot before deciding the next move."
-              : null;
+              : outcome === "infeasible"
+                ? "NOTE: 'infeasible' is a DELIBERATE verdict — the agent verified a concrete blocker (permission denied, read-only, login wall, system 'can't do that') makes this impossible. This is the CORRECT answer for a trap/impossible task; do NOT just retry. The blocker is in the transcript as 'INFEASIBLE: …' — report it to the user."
+                : null;
 
         const header = [
           `Outcome: ${outcome}${

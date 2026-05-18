@@ -489,7 +489,10 @@ async function checkActionPermissions(): Promise<{
 // generates its own answer text from the transcript we return.
 
 interface BridgeResult {
-  outcome: "done" | "cancelled" | "exhausted" | "error";
+  // `infeasible` is a CORRECT terminal answer for trap tasks (the goal
+  // genuinely can't be done) — bench/run.ts forwards it as OUTCOME so
+  // T5 cases score. Distinct from `error` (the run itself broke).
+  outcome: "done" | "cancelled" | "exhausted" | "infeasible" | "error";
   sessionId: string | null;
   steps: number;
   finalUrl?: string;
@@ -642,7 +645,8 @@ async function runAgentTaskForBridge(
     },
   };
 
-  let outcome: "done" | "cancelled" | "exhausted" = "exhausted";
+  let outcome: "done" | "cancelled" | "exhausted" | "infeasible" =
+    "exhausted";
   let errorMessage: string | undefined;
   try {
     outcome = await runTask({
@@ -703,7 +707,9 @@ async function runAgentTaskForBridge(
       ? "\nNOTE: 'exhausted' is NOT the same as failure. The goal may already be partially or fully achieved — the inner brain sometimes emits useless actions after success because it can't always recognize completion from the screen alone. Before retrying or reporting failure, call browser_snapshot AND screen_screenshot, then check whether the goal is already done."
       : outcome === "cancelled"
         ? "\nNOTE: 'cancelled' means the run stopped mid-flight (timeout or user stop). The final state is unknown until observed — call browser_snapshot AND screen_screenshot before deciding the next move."
-        : null;
+        : outcome === "infeasible"
+          ? "\nNOTE: 'infeasible' is a DELIBERATE verdict — the inner agent checked and a concrete blocker (permission denied, read-only, login wall, system 'can't do that') makes this task impossible. This is the CORRECT answer for a trap/impossible task; do NOT just retry agent_do. Report the blocker to the user (it's in the transcript as 'INFEASIBLE: …') and ask how they want to proceed."
+          : null;
 
   const finalText = errorMessage
     ? `Bridge run failed: ${errorMessage}`
@@ -719,9 +725,14 @@ async function runAgentTaskForBridge(
       });
       await convex.mutation(convexApi.sessions.setStatus, {
         sessionId: sessionId as never,
+        // Convex's status enum has no "infeasible"; it's a terminal
+        // NON-error correct answer, so map it to "done" here (the
+        // verbatim "Outcome: infeasible" + reason is preserved in the
+        // result step text above and in BridgeResult.outcome, which is
+        // what bench/run.ts actually scores on).
         status: errorMessage
           ? "error"
-          : outcome === "done"
+          : outcome === "done" || outcome === "infeasible"
             ? "done"
             : outcome === "cancelled"
               ? "cancelled"

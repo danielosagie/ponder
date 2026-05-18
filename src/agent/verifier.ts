@@ -160,3 +160,104 @@ export async function verify(
 export function verifierEnabled(): boolean {
   return process.env.PONDER_VERIFIER !== "off";
 }
+
+export interface InfeasibleResult {
+  /** True only when a concrete, screen-visible blocker is confirmed. */
+  confirmed: boolean;
+  reason?: string;
+}
+
+/**
+ * The mirror of verify() for the INFEASIBLE claim.
+ *
+ * verify() guards false-positive DONE (agent lies that it finished).
+ * This guards false-positive INFEASIBLE (agent gives up on a task that
+ * is merely hard, not impossible) — the T5 failure class. The defaults
+ * are deliberately INVERTED vs verify(): on verifier error or ambiguous
+ * output we return { confirmed: false } (keep working), because wrongly
+ * abandoning a doable task is worse than spending one more step on a
+ * genuinely impossible one.
+ *
+ * Only `confirmed: true` when the screenshot/URL shows a concrete
+ * immovable barrier: a permission-denied dialog, a read-only / locked
+ * error, an explicit system "this can't be done" message, a login wall
+ * with no credentials, etc. "I couldn't find the button" is NOT
+ * infeasible — that's a grounding miss; keep trying.
+ */
+export async function verifyInfeasible(
+  provider: ProviderClient,
+  args: VerifyArgs & { claimedReason: string },
+): Promise<InfeasibleResult> {
+  const urlBlock = args.currentUrl
+    ? `\n\nCurrent browser URL: ${args.currentUrl.url}\n` +
+      `Current browser title: ${args.currentUrl.title}\n`
+    : "";
+  const snapshotBlock = args.browserSnapshot
+    ? `\n\nChrome accessibility snapshot (informational):\n` +
+      `URL: ${args.browserSnapshot.url}\n` +
+      (args.browserSnapshot.ax.length > VERIFIER_SNAPSHOT_LIMIT
+        ? args.browserSnapshot.ax.slice(0, VERIFIER_SNAPSHOT_LIMIT) +
+          "\n…(truncated for verifier)"
+        : args.browserSnapshot.ax)
+    : "";
+
+  const checkTask =
+    `INFEASIBILITY CHECK — DO NOT EMIT AN ACTION VERB.\n` +
+    `\n` +
+    `Original goal: ${args.task}\n` +
+    `The agent claims this is IMPOSSIBLE, reason: "${args.claimedReason}"\n` +
+    `${urlBlock}${snapshotBlock}\n` +
+    `\n` +
+    `Default answer is CONTINUE. Only respond IMPOSSIBLE if the screenshot\n` +
+    `or browser state shows a CONCRETE, immovable blocker:\n` +
+    `  • a permission-denied / "operation not permitted" / read-only or\n` +
+    `    locked-file error dialog,\n` +
+    `  • an explicit system message that the action cannot be done,\n` +
+    `  • a login / paywall the agent has no way past,\n` +
+    `  • a missing prerequisite the agent cannot create.\n` +
+    `\n` +
+    `These are NOT impossible (respond CONTINUE):\n` +
+    `  • "I can't find the button/element" — that's a grounding miss.\n` +
+    `  • the task is long, fiddly, or multi-step.\n` +
+    `  • a dialog is in the way that could just be dismissed.\n` +
+    `  • the agent simply hasn't tried a working approach yet.\n` +
+    `\n` +
+    `Reply with EXACTLY ONE LINE:\n` +
+    `  IMPOSSIBLE: <one-sentence concrete blocker visible now>\n` +
+    `  CONTINUE: <one-sentence reason it is still worth trying>\n` +
+    `\n` +
+    `No other output. No verbs. No prose.`;
+
+  const t0 = Date.now();
+  console.log(
+    `[infeasible-check] → ${provider.name}.plan reason="${args.claimedReason.slice(0, 60)}"`,
+  );
+  let raw: string;
+  try {
+    const out = await provider.plan({
+      task: checkTask,
+      history: [],
+      screenshotB64: args.screenshotB64,
+      screen: args.screen,
+      signal: args.signal,
+    });
+    raw = out.action.trim();
+  } catch (e) {
+    console.warn(
+      `[infeasible-check] ← error (${Date.now() - t0}ms): ${
+        e instanceof Error ? e.message : String(e)
+      } — NOT confirming (keep working)`,
+    );
+    return { confirmed: false };
+  }
+  console.log(
+    `[infeasible-check] ← (${Date.now() - t0}ms) "${raw.slice(0, 120)}${raw.length > 120 ? "..." : ""}"`,
+  );
+
+  const m = raw.match(/^\s*IMPOSSIBLE\s*[:\-]\s*(.+?)\s*$/im);
+  if (m && m[1]) {
+    return { confirmed: true, reason: m[1].trim() };
+  }
+  // CONTINUE, ambiguous, verb echo, empty — all mean "don't give up".
+  return { confirmed: false };
+}

@@ -3,6 +3,8 @@ import {
   think,
   needsCoordinates,
   isDone,
+  isInfeasible,
+  infeasibleReason,
   isValidAction,
   parseDragAction,
   parseBrowserAction,
@@ -12,7 +14,15 @@ import { createOllamaPlanner } from "./planner";
 import { canonicalizeUrl, type RouterClient } from "./router";
 import type { AgentEvents, ProviderClient } from "./types";
 import type { BrowserClient, BrowserSnapshot } from "./browser/types";
-import { verify, verifierEnabled } from "./verifier";
+import { verify, verifyInfeasible, verifierEnabled } from "./verifier";
+
+/** Terminal outcomes of a task / subtask run. `infeasible` is a
+ *  CORRECT answer for trap tasks (the goal genuinely can't be done),
+ *  distinct from `exhausted` (ran out of steps) and `cancelled`
+ *  (stopped mid-flight). Kept as a string union to match the existing
+ *  call-site style — every `=== "exhausted"` branch was audited when
+ *  this was added. */
+type TaskOutcome = "done" | "cancelled" | "exhausted" | "infeasible";
 import * as screen from "../screen";
 
 // Per-subtask cap. With hierarchical planning the inner loop only needs to
@@ -519,7 +529,7 @@ function inferTargetApp(task: string): string | null {
  */
 export async function runTask(
   opts: RunOptions,
-): Promise<"done" | "cancelled" | "exhausted"> {
+): Promise<TaskOutcome> {
   // Destructure events early — task is left mutable because the
   // auto-targetApp detection below may prepend a framing line.
   const { events } = opts;
@@ -620,7 +630,11 @@ export async function runTask(
       maxSteps: flatBudget,
       onStep: () => {},
     });
-    return result === "cancelled" || result === "exhausted" ? result : "done";
+    return result === "cancelled" ||
+      result === "exhausted" ||
+      result === "infeasible"
+      ? result
+      : "done";
   }
 
   const planner = createOllamaPlanner();
@@ -695,6 +709,14 @@ export async function runTask(
     });
 
     if (result === "cancelled") return "cancelled";
+    // A subtask the inner loop proved impossible makes the whole task
+    // impossible — propagate immediately, don't grind the rest.
+    if (result === "infeasible") {
+      console.warn(
+        `[loop] 🚫 subtask ${i + 1} infeasible — aborting remaining ${plan.subtasks.length - i - 1} subtasks`,
+      );
+      return "infeasible";
+    }
     // If a subtask exhausts its budget without emitting DONE, the planner
     // either decomposed wrong or the lower-level model got stuck. Either
     // way, continuing into the next subtask is unlikely to help — abort.
@@ -729,7 +751,7 @@ interface SubtaskOpts extends RunOptions {
 
 async function runOneSubtask(
   opts: SubtaskOpts,
-): Promise<"done" | "cancelled" | "exhausted"> {
+): Promise<TaskOutcome> {
   const { task, provider, events, overallGoal, maxSteps, onStep } = opts;
   const browser = opts.browser ?? null;
   const router = opts.router ?? null;
@@ -806,6 +828,10 @@ async function runOneSubtask(
   // brain can course-correct. Capped at one verify per subtask — we'd
   // rather trust the second DONE than enter an infinite verify loop.
   let verificationAttempted = false;
+  // One-shot, separate from verificationAttempted so a DONE-verify and
+  // an INFEASIBLE-verify in the same subtask don't cannibalize each
+  // other's single allowed check.
+  let infeasibilityAttempted = false;
   // Hierarchical retry: when anti-loop guard #1 would bail (same
   // action 3/4 times AND screen unchanged), give the brain ONE
   // chance to recover by force-resnapshotting + pushing a strong
@@ -1223,6 +1249,52 @@ async function runOneSubtask(
       }
       console.log("[loop] ✅ DONE");
       return "done";
+    }
+
+    // INFEASIBLE — the mirror of DONE. The brain claims the task can't
+    // be done. Gate it on verifyInfeasible() so a premature / loose
+    // claim (small model dropped rule 3's "only if" and gave up early)
+    // doesn't strand a doable task. Same one-verify-then-trust shape as
+    // DONE: a second INFEASIBLE after a rejection is trusted, so the
+    // brain can't be argued with forever.
+    if (isInfeasible(action)) {
+      const claimed = infeasibleReason(action);
+      if (!infeasibilityAttempted && verifierEnabled()) {
+        infeasibilityAttempted = true;
+        console.log(`[loop] 🚫 brain claims INFEASIBLE — verifying: ${claimed}`);
+        await events.onStatus("Double-checking the task is truly impossible…");
+        const check = await verifyInfeasible(provider, {
+          task: taskForPlanner,
+          claimedReason: claimed,
+          screenshotB64: shot.png.toString("base64"),
+          screen: screenSize,
+          browserSnapshot,
+          currentUrl,
+          signal: ctrl.signal,
+        });
+        if (cancelled()) return "cancelled";
+        if (check.confirmed) {
+          const why = check.reason ?? claimed;
+          console.log(`[loop] 🚫 INFEASIBLE confirmed — ${why}`);
+          await events.onError(`INFEASIBLE: ${why}`);
+          return "infeasible";
+        }
+        const note = `[note: that is NOT impossible — no concrete blocker is visible on screen; do NOT give up, try a different approach]`;
+        console.log(`[loop] ↩ infeasible rejected — ${note}`);
+        history.push(note);
+        actionScreenHashes.push(screenHash);
+        opts.onHistory?.(note);
+        await events.onError(
+          "Claimed the task is impossible but no concrete blocker is visible — continuing.",
+        );
+        if (await interruptiblePause(stepPause, cancelled)) return "cancelled";
+        continue;
+      }
+      // Verifier disabled, or the one check was already spent and the
+      // brain re-asserted INFEASIBLE — trust it (mirrors DONE).
+      console.log(`[loop] 🚫 INFEASIBLE — ${claimed}`);
+      await events.onError(`INFEASIBLE: ${claimed}`);
+      return "infeasible";
     }
 
     // Empty plan → don't waste a ground/exec round-trip (and don't tick the

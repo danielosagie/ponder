@@ -77,6 +77,39 @@ const SPOTLIGHT_LAUNCH_SETTLE_MS = Number(
   process.env.HOLO3_SPOTLIGHT_LAUNCH_SETTLE_MS ?? 2500,
 );
 
+// Proactive completion probe.
+//
+// Holo3 is a grounding-first model: handed a multi-step task in flat
+// mode (no planner) it executes atomic clicks accurately but has NO
+// notion of "the goal is now met — stop". It simply never emits DONE,
+// so the existing Ralph verifier (which only fires ON a DONE claim)
+// never engages, and the loop grinds to maxSteps / errors out. Seen
+// 2026-05-18 on calculator-mouse-math: perfect grounding of 4,7,×,8
+// then an endless 8,=,8,= oscillation, never terminating.
+//
+// Fix: every N steps, run the SAME skeptical verifier proactively —
+// "is the original goal already satisfied on screen?" The verifier
+// defaults to RETRY and only says VERIFIED with concrete proof, so
+// probing mid-task when NOT done is safe (costs one call, returns
+// RETRY, loop continues). When the goal IS done but the brain didn't
+// notice, the probe terminates the run instead of looping to 50.
+//
+// Cost profile: healthy short runs finish (or the brain emits DONE)
+// before step PROBE_MIN, so the probe never fires — ~zero overhead on
+// the common path. On the failure mode it targets, it converts "loop
+// to exhaustion" into "stop when actually done" — a net time SAVING.
+// Disable with PONDER_COMPLETION_PROBE=off.
+const COMPLETION_PROBE_ENABLED =
+  process.env.PONDER_COMPLETION_PROBE !== "off";
+const COMPLETION_PROBE_EVERY = Math.max(
+  2,
+  Number(process.env.PONDER_COMPLETION_PROBE_EVERY ?? 4),
+);
+const COMPLETION_PROBE_MIN_STEP = Math.max(
+  2,
+  Number(process.env.PONDER_COMPLETION_PROBE_MIN ?? 4),
+);
+
 export interface RunOptions {
   task: string;
   provider: ProviderClient;
@@ -278,30 +311,31 @@ async function maybeCropToTargetApp(
     );
     return shot;
   }
-  // SIZE THRESHOLD: skip cropping for windows whose min dimension is
-  // below MIN_CROP_DIM_PX. The May-11 bench showed that at 230×408
-  // cropped, the model could only get 1/6 Calculator buttons right —
-  // 57px-wide buttons don't survive the model's 0-1000 normalized
-  // grounding output (~4px per unit). Padding the crop to give more
-  // context (commit 73dc680) made it WORSE: the padded region picked
-  // up distractors from adjacent windows (Cursor IDE chat) that looked
-  // button-like, and the model locked onto those corners.
+  // SIZE THRESHOLD — 300px min-dim, KEPT (do not lower until the live
+  // crop is made native-resolution; see below).
   //
-  // The right call for sub-300px UIs is: don't crop. Use the full
-  // screen and pay the inference cost. The model NEEDS full pixel
-  // resolution to distinguish small buttons. For Calculator-class
-  // apps the accuracy win (6/6 vs 1/6) far outweighs the 60s vs 17s
-  // speed difference — a wrong answer fast is worse than a right
-  // answer slow.
+  // 2026-05-18 lesson (the hard way): the corrected vision-precision
+  // bench shows cropped Calculator grounding at 8/8 ~5px — but that
+  // bench crops the **Retina (2×) PNG** (a 460×816px high-detail
+  // image) and only declares logical 230×408 as the coord space. The
+  // LIVE crop here runs at scaleFactor=1 → an actual **230×408px,
+  // low-detail** image (dev log: "→8447 bytes, ~15.8× fewer pixels").
+  // The model grounds that degraded thumbnail badly (observed: "4"
+  // grounded at (114,399), nowhere near it — wrong 100% of the time).
+  // So the May-11 "1/6 cropped" result was REAL for the live path;
+  // it just wasn't reproduced by the bench because the bench tests a
+  // higher-res crop than the app produces.
   //
-  // For Chrome/Finder/normal-sized windows (min >= 300px) cropping
-  // remains a strong win: their UI elements are large enough (typ.
-  // 30-60px text, 50-100px buttons) that the model resolves them
-  // fine in a sub-1000px crop, and the 6× wall-time speedup is real.
+  // The real speed-via-crop fix is to make maybeCropToTargetApp crop
+  // at NATIVE/Retina resolution (preserve the source PNG's pixel
+  // density, like vision-precision's cropPng does) instead of
+  // downsampling to logical px. Until that lands, sub-300px windows
+  // MUST stay uncropped (accurate but slower) — a right answer slow
+  // beats a wrong answer fast.
   const MIN_CROP_DIM_PX = 300;
   if (Math.min(bounds.width, bounds.height) < MIN_CROP_DIM_PX) {
     console.log(
-      `[loop] 🪟 crop skipped: ${targetApp} window ${bounds.width}×${bounds.height} is below the ${MIN_CROP_DIM_PX}px threshold — the model can't reliably ground small UI elements at sub-${MIN_CROP_DIM_PX}px crop resolution, so running uncropped this step (slower but accurate). Verified May-11: tight crop got 1/6 Calculator buttons right; uncropped got 6/6.`,
+      `[loop] 🪟 crop skipped: ${targetApp} window ${bounds.width}×${bounds.height} below ${MIN_CROP_DIM_PX}px min-dim — live crop is logical-res (not Retina) so small-window crops ground badly; running uncropped (accurate, slower).`,
     );
     return shot;
   }
@@ -1007,6 +1041,43 @@ async function runOneSubtask(
           `[loop] snapshot failed (${e instanceof Error ? e.message : String(e)}) — vision-only this step`,
         );
       }
+    }
+
+    // ── Proactive completion probe ───────────────────────────────────────
+    // Catch "goal already met but the brain won't emit DONE" (the flat-
+    // mode grounding-model failure). Cadence-gated so healthy short runs
+    // never pay for it; the skeptical verifier makes a mid-task probe
+    // safe (RETRY unless concrete proof).
+    if (
+      COMPLETION_PROBE_ENABLED &&
+      verifierEnabled() &&
+      step >= COMPLETION_PROBE_MIN_STEP &&
+      step % COMPLETION_PROBE_EVERY === 0
+    ) {
+      console.log(
+        `[loop] 🔎 completion probe (step ${step + 1}) — checking if the goal is already met…`,
+      );
+      const probe = await verify(provider, {
+        task: taskForPlanner,
+        screenshotB64: shot.png.toString("base64"),
+        screen: screenSize,
+        browserSnapshot,
+        currentUrl,
+        signal: ctrl.signal,
+      });
+      if (cancelled()) return "cancelled";
+      if (probe.verified) {
+        console.log(
+          "[loop] ✅ completion probe: goal already achieved — the brain " +
+            "didn't recognize completion; terminating as DONE",
+        );
+        await events.onStatus("Goal already met — finishing.");
+        return "done";
+      }
+      console.log(
+        `[loop] 🔁 completion probe: not done yet (${probe.reason ?? "no proof"}) — continuing`,
+      );
+      if (cancelled()) return "cancelled";
     }
 
     // ── Post-navigate redirect detection ─────────────────────────────────

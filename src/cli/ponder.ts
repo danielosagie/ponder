@@ -57,6 +57,12 @@ import {
   AUDIT_LOG_PATH,
   type Scope,
 } from "../bridge/auth.js";
+import {
+  startBrowserJobsConsumer,
+  readBrowserJobsConfig,
+  bootstrapConfig,
+  isConfigured,
+} from "../agent/browser-jobs/index.js";
 
 // ── Pretty output ────────────────────────────────────────────────────
 
@@ -116,6 +122,10 @@ ${C.bold}BROWSER${C.reset}
   ${C.cyan}attach${C.reset}              Attach a Chrome tab (vision-assisted)
   ${C.cyan}setup${C.reset}               Guided setup wizard
   ${C.cyan}doctor${C.reset}              Health check
+
+${C.bold}DISPATCH${C.reset}
+  ${C.cyan}consume${C.reset}             Run jobs dispatched from the phone (subscribes to the
+                      browser-jobs queue, executes each via Ponder)
 
 ${C.bold}BRIDGE AUTH${C.reset}
   ${C.cyan}grant${C.reset} <name>        Mint an API key for a consumer
@@ -657,6 +667,55 @@ async function cmdGrants(args: ParsedArgs): Promise<number> {
 
 // ── Dispatcher ───────────────────────────────────────────────────────
 
+// ── consume: run the browser-jobs dispatch consumer ─────────────────
+// Subscribes to the sssync-bknd Convex `browserJobs` queue and executes each
+// job through the Ponder engine (local Electron bridge). Long-running: stays
+// up until Ctrl-C. This is the desktop side of "send a job from the phone".
+async function cmdConsume(): Promise<number> {
+  let config = readBrowserJobsConfig();
+  if (!isConfigured(config)) config = await bootstrapConfig(config);
+  if (!isConfigured(config)) {
+    err(`${C.red}browser-jobs consumer is not configured.${C.reset}`);
+    err(
+      `${C.dim}Set PONDER_BROWSER_JOBS_CONVEX_URL + PONDER_BROWSER_JOBS_USER_ID,\n` +
+        `or PONDER_BROWSER_JOBS_SYNC_BASE_URL + PONDER_BROWSER_JOBS_SYNC_TOKEN to bootstrap from the backend.${C.reset}`,
+    );
+    return 2;
+  }
+
+  out(`${C.bold}ponder consume${C.reset} ${C.dim}— waiting for dispatched jobs (Ctrl-C to stop)${C.reset}`);
+  const consumer = await startBrowserJobsConsumer({
+    config,
+    events: { log: (msg) => out(`${C.dim}[browser-jobs]${C.reset} ${msg}`) },
+  });
+  const s = consumer.status();
+  out(
+    `${C.cyan}worker=${s.workerId}${C.reset} user=${s.userId} ` +
+      `bridge=:${config.bridgePort} reconcile=${s.backendSyncConfigured ? "on" : "off"}`,
+  );
+  if (!s.backendSyncConfigured) {
+    err(
+      `${C.dim}(no sync token — jobs run + complete in Convex but won't reconcile back to the agent thread)${C.reset}`,
+    );
+  }
+
+  // Keep the process alive until interrupted.
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      out(`\n${C.dim}stopping consumer…${C.reset}`);
+      try {
+        consumer.stop();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+  return 0;
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -711,6 +770,9 @@ async function main(): Promise<void> {
       case "where":
         out(RECIPES_DIR);
         process.exit(0);
+        return;
+      case "consume":
+        process.exit(await cmdConsume());
         return;
       default:
         err(`${C.red}unknown command: ${cmd}${C.reset}`);

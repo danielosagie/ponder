@@ -55,6 +55,215 @@ function listingRef(job: BrowserJob): string {
 }
 
 /**
+ * FB account-safety: the friction phrases that indicate Facebook has flagged
+ * the account (checkpoint, captcha, rate-limit, identity verify, restriction…).
+ * Seeing any of these in a WRITE result/error trips the consumer's circuit
+ * breaker — a HARD perma-block on all future writes until manual reset, so
+ * every phrase here must be UNAMBIGUOUS FB friction. NOTE: "in review" /
+ * "being reviewed" is NORMAL on healthy publishes and is explicitly stripped
+ * before scanning (see detectFrictionPhrase).
+ *
+ * DELIBERATELY NOT here: generic, transient strings like "try again later" and
+ * "log in again" — they show up in benign network flakiness / session blips and
+ * would falsely perma-trip the breaker. Benign flakiness is still caught (and
+ * self-heals) via the consumer's consecutive-write-failure counter, which only
+ * needs a manual reset after N real failures in a row, not the first hiccup.
+ */
+export const FRICTION_PHRASES: readonly string[] = [
+  // Security / checkpoint / identity (unambiguous account flags).
+  // NOTE (GAP A, adversarial re-review): the haystack for the agent_do/vision
+  // path embeds the bridge transcript, which echoes BOTH on-page FB text AND
+  // the NL goal (built from the user's own title/description/message). Bare
+  // single tokens like "suspicious" / "security check" / "checkpoint" /
+  // "captcha" therefore matched BENIGN content — an item titled "Captcha
+  // Solver" or "Security Check Camera", or FB's benign "Don't share suspicious
+  // links" inbox banner — and HARD-perma-tripped the breaker. Two defenses:
+  //   (1) frictionForWriteResult() ATTRIBUTES each detected phrase (round-3):
+  //       it suppresses the phrase only when the WHOLE phrase is present in the
+  //       user's own goal/payload, so user-supplied strings don't trip — WITHOUT
+  //       mutating the haystack (so it can never fail open the way the old
+  //       substring scrub did), and
+  //   (2) the on-page-overlap phrases below are NARROWED to FB-account-specific
+  //       multiword forms so a benign on-page banner can't match (and so a
+  //       one-word user title can never suppress a multi-word ban phrase).
+  // Keep every phrase UNAMBIGUOUS FB account friction — a match is a manual-
+  // reset perma-block on all writes.
+  "security checkpoint",
+  "complete the checkpoint",
+  "enter the captcha",
+  "temporarily blocked",
+  "confirm it's you",
+  "confirm its you",
+  "unusual activity",
+  "verify your identity",
+  "account has been restricted",
+  "account has been disabled",
+  "account is restricted",
+  "account is disabled",
+  "temporarily restricted",
+  "suspicious activity",
+  "suspicious login",
+  "suspicious attempt",
+  "you're temporarily restricted",
+  "you are temporarily restricted",
+  "you're temporarily restricted from",
+  "we limit how often",
+  "we've limited",
+  "weve limited",
+  "go to facebook to confirm",
+  "complete a security check",
+  "security check required",
+  "please re-enter your password",
+  // FB rate-limit / "too fast" friction (specific wording, not generic flakiness).
+  "posting too fast",
+  "posting too quickly",
+  "doing that too often",
+  "doing that too much",
+  "you're going too fast",
+  "you are going too fast",
+];
+
+/** Benign review spans removed before friction scanning — a healthy publish
+ *  legitimately says "this listing is being reviewed", which must NOT match. */
+const BENIGN_REVIEW_SPANS: readonly string[] = [
+  "in review",
+  "is being reviewed",
+  "being reviewed",
+  "under review",
+];
+
+/**
+ * Scan free text for an FB friction phrase. Pure/stateless/unit-testable:
+ * lowercases the input, strips benign review spans first so a normal
+ * "being reviewed" never trips, then returns the first matching friction
+ * phrase or null. The consumer calls this on combined write result + error
+ * text to drive the circuit breaker.
+ */
+export function detectFrictionPhrase(text: string): string | null {
+  if (!text) return null;
+  let hay = String(text).toLowerCase();
+  for (const span of BENIGN_REVIEW_SPANS) {
+    hay = hay.split(span).join(" ");
+  }
+  for (const phrase of FRICTION_PHRASES) {
+    if (hay.includes(phrase)) return phrase;
+  }
+  return null;
+}
+
+/**
+ * GAP A (round-3 redesign) — decide whether a WRITE outcome carries a GENUINE
+ * Facebook friction signal, with NO mutation of the haystack and explicit
+ * phrase ATTRIBUTION. Returns the friction phrase if it came from on-page /
+ * FB text, or null if it is fully accounted for by the user's own content (or
+ * if there's no friction at all). A safety breaker must NEVER fail open, so
+ * this is deliberately conservative about suppression.
+ *
+ * WHY this supersedes scrubForFrictionScan (now removed):
+ *   The old scrub MUTATED the haystack by blanking out every user-field
+ *   substring. That had three fatal flaws for a safety breaker:
+ *     (1) FAIL-OPEN: a benign one-word title like "activity" / "account" /
+ *         "limit" blanked that word out of the REAL on-page FB friction text,
+ *         so a genuine "unusual activity" ban silently vanished from the
+ *         haystack and the breaker never tripped.
+ *     (2) FALSE-TRIP: the haystack was JSON.stringify'd (escaped quotes) while
+ *         the scrub spans were raw, so a quoted user span never matched and was
+ *         never removed — defeating the suppression it was meant to provide.
+ *     (3) MISSED FIELDS: only title/description/message/text were scrubbed, but
+ *         goalForJob interpolates category/condition/location/buyer/thread/
+ *         slots and the default-type path stringifies the whole payload.
+ *
+ * The fix is non-mutating attribution:
+ *   - Build a PLAIN-TEXT haystack (recursive string leaves of outcome.result +
+ *     outcome.error, space-joined — NO JSON.stringify, so no escaped quotes to
+ *     mismatch on).
+ *   - phrase = detectFrictionPhrase(haystack). If null → no friction → null.
+ *   - Collect the user's own strings: goalForJob(job) + every recursive string
+ *     value in job.payload, each kept as a SEPARATE leaf. If ANY single leaf
+ *     contains the whole phrase → it is user-originated → suppress (return null).
+ *     Otherwise the phrase came from on-page/FB text → return it (real friction).
+ *
+ * Attribution is PER-LEAF, never on a space-joined blob: joining first would
+ * fabricate a contiguous phrase across two adjacent fields (title:"account has
+ * been" + condition:"restricted") that no field contained, suppressing real
+ * friction and failing open. Because every FRICTION_PHRASES entry is multi-word
+ * / FB-account-specific, a single shared word (a title of just "activity") can
+ * NEVER suppress a multi-word phrase like "unusual activity" — one user value
+ * would have to contain the entire phrase. So this CANNOT fail open the way the
+ * substring scrub (or a joined blob) did.
+ *
+ * The only residual suppression case is rare and self-correcting: the user
+ * verbatim-types a complete friction phrase (e.g. "we limit how often") AND FB
+ * also displays it on the same write. That one write is suppressed, but the
+ * consumer's consecutive-write-failure counter still backstops a genuine block.
+ */
+export function frictionForWriteResult(
+  outcome: BrowserJobExecutionResult,
+  job: BrowserJob,
+): string | null {
+  // Plain-text haystack: recursive string leaves of result + the error string.
+  const haystackParts: string[] = [];
+  collectStringLeaves(outcome.result, haystackParts);
+  if (outcome.error) haystackParts.push(outcome.error);
+  const haystack = haystackParts.join(" ");
+
+  const phrase = detectFrictionPhrase(haystack);
+  if (!phrase) return null;
+
+  // Attribution (no mutation): does the user's own content contain the WHOLE
+  // friction phrase? Build userBlob from the rendered goal + every payload
+  // string value, lowercased to match detectFrictionPhrase's casing.
+  const userParts: string[] = [];
+  try {
+    const goal = goalForJob(job);
+    if (goal) userParts.push(goal);
+  } catch {
+    /* never let goal-building break the safety scan */
+  }
+  collectStringLeaves(job.payload, userParts);
+
+  // Attribution is PER-LEAF, never on a joined blob: suppress only if a SINGLE
+  // user string (the rendered goal, or one individual payload field) contains
+  // the whole phrase. Joining leaves first would FABRICATE a contiguous phrase
+  // across two adjacent fields — e.g. title:"account has been" +
+  // condition:"restricted" space-joins to "account has been restricted" — that
+  // no field actually contained, suppressing REAL on-page friction and failing
+  // open. Per-leaf attribution cannot fuse fields, so a multi-word phrase must
+  // genuinely appear inside one user-supplied value to be treated as
+  // user-originated.
+  if (userParts.some((s) => s.toLowerCase().includes(phrase))) return null;
+
+  // Phrase is in the outcome but NOT user-originated → genuine on-page/FB
+  // friction → return it so the consumer trips the breaker.
+  return phrase;
+}
+
+/** Recursively collect every string leaf value from a value (objects + arrays)
+ *  into `out`. Pure, depth-guarded, ignores non-string leaves. Used to build a
+ *  PLAIN-TEXT haystack (no JSON escaping) for friction attribution. */
+function collectStringLeaves(value: unknown, out: string[], depth = 0): void {
+  if (depth > 12 || value == null) return; // cycle/runaway guard
+  if (typeof value === "string") {
+    if (value) out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStringLeaves(item, out, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      collectStringLeaves(v, out, depth + 1);
+    }
+  }
+}
+
+/** Marker substring of the executor's infra-not-FB failure (closed laptop /
+ *  Ponder app not open). The consumer excludes this from the consecutive-fail
+ *  count so an unreachable bridge never trips the friction breaker. */
+export const BRIDGE_NOT_REACHABLE_MARKER = "Ponder bridge not reachable";
+
+/**
  * Turn a job into a natural-language goal for the Ponder agent. These goals
  * are the NL form of holo3-agent/docs/PONDER-MARKETPLACE-CRUD.md.
  */
@@ -105,6 +314,33 @@ export function goalForJob(job: BrowserJob): string {
       const msg = str(p, "message") || str(p, "text");
       const who = str(p, "buyer") || str(p, "thread") || "the buyer";
       return `On ${place}, open the conversation with ${who} and send this message: "${msg}". Confirm it sent.`;
+    }
+    case "propose_slots": {
+      const who = str(p, "buyer") || str(p, "thread") || "the buyer";
+      const slots =
+        (Array.isArray((p as any).slots) && (p as any).slots.length
+          ? ((p as any).slots as unknown[]).map((s) => String(s)).join(", ")
+          : "") ||
+        str(p, "times") ||
+        str(p, "availability");
+      const item = listingRef(job);
+      const slotLine = slots
+        ? `Offer these appointment time slots: ${slots}.`
+        : "Offer the available appointment time slots from the details provided.";
+      const msg = str(p, "message") || str(p, "text");
+      return `On ${place}, open the inbox conversation with ${who} about ${item}. ${slotLine}${
+        msg ? ` Include this note: "${msg}".` : ""
+      } Send the proposed time slots in the conversation and confirm they were sent.`;
+    }
+    case "confirm_appointment": {
+      const who = str(p, "buyer") || str(p, "thread") || "the buyer";
+      const when = str(p, "slot") || str(p, "time") || str(p, "datetime") || str(p, "when");
+      const item = listingRef(job);
+      const whenLine = when ? ` for ${when}` : "";
+      const msg = str(p, "message") || str(p, "text");
+      return `On ${place}, open the inbox conversation with ${who} about ${item} and confirm the appointment${whenLine}.${
+        msg ? ` Include this note: "${msg}".` : ""
+      } Send the confirmation message and confirm it was sent.`;
     }
     case "sync_listing_state":
       return `On ${place}, open my listing ${listingRef(job)} and read its current state: title, price, status (active/sold/pending), and view count. Return those fields.`;
@@ -169,6 +405,41 @@ export function recipeParamsForJob(job: BrowserJob): Record<string, unknown> {
  *  rows the backend can surface directly. WRITE jobs (create/update/delete/
  *  send_message) stay on recipe-replay or agent_do. */
 const READ_TYPES = new Set(["scrape_inventory", "check_messages", "sync_listing_state"]);
+
+/** WRITE job types — these post a human-visible, side-effecting action that FB
+ *  rate-limits, so the consumer paces (jitter), caps (1h/24h velocity) and
+ *  circuit-breaks them. This Set is the CANONICAL, SINGLE SOURCE OF TRUTH for
+ *  WRITE vs non-write that the consumer imports.
+ *
+ *  DECISION (flagged): `send_message` IS counted as a WRITE even though the
+ *  A/B/C design examples only listed create/update/delete — sending a message
+ *  is a human-visible action FB rate-limits, so it belongs under the same
+ *  account-safety guardrails. `propose_slots` and `confirm_appointment` are
+ *  ALSO writes: both post a buyer-visible message/appointment into the FB
+ *  Marketplace inbox conversation (the upstream Convex queue accepts them —
+ *  see sssync-bknd/convex/browserJobs.ts `type` union — and the backend
+ *  produces them), and FB rate-limits inbox/appointment actions, so they must
+ *  be paced/capped/breaker-protected like any other write. WRITE is made
+ *  EXPLICIT (not "everything not in READ_TYPES") so a future new READ type
+ *  isn't accidentally throttled, and unknown/default job types (e.g.
+ *  explore_session / generate_recipe / run_recipe / report_results /
+ *  await_human — none of which directly post/send/change FB state here) fall
+ *  through as non-write (no jitter/cap/breaker, preserving the existing fast
+ *  path). */
+const WRITE_TYPES = new Set([
+  "create_listing",
+  "update_listing",
+  "delete_listing",
+  "send_message",
+  "propose_slots",
+  "confirm_appointment",
+]);
+
+/** True iff this job mutates FB state and must go through the account-safety
+ *  guardrails. Pure Set.has on String(job.type) — cannot throw. */
+export function isWriteJob(job: BrowserJob): boolean {
+  return WRITE_TYPES.has(String(job.type));
+}
 
 export interface ExtractSpec {
   url?: string;
@@ -297,7 +568,7 @@ export class PonderExecutor {
       return {
         success: false,
         requiresHuman: true,
-        error: `Ponder bridge not reachable at ${this.base}. Open the Ponder desktop app so jobs can execute.`,
+        error: `${BRIDGE_NOT_REACHABLE_MARKER} at ${this.base}. Open the Ponder desktop app so jobs can execute.`,
       };
     }
 

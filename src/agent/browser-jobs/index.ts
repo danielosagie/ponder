@@ -16,7 +16,14 @@ import { PonderExecutor } from "./ponder-executor.js";
 import { BrowserJobsConsumer, type ConsumerEvents } from "./consumer.js";
 
 export { BrowserJobsConsumer } from "./consumer.js";
-export { PonderExecutor, goalForJob } from "./ponder-executor.js";
+export {
+  PonderExecutor,
+  goalForJob,
+  isWriteJob,
+  detectFrictionPhrase,
+  FRICTION_PHRASES,
+  BRIDGE_NOT_REACHABLE_MARKER,
+} from "./ponder-executor.js";
 export type { BrowserJob } from "./ponder-executor.js";
 export {
   readBrowserJobsConfig,

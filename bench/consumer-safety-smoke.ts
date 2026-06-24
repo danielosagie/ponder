@@ -103,6 +103,7 @@ function baseConfig(overrides: Partial<BrowserJobsConfig> = {}): BrowserJobsConf
   return {
     convexURL: "https://smoke.convex.cloud",
     userId: "smoke-user",
+    orgId: "smoke-org",
     workerId: "smoke-worker",
     syncBaseURL: "",
     syncToken: "",
@@ -117,6 +118,10 @@ function baseConfig(overrides: Partial<BrowserJobsConfig> = {}): BrowserJobsConf
     readJitterMaxMs: 0,
     // Disable the cap-defer re-check timer so the process exits clean.
     deferRecheckMs: 0,
+    // Presence heartbeat is only armed by start(); the smoke calls processJob
+    // directly, so this value is unused here — set a benign default for type
+    // completeness.
+    presenceHeartbeatMs: 25000,
     ...overrides,
   };
 }

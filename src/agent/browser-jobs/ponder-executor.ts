@@ -391,9 +391,42 @@ export function mappedRecipeId(job: BrowserJob): string {
  * only. The upstream backend (sssync-bknd publishFacebook) already supplies
  * `sku` as a separate payload field and keeps it out of `description`.
  */
+/**
+ * FB Marketplace category is selected by CLICKING a button whose label is an
+ * exact FB top-level category (the recipe step is `click button name="{{category}}"`).
+ * Upstream `category` can be null, an eBay/Google taxonomy PATH
+ * ("Electronics > Audio > Headphones"), or a leaf with no matching FB button —
+ * any of which makes the category click miss and the whole create fail (this is
+ * the documented `click-category` replay failure). Coerce to a safe value: keep
+ * a plausibly-exact single label, but fall back to "Miscellaneous" (a
+ * guaranteed-present FB catch-all, verified in the recorded flow) for anything
+ * empty, path-shaped, or sentence-length.
+ *
+ * SCOPE: applied ONLY to the recipe-replay param path, where an exact button
+ * label is required. The vision/goalForJob path deliberately keeps the RICH
+ * category (even a full path) — the model can navigate FB's category picker
+ * intelligently and a path is more informative there than "Miscellaneous".
+ *
+ * A precise upstream→FB label map needs a one-time live capture of FB's
+ * category list; until then this keeps publish unblocked rather than failing.
+ */
+function normalizeFbCategory(raw: unknown): string {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  if (!v) return "Miscellaneous";
+  if (/[>/|,]/.test(v)) return "Miscellaneous"; // taxonomy path / multi-segment
+  if (v.length > 40) return "Miscellaneous"; // a description, not a label
+  return v;
+}
+
 export function recipeParamsForJob(job: BrowserJob): Record<string, unknown> {
   const p = job.payload || {};
-  if (job.type === "create_listing" || job.type === "update_listing") {
+  if (job.type === "create_listing") {
+    // create needs a guaranteed-valid category button label
+    return { ...p, sku: (p as any).sku ?? "", category: normalizeFbCategory((p as any).category) };
+  }
+  if (job.type === "update_listing") {
+    // update must NOT default category — only set it when explicitly provided,
+    // else replay would silently reset an existing listing's category.
     return { ...p, sku: (p as any).sku ?? "" };
   }
   return { ...p };

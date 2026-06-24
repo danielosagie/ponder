@@ -43,6 +43,7 @@
 import {
   type RecordedStep,
   type RecordedRecipe,
+  parseAxRefs,
 } from "../agent/recorder.js";
 import { createPlaywriterClient } from "../agent/browser/playwriter.js";
 import type { BrowserClient } from "../agent/browser/types.js";
@@ -303,6 +304,10 @@ export interface ScreenHandle {
   key(combo: string): Promise<void>;
   scroll(direction: "up" | "down", ticks?: number): Promise<void>;
   wait(ms: number): Promise<void>;
+  /** Move the pointer without clicking — hover menus / tooltips. */
+  hover(x: number, y: number): Promise<void>;
+  /** Launch or foreground a macOS app by name (AppleScript activate). */
+  openApp(name: string): Promise<void>;
 }
 
 function createScreenHandle(opts: { timeoutMs: number }): ScreenHandle {
@@ -401,6 +406,20 @@ function createScreenHandle(opts: { timeoutMs: number }): ScreenHandle {
     async wait(ms) {
       await screenLow.sleep(ms);
     },
+    async hover(x, y) {
+      await screenLow.hover(x, y);
+    },
+    async openApp(name) {
+      const ok = await screenLow.raiseMacApp(name);
+      if (!ok) {
+        throw new PonderError("INTERNAL_ERROR", {
+          message: `Could not launch/activate "${name}".`,
+          hint: "Check the app name matches the .app bundle name exactly.",
+        });
+      }
+      // Launched app needs time to draw before any follow-up grounding.
+      await screenLow.sleep(2000);
+    },
   };
 }
 
@@ -420,10 +439,23 @@ export interface ReplayResult {
   failed: number;
   durationMs: number;
   failureScreenshotPath?: string;
+  /** Steps whose refLabel drifted (e.g. a renamed button) and were healed
+   *  + rewritten in place. >0 means the recipe was persisted via opts.persist. */
+  healed?: number;
 }
 
 export interface ReplayOptions {
   reground?: boolean;
+  /**
+   * Fixed inter-step delay. When set, every gap is exactly this many
+   * ms (legacy behavior). When unset, replay paces from the RECORDED
+   * step timestamps: each gap is the original `t` delta clamped to
+   * [150, 2000]ms — raised to 8000ms after launch-type actions
+   * (navigate, Spotlight, submit-typing) where the recorded gap
+   * genuinely covers an app/page coming up. A flat 400ms used to race
+   * past those settles; raw deltas would oversleep on the recording's
+   * model think time — the asymmetric clamp is the compromise.
+   */
   stepDelayMs?: number;
   startStep?: number;
   maxSteps?: number;
@@ -433,6 +465,22 @@ export interface ReplayOptions {
   failureScreenshotPath?: string;
   onStep?: (event: ReplayStepEvent) => void | Promise<void>;
   shouldCancel?: () => boolean;
+  /**
+   * Called once after replay if any step's refLabel drifted and was healed
+   * (e.g. a platform renamed a button). Receives the MUTATED recipe so the
+   * caller can persist it (saveRecipe) — the recipe then self-heals
+   * permanently. Omit to keep replay read-only.
+   */
+  persist?: (recipe: RecordedRecipe) => Promise<unknown>;
+  /**
+   * Per-run values substituted into the recipe at replay time. Any `{{key}}`
+   * token in a typed string / navigated url is replaced with `params[key]`, and
+   * a file-input path of exactly `{{key}}` expands to `params[key]` (an array of
+   * paths). This is what turns a recorded create/update flow into a reusable,
+   * data-driven automation — the desktop consumer passes the browser-job payload
+   * here so one recipe lists ANY item, not just the one it was recorded with.
+   */
+  params?: Record<string, unknown>;
 }
 
 /**
@@ -443,7 +491,30 @@ export async function replayRecipe(
   recipe: RecordedRecipe,
   opts: ReplayOptions = {},
 ): Promise<ReplayResult> {
-  const delay = opts.stepDelayMs ?? 400;
+  // Recorded pacing by default; fixed delay when the caller sets one.
+  //
+  // Caveat (review 2026-06-10): recorded t-deltas include the
+  // RECORDING'S model/orchestrator think time (~2-4s/step for agent_do,
+  // 5-30s for LLM-driven direct calls), not just UI settle — so the
+  // ceiling is kept tight (2s) for ordinary actions and raised only
+  // after launch-type actions (navigate, Spotlight, submit-typing)
+  // where the gap genuinely covers an app/page coming up. `wait` steps
+  // already replay their own sleep, so their gap is floor-only.
+  const gapFor = (i: number): number => {
+    if (opts.stepDelayMs !== undefined) return opts.stepDelayMs;
+    const cur = recipe.steps[i];
+    const next = recipe.steps[i + 1];
+    if (typeof cur?.t !== "number" || typeof next?.t !== "number") return 400;
+    if (cur.executed.type === "wait") return 150;
+    const payload = cur.executed.payload as Record<string, unknown>;
+    const launchish =
+      cur.executed.type === "browser_navigate" ||
+      (cur.executed.type === "key" &&
+        /cmd\+space/i.test(String(payload.combo ?? ""))) ||
+      (cur.executed.type === "type" && Boolean(payload.thenPress));
+    const ceiling = launchish ? 8000 : 2000;
+    return Math.min(ceiling, Math.max(150, next.t - cur.t));
+  };
   const browser =
     opts.browser ?? (await createPlaywriterClient({}).catch(() => null));
   let provider: ProviderClient | null = opts.provider ?? null;
@@ -470,16 +541,16 @@ export async function replayRecipe(
   let ok = 0;
   let failed = 0;
   let failureScreenshotPath: string | undefined;
+  // ONE ctx for the whole replay — healedOnce must persist across steps
+  // (a heal renumbers every [eN] in the DOM, so once we've healed,
+  // later recorded refs are unreliable and labeled steps heal-first).
+  const ctx: ReplayCtx = { browser, provider, reground: !!opts.reground, dirty: false, driftCount: 0, params: opts.params };
   for (let i = start; i < end; i++) {
     if (opts.shouldCancel?.()) break;
     const step = recipe.steps[i]!;
     const tStep = Date.now();
     try {
-      await replayStep(step, {
-        browser,
-        provider,
-        reground: !!opts.reground,
-      });
+      await replayStep(step, ctx);
       ok += 1;
       await opts.onStep?.({
         index: i,
@@ -521,14 +592,27 @@ export async function replayRecipe(
       });
       break;
     }
+    const delay = gapFor(i);
     if (i < end - 1 && delay > 0) {
       await screenLow.sleep(delay);
+    }
+  }
+  // A heal rewrote one or more refLabels (platform drift) — persist the
+  // updated recipe so the next run is exact. The recipe self-heals.
+  if (ctx.dirty && opts.persist) {
+    try {
+      await opts.persist(recipe);
+    } catch (e) {
+      console.warn(
+        `[replay] persist after heal failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
   return {
     ok,
     failed,
     durationMs: Date.now() - t0,
+    healed: ctx.driftCount ?? 0,
     ...(failureScreenshotPath ? { failureScreenshotPath } : {}),
   };
 }
@@ -560,6 +644,311 @@ interface ReplayCtx {
   browser: BrowserClient | null;
   provider: ProviderClient | null;
   reground: boolean;
+  /** Set after the first successful heal. Healing takes a fresh
+   *  snapshot, which RENUMBERS every data-holo-ref in the DOM — from
+   *  that point recorded refs are unreliable, so labeled steps resolve
+   *  via their refLabel FIRST instead of trying the stale ref. */
+  healedOnce?: boolean;
+  /** A step's refLabel drifted (platform renamed an element) and was
+   *  rewritten in place — the recipe should be persisted post-replay. */
+  dirty?: boolean;
+  driftCount?: number;
+  /** Per-run substitution values ({{key}} in typed text / urls / file paths). */
+  params?: Record<string, unknown>;
+}
+
+/** Substitute `{{key}}` tokens in a recorded string with run-time params. */
+function applyParams(value: string, params?: Record<string, unknown>): string {
+  if (!params) return value;
+  return value.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_m, k: string) => {
+    const v = params[k];
+    return v == null ? "" : String(v);
+  });
+}
+
+/** Resolve a recorded file-input path list with run params. A path of exactly
+ *  `{{key}}` expands to params[key] (an array of paths, or a single path);
+ *  otherwise tokens inside each path string are substituted. Lets a recorded
+ *  "upload one photo" step replay with N real photos from the job payload. */
+function resolveFilePaths(raw: unknown, params?: Record<string, unknown>): string[] {
+  const list = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+  const out: string[] = [];
+  for (const item of list) {
+    const s = String(item);
+    const whole = s.match(/^\{\{\s*([\w.]+)\s*\}\}$/);
+    if (whole && params) {
+      const v = params[whole[1]!];
+      if (Array.isArray(v)) out.push(...v.map((x) => String(x)));
+      else if (v != null) out.push(String(v));
+      continue;
+    }
+    out.push(applyParams(s, params));
+  }
+  return out.filter(Boolean);
+}
+
+/** A self-heal match: the current [eN] ref plus the matched element's
+ *  CURRENT role+name (which may differ from the recorded refLabel when a
+ *  platform renamed it — that drift gets persisted back into the recipe). */
+interface HealMatch {
+  ref: string;
+  currentLabel: { role: string; name: string };
+}
+
+/**
+ * Self-healing ref resolution (Stagehand-style, 2026-06-10): recorded
+ * [eN] refs are per-snapshot ephemera — on replay against a reloaded
+ * page they point at nothing (or the wrong element). When a ref-based
+ * action FAILS and the step carries a refLabel (role + accessible
+ * name, captured at record time), take a fresh snapshot and find the
+ * element that matches the durable label; retry with the current ref.
+ * The recorded ref is always tried first, so an unchanged page replays
+ * byte-identically to the old behavior.
+ */
+async function healRef(
+  step: RecordedStep,
+  ctx: ReplayCtx,
+): Promise<HealMatch | null> {
+  const label = step.refLabel;
+  if (!label || !ctx.browser) return null;
+  // An EMPTY accessible name (icon-only buttons, unnamed inputs) matches
+  // every unnamed element of that role — healing on it would act on an
+  // arbitrary element. Refuse; the caller fail-stops instead.
+  const wantName = label.name.trim();
+  if (!wantName) return null;
+  try {
+    const snap = await ctx.browser.snapshot();
+    // The snapshot above RENUMBERED every data-holo-ref on the page —
+    // from this moment raw recorded refs are unreliable for the rest of
+    // the replay, match or no match.
+    ctx.healedOnce = true;
+    const refs = parseAxRefs(snap.ax);
+    const want = wantName.toLowerCase();
+    // Three tiers, each requiring a UNIQUE match: pages with repeated
+    // controls (multiple "Delete" buttons in a list) must not heal the Nth
+    // instance to the 1st. Ambiguity → null → caller fail-stops.
+    //   1. exact role + name (unchanged page → byte-identical replay)
+    //   2. same role, case/whitespace-insensitive name (minor drift)
+    //   3. same role, CURRENT name CONTAINS the recorded name (platform
+    //      rename, e.g. "Submit" → "Submit order") — the drift is captured
+    //      in currentLabel and persisted back into the recipe.
+    const exact: HealMatch[] = [];
+    const loose: HealMatch[] = [];
+    const drifted: HealMatch[] = [];
+    for (const [ref, l] of refs) {
+      if (l.role !== label.role) continue;
+      const cur = l.name.trim();
+      const curLc = cur.toLowerCase();
+      const m: HealMatch = { ref, currentLabel: { role: l.role, name: cur } };
+      if (l.name === label.name) exact.push(m);
+      if (curLc === want) loose.push(m);
+      if (cur && curLc.includes(want)) drifted.push(m);
+    }
+    if (exact.length === 1) return exact[0]!;
+    // Multiple same-name matches normally fail-stop: a list of repeated controls
+    // (several "Delete" buttons) must not heal the Nth instance to the 1st.
+    // EXCEPTION — file-inputs: FB's create form exposes TWO file-inputs both
+    // accessible-named "file" (photo accepts=image/* then video accepts=video/*).
+    // An upload step targets the primary/photo input, which is FIRST in document
+    // order (parseAxRefs preserves DOM order), so prefer it instead of fail-
+    // stopping. (Ideally we'd disambiguate by the `accepts` attribute, but the
+    // ax label doesn't carry it; document order is the reliable proxy here.)
+    if (exact.length > 1) return label.role === "file-input" ? exact[0]! : null;
+    if (loose.length === 1) return loose[0]!;
+    if (loose.length > 1) return label.role === "file-input" ? loose[0]! : null;
+    if (drifted.length === 1) return drifted[0]!;
+  } catch {
+    /* snapshot failed — nothing to heal with */
+  }
+  return null;
+}
+
+/**
+ * Resolve a UNIQUE element ref by role + run-time name from a fresh snapshot.
+ * Used for PARAMETERIZED click targets (the {{token}} branch in withHealedRef):
+ * locate the option / button whose accessible name matches the substituted
+ * value. Same exact → case-insensitive → contains tiering as healRef, each
+ * requiring uniqueness so a list of repeated controls can't mis-resolve.
+ */
+async function resolveByLabel(
+  ctx: ReplayCtx,
+  role: string,
+  wantName: string,
+): Promise<string | null> {
+  if (!ctx.browser || !wantName.trim()) return null;
+  try {
+    const snap = await ctx.browser.snapshot();
+    ctx.healedOnce = true; // snapshot renumbered refs — later raw refs unreliable
+    const refs = parseAxRefs(snap.ax);
+    const want = wantName.trim().toLowerCase();
+    const exact: string[] = [];
+    const loose: string[] = [];
+    const contains: string[] = [];
+    for (const [ref, l] of refs) {
+      if (l.role !== role) continue;
+      const cur = l.name.trim();
+      if (l.name === wantName) exact.push(ref);
+      if (cur.toLowerCase() === want) loose.push(ref);
+      if (cur && cur.toLowerCase().includes(want)) contains.push(ref);
+    }
+    if (exact.length === 1) return exact[0]!;
+    if (exact.length > 1) return null;
+    if (loose.length === 1) return loose[0]!;
+    if (loose.length > 1) return null;
+    if (contains.length === 1) return contains[0]!;
+  } catch {
+    /* snapshot failed */
+  }
+  return null;
+}
+
+/** Temp aria-ref the label-anchor resolver tags its match with. */
+const HEAL_REF = "__holo_heal";
+
+/**
+ * LABEL-ANCHORED resolution (needs `browser.evaluate`): find the form control
+ * sitting next to a visible label whose text === fieldLabel, tag it with a temp
+ * data-holo-ref, and return that ref so the normal type/click path can act. This
+ * is the robust fix for forms whose inputs have empty/duplicate accessible names
+ * (FB's Title & Price are BOTH `textbox "text"`) — we locate by the human label
+ * the way a person does. Returns the temp ref or null. The DOM heuristic checks
+ * label→for, the input inside the label's container, then forward siblings.
+ */
+async function resolveByFieldLabel(
+  ctx: ReplayCtx,
+  fieldLabel: string,
+): Promise<string | null> {
+  if (!ctx.browser?.evaluate || !fieldLabel.trim()) return null;
+  const want = JSON.stringify(fieldLabel.trim().toLowerCase());
+  const tag = JSON.stringify(HEAL_REF);
+  const expr = `(() => {
+    const want = ${want}, TAG = ${tag};
+    const CTRL = 'input,textarea,select,[contenteditable="true"],[role="combobox"],[role="textbox"],[role="spinbutton"]';
+    document.querySelectorAll('[data-holo-ref="'+TAG+'"]').forEach(e => e.removeAttribute('data-holo-ref'));
+    const vis = el => el && el.offsetParent !== null;
+    const norm = s => (s||'').replace(/\\s+/g,' ').trim().toLowerCase();
+    // 1. <label for> / aria-labelledby
+    for (const lab of document.querySelectorAll('label')) {
+      if (norm(lab.textContent) !== want || !vis(lab)) continue;
+      let ctrl = lab.htmlFor ? document.getElementById(lab.htmlFor) : null;
+      ctrl = ctrl || lab.querySelector(CTRL);
+      if (ctrl && vis(ctrl)) { ctrl.setAttribute('data-holo-ref', TAG); return true; }
+    }
+    // 2. any element whose exact text is the label → nearest control in container or following siblings
+    const labels = [...document.querySelectorAll('label,span,div,h1,h2,h3,legend')].filter(el => vis(el) && norm(el.textContent) === want);
+    for (const lab of labels) {
+      let scope = lab.parentElement;
+      for (let up = 0; up < 3 && scope; up++, scope = scope.parentElement) {
+        const c = scope.querySelector(CTRL);
+        if (c && vis(c)) { c.setAttribute('data-holo-ref', TAG); return true; }
+      }
+      let n = lab;
+      for (let i = 0; i < 6 && n; i++) {
+        n = n.nextElementSibling;
+        if (!n) break;
+        const c = n.matches && n.matches(CTRL) ? n : (n.querySelector && n.querySelector(CTRL));
+        if (c && vis(c)) { c.setAttribute('data-holo-ref', TAG); return true; }
+      }
+    }
+    return false;
+  })()`;
+  try {
+    const found = await ctx.browser.evaluate(expr);
+    return found === true ? HEAL_REF : null;
+  } catch {
+    return null;
+  }
+}
+
+async function withHealedRef(
+  step: RecordedStep,
+  ctx: ReplayCtx,
+  run: (ref: string) => Promise<void>,
+): Promise<void> {
+  const p = step.executed.payload as Record<string, unknown>;
+  const recorded = String(p.ref);
+  // PARAMETERIZED click target: when the step's refLabel name carries a
+  // {{token}}, the recorded ref points at the item we recorded against (e.g.
+  // the "Used - Good" option, or "Delete listing <some title>") — useless for a
+  // different run. Resolve by the SUBSTITUTED run-time name instead. This is the
+  // unlock for select_option({{condition}}) / delete({{title}}) — click targets
+  // become data-driven, not just typed text.
+  if (step.refLabel && /\{\{/.test(step.refLabel.name) && ctx.params) {
+    const wantName = applyParams(step.refLabel.name, ctx.params);
+    const ref = await resolveByLabel(ctx, step.refLabel.role, wantName);
+    if (ref) {
+      await run(ref);
+      return;
+    }
+    throw new Error(
+      `parameterized target not found: ${step.refLabel.role} "${wantName}" ` +
+        `(template "${step.refLabel.name}"). Re-record or check the param value.`,
+    );
+  }
+  // Persist accessible-name drift back into the step so the next replay is
+  // exact and the recipe self-heals permanently (a platform renamed the
+  // element; we caught it via uniqueness, now we remember the new name).
+  const persistDrift = (m: HealMatch): void => {
+    if (step.refLabel && m.currentLabel.name !== step.refLabel.name) {
+      step.refLabel = { role: m.currentLabel.role, name: m.currentLabel.name };
+      ctx.dirty = true;
+      ctx.driftCount = (ctx.driftCount ?? 0) + 1;
+    }
+  };
+  // After the first heal, recorded refs point into a RENUMBERED DOM —
+  // a stale number usually still exists, bound to a different element,
+  // so running it would silently act on the wrong target. Labeled steps
+  // re-resolve; unlabeled/unmatched steps FAIL-STOP (the pre-heal
+  // behavior for a stale ref was a loud locator timeout — keep that
+  // contract rather than degrade to silent wrong-element actions).
+  // Last-resort resolver: locate the control by its human field label via the
+  // DOM (e.g. fill the input next to the "Price" label). Closes the gap where
+  // the aria-name is empty/duplicated so refLabel healing can't disambiguate.
+  const fieldLabel = typeof p.fieldLabel === "string" ? p.fieldLabel : "";
+  const tryFieldLabel = async (): Promise<boolean> => {
+    if (!fieldLabel) return false;
+    const ref = await resolveByFieldLabel(ctx, fieldLabel);
+    if (!ref) return false;
+    console.log(`[replay] resolved step by field label "${fieldLabel}" → tagged ${ref}`);
+    await run(ref);
+    return true;
+  };
+
+  if (ctx.healedOnce) {
+    const healed = await healRef(step, ctx);
+    if (healed) {
+      persistDrift(healed);
+      await run(healed.ref);
+      return;
+    }
+    if (await tryFieldLabel()) return;
+    throw new Error(
+      `ref ${recorded} unreliable: a prior heal renumbered the page's refs and ` +
+        `this step has ${step.refLabel ? `no uniquely-matching refLabel (${step.refLabel.role} "${step.refLabel.name}")` : "no refLabel"}` +
+        `${fieldLabel ? ` and no control matched field label "${fieldLabel}"` : ""}. ` +
+        `Re-record the flow or hand-edit the .recipe.ts.`,
+    );
+  }
+  try {
+    await run(recorded);
+  } catch (e) {
+    const healed = await healRef(step, ctx);
+    if (healed && healed.ref !== recorded) {
+      const drift =
+        step.refLabel && healed.currentLabel.name !== step.refLabel.name
+          ? ` (name drifted → "${healed.currentLabel.name}", persisting)`
+          : "";
+      console.log(
+        `[replay] ref ${recorded} stale — healed to ${healed.ref} via refLabel ` +
+          `${step.refLabel!.role} "${step.refLabel!.name}"${drift}`,
+      );
+      persistDrift(healed);
+      await run(healed.ref);
+      return;
+    }
+    if (await tryFieldLabel()) return;
+    throw e;
+  }
 }
 
 async function replayStep(step: RecordedStep, ctx: ReplayCtx): Promise<void> {
@@ -568,24 +957,23 @@ async function replayStep(step: RecordedStep, ctx: ReplayCtx): Promise<void> {
   switch (executed.type) {
     case "browser_navigate":
       if (!ctx.browser) throw new Error("Chrome not attached for browser_navigate");
-      await ctx.browser.navigate(String(p.url));
+      await ctx.browser.navigate(applyParams(String(p.url), ctx.params));
       return;
     case "browser_click":
       if (!ctx.browser) throw new Error("Chrome not attached for browser_click");
-      await ctx.browser.click(String(p.ref));
+      await withHealedRef(step, ctx, (ref) => ctx.browser!.click(ref));
       return;
     case "browser_type":
       if (!ctx.browser) throw new Error("Chrome not attached for browser_type");
-      await ctx.browser.type(String(p.ref), String(p.text ?? ""), {
-        submit: !!p.submit,
-      });
+      await withHealedRef(step, ctx, (ref) =>
+        ctx.browser!.type(ref, applyParams(String(p.text ?? ""), ctx.params), { submit: !!p.submit }),
+      );
       return;
     case "browser_set_input_files":
       if (!ctx.browser)
         throw new Error("Chrome not attached for browser_set_input_files");
-      await ctx.browser.setInputFiles(
-        String(p.ref),
-        Array.isArray(p.paths) ? (p.paths as string[]) : [],
+      await withHealedRef(step, ctx, (ref) =>
+        ctx.browser!.setInputFiles(ref, resolveFilePaths(p.paths, ctx.params)),
       );
       return;
     case "browser_scroll_page":
@@ -599,10 +987,12 @@ async function replayStep(step: RecordedStep, ctx: ReplayCtx): Promise<void> {
     case "browser_scroll_element":
       if (!ctx.browser)
         throw new Error("Chrome not attached for browser_scroll_element");
-      await ctx.browser.scrollElement(
-        String(p.ref),
-        (p.dir as "up" | "down") ?? "down",
-        typeof p.amount === "number" ? (p.amount as number) : undefined,
+      await withHealedRef(step, ctx, (ref) =>
+        ctx.browser!.scrollElement(
+          ref,
+          (p.dir as "up" | "down") ?? "down",
+          typeof p.amount === "number" ? (p.amount as number) : undefined,
+        ),
       );
       return;
     case "browser_read":
@@ -614,6 +1004,25 @@ async function replayStep(step: RecordedStep, ctx: ReplayCtx): Promise<void> {
     case "wait":
       await screenLow.sleep(Number(p.ms ?? 1000));
       return;
+    case "open_app": {
+      const app = String(p.app ?? "");
+      if (!app) throw new Error("open_app step missing app name");
+      await screenLow.raiseMacApp(app);
+      // Launched app needs draw time before the next step's grounding.
+      await screenLow.sleep(2000);
+      return;
+    }
+    case "note":
+      // Planner working-memory entry — no screen effect, nothing to
+      // replay. Kept in recordings for human readability.
+      return;
+    case "hover": {
+      const hx = typeof p.x === "number" ? (p.x as number) : null;
+      const hy = typeof p.y === "number" ? (p.y as number) : null;
+      if (hx === null || hy === null) throw new Error("hover step missing x/y");
+      await screenLow.hover(hx, hy);
+      return;
+    }
     case "type": {
       await screenLow.typeText(String(p.text ?? ""));
       if (typeof p.thenPress === "string" && p.thenPress) {

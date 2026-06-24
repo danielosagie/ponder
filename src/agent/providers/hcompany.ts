@@ -60,7 +60,12 @@ const CLICK_COORDINATES_SCHEMA = {
 export function createHCompanyProvider(cfg: HCompanyConfig): ProviderClient {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const baseUrl = cfg.baseUrl ?? "https://api.hcompany.ai/v1";
-  const model = cfg.model ?? "holo3-35b-a3b";
+  // holo3-35b-a3b is DEPRECATED by H Company effective 2026-06-15
+  // (hub.hcompany.ai/quickstart). holo3-1-35b-a3b is the drop-in
+  // successor (same family, Apache-2.0; H measured >25% harness
+  // improvement in 3.1 via native function calling). Override with
+  // cfg.model / HCOMPANY_MODEL to pin something else.
+  const model = cfg.model ?? "holo3-1-35b-a3b";
 
   const headers = {
     "Content-Type": "application/json",

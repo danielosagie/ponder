@@ -1,0 +1,50 @@
+{
+  "id": "calculator-mouse-math-2026-05-18T20:34:45.224Z",
+  "case": "calculator-mouse-math",
+  "tier": null,
+  "axes": [],
+  "started_at": "2026-05-18T20:34:45.224Z",
+  "ended_at": "2026-05-18T20:37:06.545Z",
+  "elapsed_ms": 141321,
+  "repo_head_short": "803e774c6553",
+  "bridge_version": {
+    "commit": "803e774c6553d918aef39f7a891b0b9535213e14",
+    "commitShort": "803e774c6553",
+    "dirty": true,
+    "builtAt": "2026-05-18T20:34:22.520Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": null,
+  "task_prompt": "Compute 47 × 8 in macOS Calculator by clicking each digit and operator with the mouse, then read the answer from the display.",
+  "setup": null,
+  "agent": {
+    "called": true,
+    "outcome": "cancelled",
+    "duration_ms": 141242,
+    "steps": 3,
+    "response": {
+      "outcome": "cancelled",
+      "sessionId": "j5769e368qmh5qvaqxmfe0fqed86ycm2",
+      "steps": 3,
+      "transcript": [
+        "[t=18.9s] thought: click the \"4\" button on the calculator",
+        "[t=32.9s] error: Click at (1273,959) was outside Calculator's window — refused. Re-grounding next step.",
+        "[t=47.0s] thought: Click the \"4\" button on the Calculator keypad.",
+        "[t=57.3s] action: click {\"x\":1312,\"y\":783}",
+        "[t=71.2s] thought: Click the \"7\" button on the Calculator keypad.",
+        "[t=81.7s] action: click {\"x\":1318,\"y\":732}",
+        "[t=95.4s] thought: Click the \"×\" button on the Calculator keypad.",
+        "[t=105.8s] action: click {\"x\":1474,\"y\":731}",
+        "[t=130.5s] thought: Click the \"8\" button on the Calculator keypad."
+      ],
+      "finalScreenshotSidecarPath": "calculator-mouse-math-2026-05-18T20-37-06-549Z-final.png",
+      "finalScreenshotSidecarSha256": "912afae37406c9ad"
+    }
+  },
+  "scoring": null,
+  "deterministic_score": "UNKNOWN",
+  "agent_self_reported_outcome": "cancelled",
+  "disagreement": false
+}

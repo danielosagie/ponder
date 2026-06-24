@@ -277,14 +277,19 @@ export function createExtractor(
 
   return {
     async extract(args: ExtractInput): Promise<string> {
-      // Try Ollama first — fast, local, conversational, no rate limits.
-      const ollamaAnswer = await tryOllama(args);
-      if (ollamaAnswer) return ollamaAnswer;
-
-      // Fall back to the cloud provider — multimodal, slower, can fail
-      // on rate limits or oversized screenshots.
-      const providerAnswer = await tryProvider(args);
-      if (providerAnswer) return providerAnswer;
+      // Composite mode: the provider IS a frontier-class hosted planner
+      // — strictly better at the post-mortem than the 0.8B local model
+      // (live-observed: qwen3.5:0.8b emitted a 3-BYTE "answer" to a
+      // marketplace task), and multimodal so it can read the final
+      // frame. Use it FIRST; Ollama becomes the offline fallback.
+      const order =
+        provider?.name === "composite"
+          ? ([tryProvider, tryOllama] as const)
+          : ([tryOllama, tryProvider] as const);
+      for (const transport of order) {
+        const answer = await transport(args);
+        if (answer) return answer;
+      }
 
       // Last resort: templated. The buddy NEVER goes silent.
       console.warn("[extract] both LLM paths failed — using templated fallback");

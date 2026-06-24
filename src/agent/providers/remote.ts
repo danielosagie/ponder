@@ -13,6 +13,7 @@ interface RemoteConfig {
 const PATH_TO_FUNC: Record<string, string> = {
   "/warm": "warm",
   "/plan": "plan-endpoint",
+  "/step": "step-endpoint",
   "/ground": "ground-endpoint",
   "/ground/batch": "ground-batch-endpoint",
   "/health": "health",
@@ -28,7 +29,7 @@ function resolveUrl(baseUrl: string, path: string): string {
   const prefix = baseUrl
     .replace(/\/+$/, "")
     .replace(
-      /-(?:warm|plan-endpoint|ground-endpoint|ground-batch-endpoint|health)\.modal\.run$/,
+      /-(?:warm|plan-endpoint|step-endpoint|ground-endpoint|ground-batch-endpoint|health)\.modal\.run$/,
       "",
     )
     .replace(/\.modal\.run$/, "");
@@ -114,6 +115,25 @@ export function createRemoteProvider(cfg: RemoteConfig): ProviderClient {
         "/ground",
         {
           instruction: args.instruction,
+          screenshot_b64: args.screenshotB64,
+          screen: args.screen,
+        },
+        60_000,
+        args.signal,
+      );
+    },
+    async step(args): Promise<{
+      action: string;
+      x: number | null;
+      y: number | null;
+      raw?: [number, number];
+      usage?: Record<string, number>;
+    }> {
+      return post(
+        "/step",
+        {
+          task: args.task,
+          history: args.history,
           screenshot_b64: args.screenshotB64,
           screen: args.screen,
         },

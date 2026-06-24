@@ -1,0 +1,235 @@
+{
+  "case": "calculator",
+  "provider": "remote",
+  "bounds": {
+    "x": 1251,
+    "y": 518,
+    "width": 230,
+    "height": 408
+  },
+  "runs": 1,
+  "tolerancePx": 30,
+  "refineConfig": {
+    "boxLogical": 320,
+    "scale": 2
+  },
+  "results": [
+    {
+      "target": "the AC button on Calculator",
+      "expected": {
+        "x": 1339,
+        "y": 675
+      },
+      "uncropped": {
+        "x": 1341,
+        "y": 675,
+        "err": 2,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1337,
+        "y": 680,
+        "err": 5.385164807134505,
+        "pass": true
+      },
+      "refined": {
+        "x": 1340,
+        "y": 674,
+        "err": 1.4142135623730951,
+        "pass": true
+      }
+    },
+    {
+      "target": "the 7 button on Calculator",
+      "expected": {
+        "x": 1285,
+        "y": 729
+      },
+      "uncropped": {
+        "x": 1287,
+        "y": 731,
+        "err": 2.8284271247461903,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1280,
+        "y": 733,
+        "err": 6.4031242374328485,
+        "pass": true
+      },
+      "refined": {
+        "x": 1283,
+        "y": 728,
+        "err": 2.23606797749979,
+        "pass": true
+      }
+    },
+    {
+      "target": "the 8 button on Calculator",
+      "expected": {
+        "x": 1339,
+        "y": 729
+      },
+      "uncropped": {
+        "x": 1338,
+        "y": 732,
+        "err": 3.1622776601683795,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1337,
+        "y": 733,
+        "err": 4.47213595499958,
+        "pass": true
+      },
+      "refined": {
+        "x": 1338,
+        "y": 728,
+        "err": 1.4142135623730951,
+        "pass": true
+      }
+    },
+    {
+      "target": "the 9 button on Calculator",
+      "expected": {
+        "x": 1393,
+        "y": 729
+      },
+      "uncropped": {
+        "x": 1393,
+        "y": 731,
+        "err": 2,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1388,
+        "y": 733,
+        "err": 6.4031242374328485,
+        "pass": true
+      },
+      "refined": {
+        "x": 1393,
+        "y": 729,
+        "err": 0,
+        "pass": true
+      }
+    },
+    {
+      "target": "the × multiply button on Calculator",
+      "expected": {
+        "x": 1447,
+        "y": 729
+      },
+      "uncropped": {
+        "x": 1444,
+        "y": 731,
+        "err": 3.6055512754639896,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1446,
+        "y": 733,
+        "err": 4.123105625617661,
+        "pass": true
+      },
+      "refined": {
+        "x": 1449,
+        "y": 728,
+        "err": 2.23606797749979,
+        "pass": true
+      }
+    },
+    {
+      "target": "the 4 button on Calculator",
+      "expected": {
+        "x": 1285,
+        "y": 783
+      },
+      "uncropped": {
+        "x": 1288,
+        "y": 783,
+        "err": 3,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1280,
+        "y": 784,
+        "err": 5.099019513592785,
+        "pass": true
+      },
+      "refined": {
+        "x": 1284,
+        "y": 784,
+        "err": 1.4142135623730951,
+        "pass": true
+      }
+    },
+    {
+      "target": "the + plus button on Calculator",
+      "expected": {
+        "x": 1447,
+        "y": 837
+      },
+      "uncropped": {
+        "x": 1442,
+        "y": 837,
+        "err": 5,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1448,
+        "y": 833,
+        "err": 4.123105625617661,
+        "pass": true
+      },
+      "refined": {
+        "x": 1447,
+        "y": 837,
+        "err": 0,
+        "pass": true
+      }
+    },
+    {
+      "target": "the = equals button on Calculator",
+      "expected": {
+        "x": 1447,
+        "y": 891
+      },
+      "uncropped": {
+        "x": 1442,
+        "y": 894,
+        "err": 5.8309518948453,
+        "pass": true
+      },
+      "cropped": {
+        "x": 1449,
+        "y": 884,
+        "err": 7.280109889280519,
+        "pass": true
+      },
+      "refined": {
+        "x": 1447,
+        "y": 893,
+        "err": 2,
+        "pass": true
+      }
+    }
+  ],
+  "summary": {
+    "uncropped": {
+      "pass": 8,
+      "total": 8,
+      "meanErrPx": 3.428400994402982
+    },
+    "cropped": {
+      "pass": 8,
+      "total": 8,
+      "meanErrPx": 5.4111112363885505
+    },
+    "refined": {
+      "pass": 8,
+      "total": 8,
+      "meanErrPx": 1.3393470802648582
+    }
+  }
+}

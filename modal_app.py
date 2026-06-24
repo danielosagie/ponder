@@ -120,13 +120,37 @@ def _strip_think(text: str) -> str:
     open_idx = out.find("<think>")
     if open_idx != -1:
         out = out[:open_idx]
-    out = re.sub(r"^\s*</think>\s*", "", out, flags=re.IGNORECASE)
+    # Orphan CLOSING tag with no opener (live-observed 2026-06-10: the
+    # model emitted reasoning prose directly, then "</think>", then ran
+    # out of budget — the prose leaked through as the "action"). All
+    # complete pairs are already gone, so anything before a remaining
+    # </think> is reasoning; the answer (if any) is after it.
+    close_idx = out.rfind("</think>")
+    if close_idx != -1:
+        out = out[close_idx + len("</think>"):]
     return out.strip()
 
+
+def _shrink_for_ctx(task: str) -> str:
+    """Recovery for 'request exceeds the available context size' (8192/slot):
+    the overwhelmingly common cause is a huge [CHROME ACTIVE …] AX-snapshot
+    block appended to the task by the client. Drop it (the screenshot still
+    shows the page); as a last resort hard-cap the task text."""
+    marker = task.find("[CHROME ACTIVE")
+    if marker != -1:
+        return task[:marker] + "\n[page snapshot omitted: prompt was too large]"
+    return task[:6000]
+
+
+def _is_ctx_overflow(err: Exception) -> bool:
+    return "exceeds the available context" in str(err)
+
+
 MODELS_DIR = "/models"
-HF_REPO = "mudler/Holo3-35B-A3B-APEX-GGUF"
-GGUF_FILENAME = os.environ.get("HOLO3_GGUF", "Holo3-35B-A3B-APEX-I-Compact.gguf")
-MMPROJ_FILENAME = "mmproj.gguf"
+# Holo 3.1 (official H Company GGUF) — was mudler's Holo3-35B-A3B-APEX (3.0, deprecated 2026-06-15).
+HF_REPO = "Hcompany/Holo-3.1-35B-A3B-GGUF"
+GGUF_FILENAME = os.environ.get("HOLO3_GGUF", "q4_k_m.gguf")  # 21.3 GB Q4_K_M
+MMPROJ_FILENAME = "mmproj.f16.gguf"  # vision projector, 899 MB
 LOCAL_GGUF_PATH = f"{MODELS_DIR}/{GGUF_FILENAME}"
 LOCAL_MMPROJ_PATH = f"{MODELS_DIR}/{MMPROJ_FILENAME}"
 
@@ -137,6 +161,24 @@ LLAMA_BIN = "/opt/llama.cpp/build/bin/llama-server"
 GROUND_GRAMMAR = (
     'root   ::= "{" ws "\\"x\\"" ws ":" ws number ws "," ws "\\"y\\"" ws ":" ws number ws "}"\n'
     "number ::= [0-9]+\n"
+    "ws     ::= [ \\t\\n]*\n"
+)
+
+# Combined plan+ground (/step): one forward pass yields the action AND,
+# for mouse-aimed verbs, the click point. Halves per-step model time vs
+# the sequential /plan → /ground pair (each of which re-uploads the
+# screenshot and re-runs the vision tower on it). Coordinates are null
+# for keyboard/scroll/wait/DONE verbs and for drag (drag needs TWO
+# points — it stays on the split path).
+STEP_GRAMMAR = (
+    'root   ::= "{" ws "\\"action\\"" ws ":" ws string ws "," ws'
+    ' "\\"x\\"" ws ":" ws coord ws "," ws "\\"y\\"" ws ":" ws coord ws "}"\n'
+    'coord  ::= number | "null"\n'
+    "number ::= [0-9]+\n"
+    'string ::= "\\"" char* "\\""\n'
+    'char   ::= [^"\\\\\\x00-\\x1f] | "\\\\" esc\n'
+    'esc    ::= ["\\\\/bfnrt] | "u" hex hex hex hex\n'
+    "hex    ::= [0-9a-fA-F]\n"
     "ws     ::= [ \\t\\n]*\n"
 )
 
@@ -182,7 +224,12 @@ def download_model() -> str:
 
 @app.cls(
     image=image,
-    gpu="L4",  # cheapest 24GB-class GPU; fits I-Compact (17GB) + KV cache
+    gpu="L40S",  # 48GB. KEPT after measuring H100 (2026-06-17): H100 is ~3x faster on the
+    # prefill-bound vision step WHEN WARM, but Modal H100 cold-start/scheduling is ~150s
+    # (capacity-constrained) vs L40S ~22s — a net LOSS for on-demand (min_containers=0,
+    # cold-starts often). L40S also has comparable BF16 TFLOPS to A100 (~362 vs ~312), so
+    # A100 wouldn't speed the compute-bound prefill much either. The real per-step lever is
+    # trimming screenshot tokens, not the GPU. Holo 3.1 q4_k_m 21.3GB + 0.9GB mmproj fit fine.
     volumes={MODELS_DIR: volume},
     secrets=[auth_secret],
     scaledown_window=600,
@@ -236,6 +283,16 @@ class Holo3:
             # exactly what makes the batch endpoint a 4× speedup instead
             # of a wash.
             "--parallel", "4",
+            # PREFILL SPEEDUP (no resolution/accuracy change — same image, fewer
+            # GPU-seconds = faster AND cheaper per step):
+            #  -fa: flash attention. The per-step cost is prefill of the ~4k-token
+            #       screenshot; FA makes that attention faster and frees KV memory.
+            #  -ub 2048: physical micro-batch. Default 512 splits a 4k-token image
+            #       prefill into 8 passes; 2048 does it in 2 → much better GPU use.
+            #  -b 4096: logical batch ceiling to match.
+            "-fa",
+            "-b", "4096",
+            "-ub", "2048",
             "--no-warmup",
             # NB: --log-disable removed. We need llama-server's stderr in Modal
             # logs when image loading or chat-template rendering fails — the
@@ -335,6 +392,15 @@ class Holo3:
             "Both endpoints must be visible on screen; if the destination isn't,\n"
             "scroll first.\n"
             "\n"
+            "\n"
+            "If the Task text says Chrome is ACTIVE and lists [eN] element refs,\n"
+            "these browser actions are ALSO valid — PREFER them for anything\n"
+            "inside the web page (faster and more precise than pixel clicks):\n"
+            "  - browser.navigate <url>      (e.g. browser.navigate https://www.google.com/search?q=...)\n"
+            "  - browser.click e<N>\n"
+            "  - browser.type e<N> \"text\" [enter]\n"
+            "  - browser.read\n"
+            "  - browser.scroll up / browser.scroll down\n"
             "Return ONLY one action sentence (or DONE). No commentary, no JSON, "
             "no chained actions."
         )
@@ -345,34 +411,210 @@ class Holo3:
             "What is the next single action?"
         )
 
-        body = {
-            "messages": self._messages(system, user_text, screenshot_b64),
-            "temperature": 0.2,
-            # Bumped 128 → 256. With reasoning enabled (default), the old cap
-            # got eaten entirely by <think>…</think> and the post-strip action
-            # came out empty. Even with reasoning OFF, 256 is cheap insurance
-            # against a slightly verbose answer being truncated mid-sentence.
-            "max_tokens": 256,
-            "stop": ["\n\n"],
-            # Disable Qwen3-style reasoning at the chat-template layer. llama.cpp
-            # passes chat_template_kwargs through to the Jinja renderer; the
-            # Holo3 (Qwen3) template honors `enable_thinking`. Without this,
-            # the model wraps its answer in <think>…</think>, runs out of
-            # max_tokens before closing, and we return "" after stripping.
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        r = self.client.post("/v1/chat/completions", json=body)
-        if r.status_code != 200:
-            # Surface llama-server's actual error body to the client. Without
-            # this, httpx raises a generic HTTPStatusError and the response
-            # body — which contains the real message — is lost.
-            raise RuntimeError(
-                f"llama-server /v1/chat/completions returned {r.status_code}: "
-                f"{r.text[:600]}"
+        def run_plan(task_text: str) -> dict[str, Any]:
+            ut = (
+                f"Task: {task_text}\n"
+                f"Screen: {screen_w}x{screen_h}\n"
+                f"Recent history:\n{history_block}{dup_warning}\n"
+                "What is the next single action?"
             )
-        out = r.json()
+            body = {
+                "messages": self._messages(system, ut, screenshot_b64),
+                "temperature": 0.2,
+                "max_tokens": 256,
+                "stop": ["\n\n"],
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            r = self.client.post("/v1/chat/completions", json=body)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"llama-server /v1/chat/completions returned {r.status_code}: "
+                    f"{r.text[:600]}"
+                )
+            return r.json()
+
+        try:
+            out = run_plan(task)
+        except RuntimeError as e:
+            if not _is_ctx_overflow(e):
+                raise
+            out = run_plan(_shrink_for_ctx(task))
         text = _strip_think(out["choices"][0]["message"]["content"])
         return {"action": text, "usage": out.get("usage", {})}
+
+
+
+    # ---- Brain+Eyes combined (one forward pass) ----
+
+    @modal.method()
+    def step(
+        self,
+        task: str,
+        history: list[str],
+        screenshot_b64: str,
+        screen_w: int,
+        screen_h: int,
+    ) -> dict[str, Any]:
+        history_block = "\n".join(f"- {h}" for h in history[-3:]) or "(none)"
+        dup_warning = ""
+        if len(history) >= 2 and history[-1] == history[-2]:
+            dup_warning = (
+                "\nCRITICAL WARNING: your last action was repeated. "
+                "If the screen did not change, switch strategy."
+            )
+
+        system = (
+            "You are the Brain of a computer-use agent. Look at the screenshot "
+            "and decide the SINGLE next action.\n"
+            "\n"
+            "Allowed actions (emit exactly one):\n"
+            "  - click <thing>\n"
+            "  - double click <thing>\n"
+            "  - type \"text\"\n"
+            "  - press KEY              (e.g. press enter, press esc)\n"
+            "  - hotkey KEY+KEY         (e.g. hotkey cmd+tab to switch apps)\n"
+            "  - drag <source> to <target>  (drag-and-drop one element onto another)\n"
+            "  - scroll up / scroll down\n"
+            "  - wait Ns\n"
+            "  - DONE\n"
+            "\n"
+            "PREFER KEYBOARD SHORTCUTS when they're faster or more reliable than\n"
+            "clicking. Useful ones:\n"
+            "  • hotkey cmd+tab     switch to another open app\n"
+            "  • hotkey cmd+space   open Spotlight to launch any app by name\n"
+            "  • hotkey cmd+`       cycle windows within the current app\n"
+            "  • hotkey cmd+w       close window\n"
+            "  • hotkey cmd+t       new tab (browsers)\n"
+            "  • press tab          move to next form field\n"
+            "  • press enter        submit the focused field\n"
+            "  • press esc          close popovers / cancel modals\n"
+            "\n"
+            "\n"
+            "If the Task text says Chrome is ACTIVE and lists [eN] element refs,\n"
+            "these browser actions are ALSO valid — PREFER them for anything\n"
+            "inside the web page (faster and more precise than pixel clicks):\n"
+            "  - browser.navigate <url>      (e.g. browser.navigate https://www.google.com/search?q=...)\n"
+            "  - browser.click e<N>\n"
+            "  - browser.type e<N> \"text\" [enter]\n"
+            "  - browser.read\n"
+            "  - browser.scroll up / browser.scroll down\n"
+            "browser.* actions take x = null and y = null.\n"
+            "Reply with ONLY this JSON object, nothing else:\n"
+            '{"action": "<one action sentence>", "x": <int|null>, "y": <int|null>}\n'
+            "- action is the COMPLETE action sentence naming the target —\n"
+            "  NEVER a bare verb like \"click\" or \"press\".\n"
+            "- For click / double click: x,y = the exact point to click, as\n"
+            "  integers normalized to a 1000x1000 grid over the screenshot.\n"
+            "- For type/press/hotkey/scroll/wait/DONE and for drag: x and y\n"
+            "  are null (drag endpoints are grounded separately).\n"
+            "\n"
+            "Example replies (format only — pick YOUR action from the screen):\n"
+            '{"action": "click the blue Submit button", "x": 512, "y": 833}\n'
+            '{"action": "double click the report.pdf file icon", "x": 217, "y": 405}\n'
+            '{"action": "type \\"47*8\\"", "x": null, "y": null}\n'
+            '{"action": "press enter", "x": null, "y": null}\n'
+            '{"action": "hotkey cmd+space", "x": null, "y": null}\n'
+            '{"action": "drag the file icon to the trash", "x": null, "y": null}\n'
+            '{"action": "DONE", "x": null, "y": null}'
+        )
+        user_text = (
+            f"Task: {task}\n"
+            f"Screen: {screen_w}x{screen_h}\n"
+            f"Recent history:\n{history_block}{dup_warning}\n"
+            "What is the next single action?"
+        )
+
+        def call(messages: list[dict[str, Any]]) -> dict[str, Any]:
+            body = {
+                "messages": messages,
+                # Deterministic: the grammar pins the shape; temperature 0
+                # pins the choice (the dup-warning + growing history break
+                # loops, not sampling noise).
+                "temperature": 0.0,
+                # Action sentence + coords fit comfortably; 384 leaves
+                # headroom for long type-"..." payloads.
+                "max_tokens": 384,
+                "grammar": STEP_GRAMMAR,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            r = self.client.post("/v1/chat/completions", json=body)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"llama-server /v1/chat/completions returned "
+                    f"{r.status_code}: {r.text[:600]}"
+                )
+            return r.json()
+
+        messages = self._messages(system, user_text, screenshot_b64)
+        try:
+            out = call(messages)
+        except RuntimeError as e:
+            if not _is_ctx_overflow(e):
+                raise
+            # Prompt blew the 8192/slot ctx (huge AX snapshot in the task).
+            # Drop the snapshot block and retry once.
+            user_text = (
+                f"Task: {_shrink_for_ctx(task)}\n"
+                f"Screen: {screen_w}x{screen_h}\n"
+                f"Recent history:\n{history_block}{dup_warning}\n"
+                "What is the next single action?"
+            )
+            messages = self._messages(system, user_text, screenshot_b64)
+            out = call(messages)
+        raw = _strip_think(out["choices"][0]["message"]["content"])
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            # Grammar should make this unreachable; degrade to plan-shaped
+            # output so the client's split-path fallback grounds separately.
+            return {"action": raw.strip(), "x": None, "y": None,
+                    "usage": out.get("usage", {})}
+        action = str(parsed.get("action") or "").strip()
+
+        # Malformed-action guard: under grammar-constrained greedy decoding
+        # the model occasionally emits just the verb ("click", "press") or
+        # nests JSON inside the action string ('{"action": "click", "x": …'
+        # until the token cap) — both useless for history/recipes and
+        # unparseable client-side. ONE corrective retry with the malformed
+        # reply echoed back.
+        bare_verbs = {"click", "double", "double click", "right click",
+                      "press", "hotkey", "type", "drag", "scroll", "wait"}
+        finish = out["choices"][0].get("finish_reason")
+        malformed = (
+            action.lower() in bare_verbs
+            or action.lstrip().startswith("{")
+            or '"action"' in action
+            or finish == "length"
+        )
+        if malformed:
+            retry_messages = messages + [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f'Your reply was malformed (action was "{action[:60]}"). '
+                    "Reply again with ONE short JSON object whose action is a "
+                    "COMPLETE action sentence naming the target or key (e.g. "
+                    '{"action": "click the 7 button", "x": 374, "y": 512} or '
+                    '{"action": "press enter", "x": null, "y": null}). '
+                    "Do NOT nest JSON inside the action string."
+                )},
+            ]
+            out = call(retry_messages)
+            raw = _strip_think(out["choices"][0]["message"]["content"])
+            try:
+                parsed = json.loads(raw)
+                action = str(parsed.get("action") or "").strip()
+            except (ValueError, TypeError):
+                pass  # keep the bare verb; client falls back to split path
+        rx, ry = parsed.get("x"), parsed.get("y")
+        if isinstance(rx, (int, float)) and isinstance(ry, (int, float)):
+            x = int(round((rx / 1000.0) * screen_w)) if rx <= 1000 else int(rx)
+            y = int(round((ry / 1000.0) * screen_h)) if ry <= 1000 else int(ry)
+            x = max(0, min(screen_w - 1, x))
+            y = max(0, min(screen_h - 1, y))
+            return {"action": action, "x": x, "y": y, "raw": [rx, ry],
+                    "usage": out.get("usage", {})}
+        return {"action": action, "x": None, "y": None,
+                "usage": out.get("usage", {})}
 
     # ---- Eyes (grounder) ----
 
@@ -711,6 +953,30 @@ def plan_endpoint(
     _check_auth(authorization)
     holo3 = Holo3()
     return holo3.plan.remote(
+        body["task"],
+        body.get("history", []),
+        body["screenshot_b64"],
+        int(body.get("screen", [0, 0])[0]),
+        int(body.get("screen", [0, 0])[1]),
+    )
+
+
+@app.function(image=image, secrets=[auth_secret], timeout=120)
+@modal.fastapi_endpoint(method="POST", docs=True)
+def step_endpoint(
+    body: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Combined plan+ground: one model call → {"action", "x", "y"}.
+
+    Same request shape as /plan. x/y are SCREEN-space ints (already
+    rescaled from the 0-1000 grid server-side, like /ground) or null
+    for keyboard/scroll/wait/DONE/drag actions. Clients treat null
+    coords on a mouse-aimed action as "fall back to /ground".
+    """
+    _check_auth(authorization)
+    holo3 = Holo3()
+    return holo3.step.remote(
         body["task"],
         body.get("history", []),
         body["screenshot_b64"],

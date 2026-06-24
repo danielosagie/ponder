@@ -14,7 +14,19 @@ import type { BrowserSnapshot } from "./browser/types";
  * interactive elements and the rest is decorative. Logged so we can spot
  * truncation in dev.
  */
-const SNAPSHOT_LIMIT = 20_000;
+// 8,000 chars (was 20,000): the Modal llama-server runs 8192 ctx per
+// slot, and a 12KB+ snapshot (basketball-reference, news sites) plus
+// the ~4k-token screenshot blew it — every plan/step call 500'd with
+// "exceeds the available context size" (live 2026-06-10). 8KB of refs
+// is plenty for the brain to pick an [eN]; the verifier already uses
+// the same cap.
+const SNAPSHOT_LIMIT = 8_000;
+// The hosted composite planner (Gemini-class, ~1M ctx) does NOT share
+// Modal's ceiling — capping it at 8KB starved it of refs on real pages
+// (live 2026-06-10: /you/selling snapshot was 8.2KB; the tail past the
+// cap held the per-listing controls, and the planner toggle-clicked the
+// one menu ref it could see until the ban fired).
+const SNAPSHOT_LIMIT_COMPOSITE = 24_000;
 
 export async function think(
   provider: ProviderClient,
@@ -43,7 +55,15 @@ export async function think(
      *  see the URL was wrong. */
     currentUrl?: { url: string; title: string };
   },
-): Promise<string> {
+): Promise<{
+  /** The next action sentence (same contract as before). */
+  action: string;
+  /** Pre-grounded click point from the combined step() path, in
+   *  screenshot-LOGICAL space (same space ground() answers in), or null
+   *  when the split path ran / the verb is keyboard-only / the combined
+   *  reply omitted coords. Callers use it to skip the ground call. */
+  coords: { x: number; y: number } | null;
+}> {
   let task = args.task;
 
   // ── TASK PRIORITY preamble ────────────────────────────────────────
@@ -93,7 +113,7 @@ export async function think(
   // wasted verifier call, not a falsely-abandoned task.
   const TASK_PRIORITY_PREAMBLE =
     `[TASK PRIORITY]\n` +
-    `1. Task text > screen state. Do task steps in the order written. If step 1 names an app that isn't visible, open it (cmd+space → type → enter) BEFORE anything else; ignore unrelated tabs/dialogs.\n` +
+    `1. Task text > screen state. Do task steps in the order written. If step 1 names an app that isn't visible, open it (open app "Name" — or cmd+space → type → enter as fallback) BEFORE anything else; ignore unrelated tabs/dialogs.\n` +
     `2. If a described element produced no screen change in your last action, it's not there — change the description (or strategy), don't re-emit.\n` +
     `3. Only if the task is truly impossible — a permission-denied / read-only / error dialog or a system message blocks it (NOT merely a hard or fiddly step) — reply exactly: INFEASIBLE: <one-line reason>. Never use this to give up on a hard-but-doable task.\n` +
     `\n` +
@@ -148,7 +168,15 @@ export async function think(
         `Type the FULL URL beginning with "https://".\n` +
         `\n` +
         `This is faster than the click-the-sidebar approach AND\n` +
-        `immune to vision grounding misses (no coords needed).\n`;
+        `immune to vision grounding misses (no coords needed).\n` +
+        `\n` +
+        `KNOWN MARKETPLACE URLS (use the one matching the task):\n` +
+        `  • search listings:   https://www.facebook.com/marketplace/search?query=...\n` +
+        `  • the USER'S OWN listings ("my listings", "products I'm\n` +
+        `    selling", editing your own items):\n` +
+        `    https://www.facebook.com/marketplace/you/selling\n` +
+        `Do NOT search the public marketplace for the user's own items —\n` +
+        `their listings live under /you/selling.\n`;
     }
     task =
       `[Browser state — for state-awareness only, do NOT emit actions about this:]\n` +
@@ -162,9 +190,11 @@ export async function think(
   }
   if (args.browserSnapshot) {
     const ax = args.browserSnapshot.ax;
+    const snapshotLimit =
+      provider.name === "composite" ? SNAPSHOT_LIMIT_COMPOSITE : SNAPSHOT_LIMIT;
     const trimmed =
-      ax.length > SNAPSHOT_LIMIT
-        ? ax.slice(0, SNAPSHOT_LIMIT) + "\n…(truncated)"
+      ax.length > snapshotLimit
+        ? ax.slice(0, snapshotLimit) + "\n…(truncated)"
         : ax;
     // Append, don't replace. The original task (with TASK_PRIORITY
     // preamble already prepended at the top of this function) stays
@@ -185,10 +215,19 @@ export async function think(
       `  browser.scroll page up\n` +
       `  browser.scroll <ref> down      (scroll a specific element/sidebar)\n` +
       `  browser.read [<ref>]           (read element or whole page text)\n` +
-      `Use browser.scroll page down for any page scroll on a web page —\n` +
-      `it scrolls the actual viewport instead of whatever's under the cursor.\n` +
+      `Use browser.scroll page down for whole-page scrolls — it scrolls the\n` +
+      `document viewport instead of whatever's under the cursor. BUT if it\n` +
+      `changes nothing (many app-like pages keep their lists in a NESTED\n` +
+      `scroll container that window scrolling can't reach), switch to the\n` +
+      `grounded form: scroll down at <description of the list/pane>.\n` +
       `If the snapshot URL is chrome-extension://…/welcome.html, your FIRST step\n` +
       `should be browser.navigate <url> — the welcome tab is just a launchpad.\n` +
+      (/facebook\.com/i.test(args.browserSnapshot.url)
+        ? `\nFACEBOOK URL MAP: the user's OWN listings ("my listings", items\n` +
+          `they are selling, editing their own items) live at\n` +
+          `https://www.facebook.com/marketplace/you/selling — go there\n` +
+          `directly; do NOT search the public marketplace for them.\n`
+        : ``) +
       `\n` +
       `CLI BIAS — default to keyboard/CLI verbs (~70% of actions):\n` +
       `browser.navigate, browser.type, hotkey, press. Reserve browser.click for\n` +
@@ -240,6 +279,57 @@ export async function think(
       `Use the screenshot to find what the router missed.`;
   }
 
+  // ── Combined plan+ground (2026-06-10) ────────────────────────────────
+  // When the provider supports step() (Modal /step), ONE model call
+  // returns the action AND its click point — halving per-step model time
+  // vs the sequential plan→ground pair. Gated by PONDER_COMBINED_STEP
+  // (default on; set "off" to force the split path). Any defect in the
+  // combined reply (error, bare-verb action) falls back to plan() for
+  // this step, so the worst case is exactly the old behavior.
+  const combinedEnabled =
+    (process.env.PONDER_COMBINED_STEP ?? "on").toLowerCase() !== "off";
+  if (combinedEnabled && typeof provider.step === "function") {
+    console.log(
+      `[brain] → ${provider.name}.step history=${args.history.length} screen=${args.screen[0]}x${args.screen[1]}` +
+        (args.browserSnapshot ? ` snapshot=${args.browserSnapshot.ax.length}b` : "") +
+        (args.routerHint ? ` routerHint="${args.routerHint.slice(0, 60)}"` : ""),
+    );
+    try {
+      const s = await provider.step({
+        task,
+        history: args.history,
+        screenshotB64: args.screenshotB64,
+        screen: args.screen,
+        signal: args.signal,
+      });
+      // Bare-verb guard: grammar-constrained greedy decoding sometimes
+      // emits just the verb ("click", "press") — useless for history/
+      // recipes and unparseable for keyboard verbs. Treat as a combined-
+      // path miss and re-plan via the split path.
+      const bare =
+        /^(click|double(?:\s+click)?|right\s+click|triple\s+click|press|hotkey|type|drag|scroll|wait)$/i.test(
+          s.action.trim(),
+        );
+      if (!bare) {
+        console.log(
+          `[brain] ← action="${s.action}" coords=${s.x !== null && s.y !== null ? `(${s.x},${s.y})` : "null"}${s.usage ? ` usage=${JSON.stringify(s.usage)}` : ""}`,
+        );
+        return {
+          action: s.action,
+          coords:
+            s.x !== null && s.y !== null ? { x: s.x, y: s.y } : null,
+        };
+      }
+      console.log(
+        `[brain] combined step returned bare verb "${s.action}" — falling back to split plan for this step`,
+      );
+    } catch (e) {
+      console.log(
+        `[brain] combined step failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)}) — falling back to split plan`,
+      );
+    }
+  }
+
   console.log(
     `[brain] → ${provider.name}.plan history=${args.history.length} screen=${args.screen[0]}x${args.screen[1]}` +
       (args.browserSnapshot ? ` snapshot=${args.browserSnapshot.ax.length}b` : "") +
@@ -255,17 +345,22 @@ export async function think(
   console.log(
     `[brain] ← action="${action}"${usage ? ` usage=${JSON.stringify(usage)}` : ""}`,
   );
-  return action;
+  return { action, coords: null };
 }
 
 // Actions that NEVER need pixel coordinates. The browser.* family is here
 // because every browser.* verb resolves via aria-ref, not (x, y) — so we
 // must short-circuit the grounding step the same way we do for type/press.
 const KEYBOARD_ONLY =
-  /^(type\s+|press\s+|hotkey\s+|scroll\s+|wait\s+|done|browser\.)/i;
+  /^(type\s+|press\s+|hotkey\s+|scroll\s+|wait\s+|done|note\s+|open\s+app\s+|browser\.)/i;
 
 export function needsCoordinates(action: string): boolean {
-  return !KEYBOARD_ONLY.test(action.trim());
+  const a = action.trim();
+  // "scroll up|down at/in/on <target>" aims the wheel at a SPECIFIC
+  // element (nested panes, sidebars) — it needs grounding even though
+  // plain "scroll up|down" is keyboard-only.
+  if (/^scroll\s+(up|down)\s+(at|in|on)\b/i.test(a)) return true;
+  return !KEYBOARD_ONLY.test(a);
 }
 
 // Allow-list of action verbs the executor knows how to dispatch. Used to
@@ -282,7 +377,7 @@ export function needsCoordinates(action: string): boolean {
 // treated as invalid — the loop pushes a `[note: …]` to history and
 // re-prompts, bailing after two consecutive invalids.
 const VALID_ACTION_VERB =
-  /^(?:click\b|double\s+click\b|triple\s+click\b|right\s+click\b|type\b|press\b|hotkey\b|drag\b|scroll\b|wait\b|done\b|infeasible\b|browser\.)/i;
+  /^(?:click\b|double\s+click\b|triple\s+click\b|right\s+click\b|(?:cmd|command|shift|alt|option|ctrl|control)[\s_-]*click\b|hover\b|type\b|press\b|hotkey\b|drag\b|scroll\b|wait\b|note\b|open\s+app\b|done\b|infeasible\b|browser\.)/i;
 
 export function isValidAction(action: string): boolean {
   return VALID_ACTION_VERB.test(action.trim());
@@ -365,6 +460,15 @@ export type BrowserAction =
   | { kind: "read"; ref?: string }
   | { kind: "navigate"; url: string };
 
+// Refs are ALWAYS [eN] snapshot tags. Live failure: the planner emitted
+// `browser.click "Modal"` (an accessible NAME instead of a ref); the raw
+// string flowed into a CSS attribute selector and Playwright threw
+// `'[data-holo-ref=""Modal""]' is not a valid selector` — 9 identical
+// crashes in one run because the error taught the model nothing. A
+// name-form ref now fails parsing, and the loop's invalid-action note
+// tells the planner to use the snapshot ref or a vision click.
+const VALID_REF = /^e\d+$/i;
+
 export function parseBrowserAction(action: string): BrowserAction | null {
   const a = action.trim();
   if (!/^browser\./i.test(a)) return null;
@@ -387,13 +491,17 @@ export function parseBrowserAction(action: string): BrowserAction | null {
 
   // browser.click <ref>
   m = a.match(/^browser\.click\s+(\S+)/i);
-  if (m) return { kind: "click", ref: m[1]! };
+  if (m) {
+    if (!VALID_REF.test(m[1]!)) return null; // name-form ref — see VALID_REF
+    return { kind: "click", ref: m[1]! };
+  }
 
   // browser.type <ref> "text" [and press enter|then press enter]
   m = a.match(
     /^browser\.type\s+(\S+)\s+["“'](?<text>[^"”']*)["”']\s*(?:(?:and|then)\s+press\s+(?<key>\w+))?/i,
   );
   if (m?.groups) {
+    if (!VALID_REF.test(m[1]!)) return null; // name-form ref — see VALID_REF
     return {
       kind: "type",
       ref: m[1]!,
@@ -415,6 +523,7 @@ export function parseBrowserAction(action: string): BrowserAction | null {
   // browser.scroll <ref> up|down [N]
   m = a.match(/^browser\.scroll\s+(\S+)\s+(up|down)(?:\s+(\d+))?/i);
   if (m) {
+    if (!VALID_REF.test(m[1]!)) return null; // name-form ref — see VALID_REF
     return {
       kind: "scroll_element",
       ref: m[1]!,

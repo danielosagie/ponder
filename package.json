@@ -62,7 +62,10 @@
     "ponder": "tsx src/cli/ponder.ts",
     "ponder:list": "tsx src/cli/ponder.ts list",
     "postinstall": "tsx src/cli/postinstall.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bench:decisions": "tsx bench/planner-decisions.ts --runs 6",
+    "bench:integration": "tsx bench/integration-flat-edit.ts",
+    "bench:menu": "tsx bench/integration-fb-menu.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

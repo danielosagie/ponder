@@ -42,12 +42,17 @@ function execFileP(cmd: string, argv: string[]): Promise<void> {
 
 /**
  * Crop `png` to `rect` (in PNG-pixel space) then resample the result by
- * `scale` (e.g. 2 = double the pixels). Both ops in one sips invocation;
- * sips applies flags left-to-right so crop happens before resample.
+ * `scale` (e.g. 2 = double the pixels).
  *
- * `scale === 1` still goes through sips (a pure crop) — keeps the one
- * code path. The returned buffer is PNG bytes at `rect.w*scale ×
- * rect.h*scale`.
+ * MUST be two sips invocations (2026-06-10): combining
+ * `--cropToHeightWidth` and `--resampleHeightWidth` in one call makes
+ * sips emit a mangled image (measured: a 460×816 crop + same-size
+ * resample returned 70×339). Crop first; resample only when scale≠1.
+ * This single-invocation bug is also a suspect in the eyes.ts refine
+ * experiment scoring 0/8.
+ *
+ * `scale === 1` is a pure crop. The returned buffer is PNG bytes at
+ * `rect.w*scale × rect.h*scale`.
  *
  * Rect is clamped to the image so a coarse coord near an edge can't
  * produce an out-of-bounds crop that sips would reject.
@@ -73,8 +78,7 @@ export async function cropAndScalePng(
   await writeFile(tmpIn, png);
   try {
     // --cropToHeightWidth H W --cropOffset Y X  is sips's left-handed
-    // way of saying "crop the rect (X,Y,W,H)". --resampleHeightWidth
-    // then scales the cropped result.
+    // way of saying "crop the rect (X,Y,W,H)".
     await execFileP("/usr/bin/sips", [
       "--cropToHeightWidth",
       String(h),
@@ -82,13 +86,20 @@ export async function cropAndScalePng(
       "--cropOffset",
       String(y),
       String(x),
-      "--resampleHeightWidth",
-      String(outH),
-      String(outW),
       tmpIn,
       "--out",
       tmpOut,
     ]);
+    if (outW !== w || outH !== h) {
+      // Separate invocation — see header comment for why these flags
+      // cannot share one sips call. In-place edit of the crop output.
+      await execFileP("/usr/bin/sips", [
+        "--resampleHeightWidth",
+        String(outH),
+        String(outW),
+        tmpOut,
+      ]);
+    }
     return await readFile(tmpOut);
   } finally {
     await unlink(tmpIn).catch(() => {});

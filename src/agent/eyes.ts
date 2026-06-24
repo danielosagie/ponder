@@ -4,21 +4,26 @@ import { cropAndScalePng, pngDimensions } from "./imageops";
 /**
  * Coarse→fine grounding (opt-in, env-gated).
  *
- * The vision-precision bench (2026-05-13) showed ~25% top-1 hit and
- * ~55px mean error on a SIMPLE Calculator, and that cropping to the
- * window barely helped. The hypothesis this implements: the model
- * localizes the rough region fine, but loses precision because dense
- * UI occupies few pixels. So: ground once for a rough point, crop a
- * tight box around it, UPSCALE that box (more pixels for the same
- * widget), and ground again. The second pass sees the target large.
+ * Ground once for a rough point, crop a tight box around it, UPSCALE
+ * that box (more pixels for the same widget), and ground again with
+ * the target shown large.
  *
- * Default OFF. It is a behavior change to the live loop that cannot be
- * validated from a dev box without Modal + a real desktop; shipping it
- * default-on would risk regressing the loop the user depends on. Flip
- * PONDER_GROUND_REFINE=1 to measure it via bench/vision-precision.ts
- * (which has a matching `refined` column), then make it default if it
- * wins. Any failure inside the fine pass falls back to the coarse
- * coord — refinement can only help, never strand a step.
+ * HISTORY — the 0/8 verdict was a tooling artifact, not a model limit.
+ * The 2026-05-18 bench scored refine 0/8 (~76px mean error) and
+ * NEXT-WORK declared it a dead end. Root cause found 2026-06-10:
+ * imageops.cropAndScalePng combined --cropToHeightWidth and
+ * --resampleHeightWidth in ONE sips invocation, which emits a mangled
+ * image (a 460×816 crop came back 70×339) — the model was grounding
+ * garbage pixels. With the two-invocation fix, the same bench scores
+ * refined 8/8 at ~1px mean error — the MOST precise grounding mode
+ * measured (uncropped ~3px, window-crop ~6px).
+ *
+ * Still default OFF because it costs one extra ground call per click
+ * and base grounding is already ~3-6px (well inside any button).
+ * Enable PONDER_GROUND_REFINE=1 for surfaces with genuinely tiny
+ * targets (dense toolbars, small text links) where ±5px matters. Any
+ * failure inside the fine pass falls back to the coarse coord —
+ * refinement can only help, never strand a step.
  */
 function refineEnabled(): boolean {
   const v = (process.env.PONDER_GROUND_REFINE ?? "").toLowerCase();
@@ -34,6 +39,16 @@ export async function findCoordinates(
     screenshotB64: string;
     screen: [number, number];
     signal?: AbortSignal;
+  },
+  opts?: {
+    /**
+     * Force the coarse→fine refine pass for THIS call regardless of the
+     * PONDER_GROUND_REFINE env default. Used by the loop's retry path:
+     * when the brain re-emits the same action (suspected misclick), the
+     * second attempt is worth the extra ground call — refine measured
+     * 8/8 ~1px vs ~3-6px coarse on the 2026-06-10 bench.
+     */
+    refine?: boolean;
   },
 ): Promise<{ x: number; y: number } | null> {
   console.log(`[eyes] → ${provider.name}.ground "${args.instruction}"`);
@@ -52,7 +67,7 @@ export async function findCoordinates(
     `[eyes] ← (${coarse.x}, ${coarse.y})${r.raw ? ` raw=${JSON.stringify(r.raw)}` : ""}`,
   );
 
-  if (!refineEnabled()) return coarse;
+  if (!(opts?.refine === true || refineEnabled())) return coarse;
   try {
     const refined = await refine(provider, args, coarse, [w, h]);
     if (refined) {
@@ -86,6 +101,20 @@ async function refine(
   coarse: { x: number; y: number },
   [w, h]: [number, number],
 ): Promise<{ x: number; y: number } | null> {
+  // Domain guard (2026-06-10, measured live): refine exists for FULL
+  // frames where the target occupies few pixels. On a window CROP the
+  // target is already large and native-res — upscaling it another 2×
+  // hands the model 4× blur, which it mis-grounds (observed: coarse
+  // (29,258) = the correct "4" button, refined → (34,298) = the "1"
+  // button, repeatedly, while the same refine scores 8/8 ~1px on full
+  // frames). Decline when the source's smallest side isn't comfortably
+  // larger than the refine box; the coarse answer stands.
+  if (Math.min(w, h) < REFINE_BOX_LOGICAL * 1.5) {
+    console.log(
+      `[eyes] refine skipped: source ${w}x${h} is already a zoomed view (box=${REFINE_BOX_LOGICAL}) — keeping coarse`,
+    );
+    return null;
+  }
   const png = Buffer.from(args.screenshotB64, "base64");
   const dims = pngDimensions(png);
   if (!dims) return null;

@@ -58,11 +58,18 @@ In the Anorha app, tell Sprout: **"Publish this to Facebook Marketplace"** (or
 listings"). Sprout calls `dispatch_marketplace_job`; because it leaves the app it
 goes to the approval queue first — approve it, and the desktop picks it up.
 
-## 4. Record recipes (makes it fast + reliable)
+## 4. Reads are automatic; record recipes for writes
 
-Until a recipe is recorded, the consumer drives FB with the **vision agent**
-(`agent_do`) — works, but slower and less reliable on FB's busy UI. Record once,
-replay forever:
+**READ jobs need NO setup.** `scrape_inventory`, `check_messages`, and
+`sync_listing_state` run through the built-in coarse **`/extract`** path
+(navigate → load-all → one structured pass → rows). The consumer returns clean
+rows + a `table` artifact deterministically — no recipe, no vision loop. This is
+the proven path (e.g. scrape_inventory returns your listings as Title/Price/
+Status/Views/Listed rows).
+
+**WRITE jobs** (`create_listing` / `update_listing` / `delete_listing` /
+`send_message`) default to the **vision agent** (`agent_do`) — works, but slower
+and less reliable on FB's busy UI. Record once, replay forever:
 
 ```bash
 # 1. Record yourself creating one listing (you must be logged into Facebook):
@@ -73,12 +80,15 @@ ponder list                      # find the new recipe id
 export PONDER_BROWSER_JOBS_RECIPE_CREATE_LISTING="<recipe-id>"
 ```
 
-Same pattern for the others:
-`PONDER_BROWSER_JOBS_RECIPE_UPDATE_LISTING`,
-`PONDER_BROWSER_JOBS_RECIPE_DELETE_LISTING`,
-`PONDER_BROWSER_JOBS_RECIPE_SCRAPE_INVENTORY`.
-With a recipe mapped, that job type replays deterministically (with vision
-re-grounding) instead of using the agent. Bulk = the same recipe replayed per row.
+Same pattern for `PONDER_BROWSER_JOBS_RECIPE_UPDATE_LISTING` and
+`PONDER_BROWSER_JOBS_RECIPE_DELETE_LISTING`. With a recipe mapped, that job type
+replays deterministically (with vision re-grounding) instead of using the agent.
+(`/recipe/run` is localhost-trusted, so the consumer needs no bridge key for it.)
+Don't map `*_SCRAPE_INVENTORY` / read types — they use `/extract` above.
+
+**Bulk** = the Sprout `dispatch_marketplace_job` tool accepts `productIds[]` /
+`listingRefs[]` / `items[]`; it enqueues one job per item and the consumer runs
+them serially (each write replays the same recipe). One approval covers the batch.
 
 See `docs/PONDER-MARKETPLACE-CRUD.md` for the full per-operation playbook.
 

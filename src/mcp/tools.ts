@@ -18,10 +18,18 @@ import { ConvexHttpClient } from "convex/browser";
 import { api as convexApi } from "../../convex/_generated/api.js";
 import { createPlaywriterClient } from "../agent/browser/playwriter.js";
 import * as screen from "../screen.js";
+import { cropAndScalePng, pngDimensions } from "../agent/imageops.js";
 import type { BrowserClient, BrowserSnapshot } from "../agent/browser/types.js";
 import { runTask } from "../agent/loop.js";
+import { runAgpTask } from "../agent/agp/loop.js";
+import { AgpClient } from "../agent/agp/client.js";
+import { writeCsvFile, copyTableToClipboard } from "../agent/export.js";
+import { extractRows } from "../agent/extract.js";
+import { runLongTask } from "../agent/orchestrator.js";
+import { buildOrchestratorDeps } from "../agent/orchestrator-deps.js";
 import {
   computeDefaultProvider,
+  executorNameFor,
   isProviderConfigured,
   makeProvider,
   makeRouter,
@@ -48,6 +56,7 @@ import {
   RECIPES_DIR,
   SESSIONS_DIR,
   recordAction,
+  parseAxRefs,
   snapshotTrace,
   traceLength,
   startNewTrace,
@@ -101,6 +110,114 @@ function getBrowser(): Promise<BrowserClient> {
     });
   }
   return _browserPromise;
+}
+
+// Latched from the most recent browser_snapshot: ref→(role,name) labels
+// + page URL. Direct browser_click/browser_type/browser_set_input_files
+// trace records stamp these on (mcpRefMeta below) so recipe codegen gets
+// durable page.getByRole(...) selectors and replay gets self-healing —
+// previously direct MCP browser actions recorded only the ephemeral [eN]
+// ref. Snapshot-then-act is the orchestrator's contract, so the latch is
+// fresh whenever a ref is valid in the first place.
+let lastMcpSnapshotRefs: Map<string, { role: string; name: string }> | null =
+  null;
+let lastMcpSnapshotUrl: string | undefined;
+function mcpRefMeta(ref: string): {
+  refLabel?: { role: string; name: string };
+  url?: string;
+} {
+  const refLabel = lastMcpSnapshotRefs?.get(ref);
+  return {
+    ...(refLabel ? { refLabel } : {}),
+    ...(lastMcpSnapshotUrl ? { url: lastMcpSnapshotUrl } : {}),
+  };
+}
+
+/**
+ * Crop a captured frame to `targetApp`'s front window for the single-shot
+ * vision primitives (agent_click / agent_observe) — the same ~6-20×
+ * image-token reduction the agent_do loop gets from maybeCropToTargetApp,
+ * without these tools paying full-frame grounding (~5-10s on Modal).
+ *
+ * Strategy mirrors the loop:
+ *   1. When the frame came from LOCAL capture (bridge down), prefer
+ *      screen.captureWindowDirect — native-res, occlusion-proof.
+ *   2. Otherwise crop the frame we already have: bounds via
+ *      getMacWindowBounds (bridge-first), physical-px slice via sips.
+ *   3. Any failure → return the frame unchanged (never blocks the call).
+ *
+ * Returned offsets carry the window origin, so the existing
+ * `coords + offsetX/Y` translation downstream works unchanged.
+ */
+async function cropFrameToApp(
+  frame: {
+    png: Buffer;
+    width: number;
+    height: number;
+    offsetX: number;
+    offsetY: number;
+  },
+  targetApp: string,
+  preferDirect: boolean,
+): Promise<typeof frame & { cropNote?: string }> {
+  try {
+    if (preferDirect) {
+      const direct = await screen.captureWindowDirect(targetApp);
+      if (direct && Math.min(direct.width, direct.height) >= 80) {
+        return {
+          png: direct.png,
+          width: direct.width,
+          height: direct.height,
+          offsetX: direct.offsetX,
+          offsetY: direct.offsetY,
+          ...(direct.occluders.length > 0
+            ? {
+                cropNote: `⚠️ ${targetApp}'s window is overlapped by ${direct.occluders.join("; ")} — grounding uses the window's own pixels, but clicks land on whatever is on top.`,
+              }
+            : {}),
+        };
+      }
+    }
+    const bounds = await screen.getMacWindowBounds(targetApp);
+    if (!bounds) return frame;
+    const dims = pngDimensions(frame.png);
+    if (!dims) return frame;
+    const sf = dims.width / frame.width;
+    const floor = sf > 1 ? 80 : 300;
+    if (Math.min(bounds.width, bounds.height) < floor) return frame;
+    const cropX = bounds.x - frame.offsetX;
+    const cropY = bounds.y - frame.offsetY;
+    if (
+      cropX < 0 ||
+      cropY < 0 ||
+      cropX + bounds.width > frame.width ||
+      cropY + bounds.height > frame.height
+    ) {
+      return frame; // window not fully inside this frame — stay uncropped
+    }
+    const cropped = await cropAndScalePng(
+      frame.png,
+      {
+        x: cropX * sf,
+        y: cropY * sf,
+        w: bounds.width * sf,
+        h: bounds.height * sf,
+      },
+      1,
+    );
+    return {
+      png: cropped,
+      width: bounds.width,
+      height: bounds.height,
+      offsetX: bounds.x,
+      offsetY: bounds.y,
+    };
+  } catch (e) {
+    stderrLog(
+      `[mcp] cropFrameToApp("${targetApp}") failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)}) — grounding uncropped`,
+    );
+    return frame;
+  }
 }
 
 // Best-effort browser fetch for paths that DON'T want to fail when Chrome
@@ -199,6 +316,17 @@ async function getProviderWarmed(): Promise<{
 
 let _providerLastWarmError: string | null = null;
 
+// ── AGP server-side brain (thin-driver) ──────────────────────────────
+// Lazily-constructed client for the `agp_do` tool: H-company's Holo 3.1
+// agent plans+grounds server-side and streams driver commands we execute
+// against the shared Playwriter browser. Same process lifetime as
+// _browserPromise; reads HAI_API_KEY / HCOMPANY_API_KEY from env.
+let _agpClient: AgpClient | null = null;
+function getAgpClient(): AgpClient {
+  if (!_agpClient) _agpClient = new AgpClient();
+  return _agpClient;
+}
+
 const ok = (text: string) => ({
   content: [{ type: "text" as const, text }],
 });
@@ -210,6 +338,17 @@ const fail = (text: string) => ({
 async function ensureAttached(): Promise<string | null> {
   const browser = await getBrowser();
   if (await browser.available()) return null;
+  // Zero-touch (user: "shouldn't have to press a single thing", no debug ports):
+  // the agent vision-clicks the Playwriter icon ITSELF before bouncing to the
+  // user. Proven to attach in ~11s, first try. Only if that fails do we fall
+  // back to asking the human to click the green icon.
+  try {
+    const { autoAttachPlaywriter } = await import("../agent/auto-attach.js");
+    const r = await autoAttachPlaywriter(browser);
+    if (r.attached) return null;
+  } catch {
+    /* grounding/screen unavailable — fall through to the manual recovery */
+  }
   return (
     "Chrome tab not attached to Playwriter. Attaching requires a user " +
     "gesture (Chrome's debugger.attach security model — no programmatic " +
@@ -516,7 +655,20 @@ type ToolResult =
 async function tryForwardToBridge(
   task: string,
   sendProgress: (msg: string) => Promise<void>,
-  opts?: { targetApp?: string; surface?: string; rawTask?: string },
+  opts?: {
+    targetApp?: string;
+    surface?: string;
+    rawTask?: string;
+    decompose?: boolean;
+    /**
+     * Mirror the bridge's transcript steps into the process-wide trace
+     * buffer so they appear in whole-flow recipe saves. Pass true ONLY
+     * for user-task forwards (agent_do) — ponder_browser_ensure's
+     * auto-attach also routes through here, and its toolbar-click
+     * machinery must never become recipe steps.
+     */
+    mirrorTrace?: boolean;
+  },
 ): Promise<{ isError: boolean; payload: ToolResult } | null> {
   if (!(await bridgeAvailable())) return null;
   const bridgeStartedAt = Date.now();
@@ -526,7 +678,13 @@ async function tryForwardToBridge(
       (opts?.targetApp ? ` — targetApp="${opts.targetApp}"` : ""),
   );
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), BRIDGE_RUN_TIMEOUT_MS);
+  // Decomposed runs execute up to ~12 verified steps × 8 inner steps —
+  // give them a proportionally longer leash than a single atomic step.
+  const runTimeoutMs =
+    opts?.decompose === true
+      ? Math.max(BRIDGE_RUN_TIMEOUT_MS, 600_000)
+      : BRIDGE_RUN_TIMEOUT_MS;
+  const timer = setTimeout(() => ctrl.abort(), runTimeoutMs);
   try {
     const res = await fetch(`http://127.0.0.1:${BRIDGE_PORT}/agent_do`, {
       method: "POST",
@@ -534,6 +692,7 @@ async function tryForwardToBridge(
       body: JSON.stringify({
         task,
         ...(opts?.targetApp ? { targetApp: opts.targetApp } : {}),
+        ...(opts?.decompose === true ? { decompose: true } : {}),
       }),
       signal: ctrl.signal,
     });
@@ -580,6 +739,34 @@ async function tryForwardToBridge(
         ...(result.errorMessage ? { error: result.errorMessage } : {}),
       },
     );
+    // Mirror the reconstructed steps into the process-wide trace buffer
+    // so a later ponder_recipe_save of the WHOLE flow includes what the
+    // bridge did. Without this, bridge-forwarded agent_do segments were
+    // silently missing from saved recipes (they only existed in the
+    // per-run auto-saved session) — the biggest fidelity gap in the
+    // logs→reproducible-script pipeline.
+    //
+    // Gated on mirrorTrace (agent_do only — never browser_ensure's
+    // attach machinery), skipped for error outcomes, skips steps whose
+    // payload didn't survive the transcript round-trip (_truncated),
+    // and rebases each step's REAL transcript timestamp onto the trace
+    // clock so recorded-pacing replay keeps true inter-step deltas.
+    if (opts?.mirrorTrace === true && result.outcome !== "error") {
+      for (const step of recordedSession.steps) {
+        if ((step.executed.payload as { _truncated?: boolean })._truncated) {
+          continue; // unreplayable — recording it would halt replays
+        }
+        recordAction({
+          type: step.executed.type,
+          payload: step.executed.payload,
+          ...(step.intent ? { intent: step.intent } : {}),
+          ...(step.refLabel ? { refLabel: step.refLabel } : {}),
+          ...(step.url ? { url: step.url } : {}),
+          consumer: "bridge:agent_do",
+          atEpochMs: bridgeStartedAt + step.t,
+        });
+      }
+    }
     const saved = await saveSession(recordedSession);
     const scriptBlock = renderScriptBlockFromSession(recordedSession, saved);
 
@@ -752,7 +939,22 @@ export function registerTools(server: McpServer): void {
             "Natural-language description of ONE atomic mouse-aimed step. Should fit " +
               "in one sentence. The inner brain is small — keep tasks tight (one verb, " +
               "one target). For multi-step goals, decompose into multiple tool calls " +
-              "and observe state (browser_snapshot / screen_screenshot) between them.",
+              "and observe state (browser_snapshot / screen_screenshot) between them, " +
+              "or pass multistep:true to let the inner loop decompose once and " +
+              "verify-advance through the steps itself.",
+          ),
+        multistep: z
+          .boolean()
+          .optional()
+          .describe(
+            "Declare the task as genuinely multi-step (e.g. 'enter 47×8 on the " +
+              "calculator and read the result'). The inner loop then makes ONE " +
+              "strong-model planning call to split it into atomic steps and only " +
+              "advances past each step when a verifier confirms it landed — fixes " +
+              "the mis-sequencing failure mode where the per-step brain loses track " +
+              "of which sub-step it is on. Requires the PONDER_DECOMPOSE env gate " +
+              "on the server; without it this flag is inert and the task runs flat. " +
+              "Leave unset for true single-action calls (the common case).",
           ),
         // Marked optional in the schema so a missing value falls
         // through to our handler-side validator, which returns a
@@ -826,7 +1028,7 @@ export function registerTools(server: McpServer): void {
           ),
       },
     },
-    async ({ task, surface, context, goal, targetApp }, extra) => {
+    async ({ task, surface, context, goal, targetApp, multistep }, extra) => {
       return chainAgentDo(async () => {
         const t0 = Date.now();
 
@@ -929,7 +1131,13 @@ export function registerTools(server: McpServer): void {
         const bridgeResult = await tryForwardToBridge(
           augmentedTask,
           sendProgress,
-          { targetApp, surface, rawTask: task },
+          {
+            targetApp,
+            surface,
+            rawTask: task,
+            decompose: multistep === true,
+            mirrorTrace: true,
+          },
         );
         if (bridgeResult !== null) {
           stderrLog(
@@ -1025,7 +1233,7 @@ export function registerTools(server: McpServer): void {
           try {
             const id = (await convex.mutation(convexApi.sessions.create, {
               prompt: task,
-              provider: provider.name,
+              provider: executorNameFor(provider.name),
             })) as unknown as string;
             sessionId = id;
             await convex.mutation(convexApi.sessions.setStatus, {
@@ -1087,7 +1295,7 @@ export function registerTools(server: McpServer): void {
         // observational — it never changes runTask's behavior.
         const recorder = createSessionRecorder({
           task,
-          provider: provider.name,
+          provider: executorNameFor(provider.name),
           surface,
         });
 
@@ -1179,6 +1387,9 @@ export function registerTools(server: McpServer): void {
             // is already open) that the brain can't recognize as DONE.
             // See loop.ts RunOptions.flat for the rationale.
             flat: true,
+            // Declared-multi-step decomposition (NEXT-WORK Item 2);
+            // inert unless PONDER_DECOMPOSE is also on server-side.
+            ...(multistep === true ? { decompose: true } : {}),
             // Tandem-mode safety: forward the declared surface so the
             // loop can seed step 1's routerHint and suppress the router
             // when an OS overlay is on top of Chrome. From step 2
@@ -1190,14 +1401,14 @@ export function registerTools(server: McpServer): void {
             // instead of letting the brain spin for 50 retries. Override
             // via PONDER_AGENT_DO_MAX_STEPS for legacy callers.
             maxSteps: Number(process.env.PONDER_AGENT_DO_MAX_STEPS ?? 8),
-            // Tighter inter-step pause for atomic OS-level work. The
-            // legacy 6500ms pause (hcompany rate-limit safety) × 8
-            // steps + plan/ground per step pushes total runtime over
-            // the MCP client's typical 30-60s request timeout, even
-            // with progress notifications. 1500ms keeps an 8-step run
-            // under ~30s wall time on the rate-limited path. Override
-            // via PONDER_AGENT_DO_STEP_PAUSE_MS.
-            stepPause: Number(process.env.PONDER_AGENT_DO_STEP_PAUSE_MS ?? 1500),
+            // Tighter inter-step pause for atomic OS-level work. UI
+            // settle is handled separately (settleMs: 250ms base,
+            // 1400ms post-type, 2500ms post-Spotlight); this is just
+            // the inter-step breather. 500ms (was 1500ms) — with
+            // native-res crops a step is ~2-4s, so the old pause was
+            // a third of the step. Override via
+            // PONDER_AGENT_DO_STEP_PAUSE_MS.
+            stepPause: Number(process.env.PONDER_AGENT_DO_STEP_PAUSE_MS ?? 500),
             // Thread the orchestrator's optional higher-level goal so
             // the brain stays oriented if the immediate task is just a
             // mechanical step.
@@ -1334,6 +1545,211 @@ export function registerTools(server: McpServer): void {
         // what to do with the transcript.
         if (outcome === "error") return fail(finalText);
         return { content: responseContent };
+      });
+    },
+  );
+
+  server.registerTool(
+    "agp_do",
+    {
+      title: `${MCP_BRAND}: Run a whole browser task on the server-side AGP brain`,
+      description:
+        "Run an END-TO-END in-Chrome task on H-company's server-side Holo 3.1 agent — " +
+        "the SAME brain the HoloTab extension uses. holo3-agent acts as a thin DRIVER: " +
+        "the agent plans AND grounds on the server and streams driver commands " +
+        "(navigate, observe, click, type, extract_table, extract_markdown, fill_form, " +
+        "scroll, new_tab, …) which we execute against the user's real Chrome via the " +
+        "Playwriter relay. There are NO client-side per-step screenshots or model " +
+        "round-trips, so this is the FAST path for multi-step web work: searching, " +
+        "browsing, filling forms, and bulk-extracting structured data from a page. " +
+        "Give it the WHOLE goal in one call (e.g. 'find the 3 cheapest 1997 Camrys on " +
+        "Marketplace and report title+price+link'), not one atomic step. " +
+        "Contrast with agent_do, which runs the LOCAL composite vision loop ONE atomic " +
+        "OS-level step at a time — use agent_do only for OS surfaces outside Chrome " +
+        "(Finder, file-picker, menu-bar). For anything that happens inside a Chrome " +
+        "page, prefer agp_do. Requires HAI_API_KEY and an attached Playwriter tab " +
+        "(same as the browser_* tools). Returns the run status, the agent's final " +
+        "answer, and a compact transcript of the commands it drove." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        task: z
+          .string()
+          .min(1)
+          .describe(
+            "The full natural-language goal to accomplish in the browser. Unlike " +
+              "agent_do, this is NOT one atomic step — describe the whole task and let " +
+              "the server brain plan it (e.g. 'list my Facebook Marketplace items with " +
+              "their prices and sold/active status').",
+          ),
+        startUrl: z
+          .string()
+          .url()
+          .optional()
+          .describe(
+            "Optional URL the brain should start on. If omitted, the brain works from " +
+              "the currently-attached tab (so navigate there first, or pass it here).",
+          ),
+        agent: z
+          .string()
+          .optional()
+          .describe(
+            "Optional AGP agent id override. Defaults to the live EU Holo 3.1 HoloTab " +
+              "agent. Only set this if you know a specific client-driven agent id.",
+          ),
+        timeoutSec: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Overall wall-clock budget in seconds (default 600)."),
+        maxCommands: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Hard cap on driver commands executed (runaway backstop; default 120)."),
+      },
+    },
+    async ({ task, startUrl, agent, timeoutSec, maxCommands }) => {
+      // Serialize against agent_do: both drive the user's ONE Chrome session
+      // through the shared Playwriter client, so they must not run concurrently.
+      return chainAgentDo(async () => {
+        const client = getAgpClient();
+        if (!client.configured) {
+          return fail(
+            "AGP brain not configured. Set HAI_API_KEY (or HCOMPANY_API_KEY) in the " +
+              "environment so holo3-agent can authenticate to H-company's Agent " +
+              "Platform. Until then, use agent_do (local composite loop) instead.",
+          );
+        }
+        const notAttached = await ensureAttached();
+        if (notAttached) return fail(notAttached);
+        const browser = await getBrowser();
+
+        // Collect a compact transcript from the server event + command streams.
+        const trace: string[] = [];
+        const result = await runAgpTask({
+          task,
+          startUrl: startUrl ?? null,
+          agentId: agent,
+          client,
+          browser,
+          timeoutMs: timeoutSec ? timeoutSec * 1000 : undefined,
+          maxCommands,
+          onEvent: (ev) => {
+            if (ev.kind === "policy_event" && ev.text) {
+              trace.push(`· ${ev.text.replace(/\s+/g, " ").slice(0, 200)}`);
+            } else if (ev.kind === "error_event" && ev.error) {
+              trace.push(`! ${ev.error.slice(0, 200)}`);
+            }
+          },
+          onCommand: (name, args) => {
+            const argStr = Object.keys(args).length
+              ? ` ${JSON.stringify(args).slice(0, 100)}`
+              : "";
+            trace.push(`  - ${name}${argStr}`);
+          },
+        });
+
+        const head = `AGP ${result.status} — ${result.commandCount} commands (traj ${
+          result.trajectoryId ?? "?"
+        }).`;
+        const answer = result.answer ? `\n\nAnswer:\n${result.answer}` : "";
+        const err = result.error ? `\n\nError: ${result.error}` : "";
+        // Last 40 trace lines keep the reply bounded on long runs.
+        const tail = trace.length ? `\n\nTranscript:\n${trace.slice(-40).join("\n")}` : "";
+        const body = `${head}${answer}${err}${tail}`;
+        return result.status === "failed" || result.status === "error"
+          ? fail(body)
+          : ok(body);
+      });
+    },
+  );
+
+  server.registerTool(
+    "long_task",
+    {
+      title: `${MCP_BRAND}: Run a long, multi-step task (orchestrated)`,
+      description:
+        "Run a BIG multi-step goal end-to-end. Decomposes the goal into sub-tasks ONCE, " +
+        "then runs each via the cheapest capable path — replay a saved automation › a " +
+        "coarse extract/write › the AGP agent — and checkpoints progress to a durable run " +
+        "file so it RESUMES after a crash/restart (pass back the returned runId). " +
+        "Accumulated rows live in a scratchpad, not the context, so it scales to hundreds " +
+        "of steps without blowing up cost. Use this for goals like 'list/collect/cross-post/" +
+        "reprice across many items or pages'. For a single atomic action use browser_* or " +
+        "agp_do instead. Needs HAI_API_KEY (agent tier) + an attached Chrome tab. Returns " +
+        "status, the sub-task trace, accumulated row count, and the runId to resume." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        goal: z.string().min(1).describe("The full high-level goal to accomplish."),
+        maxSubtasks: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Cap how many sub-tasks run (default: all)."),
+        maxAgentCalls: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Cap the expensive AGP-agent tier — the cost/drift governor."),
+        runId: z
+          .string()
+          .optional()
+          .describe("Resume a prior run: pass the runId it returned; completed sub-tasks are skipped."),
+      },
+    },
+    async ({ goal, maxSubtasks, maxAgentCalls, runId }) => {
+      return chainAgentDo(async () => {
+        const client = getAgpClient();
+        if (!client.configured) {
+          return fail(
+            "Long tasks need the AGP brain for the agent tier — set HAI_API_KEY (or " +
+              "HCOMPANY_API_KEY). The replay + coarse tiers still work, but novel sub-tasks " +
+              "need the agent.",
+          );
+        }
+        const notAttached = await ensureAttached();
+        if (notAttached) return fail(notAttached);
+        const browser = await getBrowser();
+        const deps = buildOrchestratorDeps({ browser, agpClient: client });
+
+        const trace: string[] = [];
+        const result = await runLongTask(
+          goal,
+          {
+            ...deps,
+            onProgress: (ev) =>
+              trace.push(
+                `[${ev.index + 1}/${ev.total}] ${ev.via} · ${ev.subtask.description}` +
+                  (ev.result.note ? ` — ${ev.result.note}` : ""),
+              ),
+          },
+          {
+            ...(runId ? { runId } : {}),
+            budget: {
+              ...(maxSubtasks ? { maxSubtasks } : {}),
+              ...(maxAgentCalls ? { maxAgentCalls } : {}),
+            },
+          },
+        );
+
+        const head =
+          `Long task ${result.status} — ${result.done}/${result.total} sub-tasks, ` +
+          `${result.agentCalls} agent call(s).`;
+        const reason = result.reason ? `\nStopped: ${result.reason}` : "";
+        const rowsNote = result.rows.length
+          ? `\n\nAccumulated ${result.rows.length} row(s)${
+              result.headers.length ? ` [${result.headers.join(", ")}]` : ""
+            }.`
+          : "";
+        const traceTxt = trace.length ? `\n\nSub-tasks:\n${trace.join("\n")}` : "";
+        const body =
+          `${head}${reason}${rowsNote}${traceTxt}\n\n` +
+          `Resume/continue with long_task(runId: "${result.runId}").`;
+        return result.status === "aborted" && result.done === 0 ? fail(body) : ok(body);
       });
     },
   );
@@ -1520,6 +1936,58 @@ export function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "browser_new_tab",
+    {
+      title: `${MCP_BRAND}: Open a new tab`,
+      description:
+        "Open a NEW Chrome tab in the controlled group and make it the active tab " +
+        "(subsequent browser_* calls target it). Pass a url to load it immediately, or " +
+        "omit url for a blank tab you then browser_navigate. " +
+        "Use this to work across several pages at once WITHOUT losing the page you're on — " +
+        "e.g. keep a Marketplace listing index open in one tab while opening each post in " +
+        "its own tab to pull title / price / SKU / photo URLs, then browser_switch_tab back " +
+        "to the index. The new tab is auto-attached (no green-icon click needed). " +
+        "Pair with browser_list_tabs (see all open tabs) and browser_switch_tab (jump between them)." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        url: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute URL to load in the new tab, e.g. " +
+              "https://www.facebook.com/marketplace/item/123. Omit for a blank tab.",
+          ),
+      },
+    },
+    async ({ url }) => {
+      const not = await ensureAttached();
+      if (not) return fail(not);
+      try {
+        const browser = await getBrowser();
+        if (typeof browser.newTab !== "function") {
+          return fail(
+            "This browser driver can't open tabs. Use browser_navigate to reuse the " +
+              "current tab instead.",
+          );
+        }
+        await browser.newTab(url);
+        await new Promise((r) => setTimeout(r, url ? 900 : 300));
+        const tabs = await browser.listTabs();
+        const current = tabs.find((t) => t.isCurrent) ?? tabs[tabs.length - 1];
+        return ok(
+          `Opened a new tab${current ? ` [${current.index}]: ${current.url}` : ""}. ` +
+            `${tabs.length} tab${tabs.length === 1 ? "" : "s"} now attached. ` +
+            "It's the active tab — call browser_snapshot to see it, or browser_switch_tab to go back.",
+        );
+      } catch (e) {
+        return fail(
+          `Open tab failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+  );
+
+  server.registerTool(
     "browser_navigate",
     {
       title: `${MCP_BRAND}: Navigate`,
@@ -1546,6 +2014,12 @@ export function registerTools(server: McpServer): void {
         // Brief settle so the next snapshot/read reflects the new page.
         await new Promise((r) => setTimeout(r, 800));
         const snap = await browser.snapshot();
+        // This snapshot just RE-STAMPED every data-holo-ref on the new
+        // page — refresh the refLabel latch to match, or a post-navigate
+        // ref reuse would record the OLD page's role/name and URL as a
+        // confidently-wrong refLabel.
+        lastMcpSnapshotRefs = parseAxRefs(snap.ax);
+        lastMcpSnapshotUrl = snap.url;
         const note = snap.url !== url ? " (redirected)" : "";
         recordAction({
           type: "browser_navigate",
@@ -1585,6 +2059,15 @@ export function registerTools(server: McpServer): void {
       if (not) return fail(not);
       try {
         const snap = await (await getBrowser()).snapshot();
+        // Latch ref→(role,name) labels + URL so the trace buffer can
+        // stamp durable refLabels onto subsequent direct browser_click /
+        // browser_type / browser_set_input_files records WITHOUT a
+        // post-action snapshot. The orchestrator necessarily snapshotted
+        // to learn the ref, so this costs nothing and gives recipe
+        // codegen page.getByRole(...) selectors (and replay-time
+        // self-healing) instead of stale [data-holo-ref] fallbacks.
+        lastMcpSnapshotRefs = parseAxRefs(snap.ax);
+        lastMcpSnapshotUrl = snap.url;
         return ok(
           `URL: ${snap.url}\nTitle: ${snap.title}\n\n` +
             `Interactive elements (refs in [eN]):\n${snap.ax}`,
@@ -1632,7 +2115,11 @@ export function registerTools(server: McpServer): void {
         // agent_do path still captures full refLabels via its own
         // recorder.onBrowserSnapshot hook (see the agent_do handler
         // below), where the snapshot was already taken anyway.
-        recordAction({ type: "browser_click", payload: { ref } });
+        recordAction({
+          type: "browser_click",
+          payload: { ref },
+          ...mcpRefMeta(ref),
+        });
         return ok(`Clicked ${ref}`);
       } catch (e) {
         return fail(
@@ -1689,6 +2176,7 @@ export function registerTools(server: McpServer): void {
         recordAction({
           type: "browser_set_input_files",
           payload: { ref, paths },
+          ...mcpRefMeta(ref),
         });
         return ok(
           `Attached ${paths.length} file${paths.length === 1 ? "" : "s"} to ${ref}: ${names}. ` +
@@ -1750,6 +2238,7 @@ export function registerTools(server: McpServer): void {
         recordAction({
           type: "browser_type",
           payload: { ref, text, ...(submit ? { submit: true } : {}) },
+          ...mcpRefMeta(ref),
         });
         return ok(
           `Typed "${text}" into ${ref}${submit ? " and pressed Enter" : ""}. ` +
@@ -1841,6 +2330,142 @@ export function registerTools(server: McpServer): void {
         return ok(text || "(page is empty)");
       } catch (e) {
         return fail(`Read failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "extract",
+    {
+      title: `${MCP_BRAND}: Extract structured rows from the page`,
+      description:
+        "Turn the CURRENT Chrome page into structured rows in ONE call — reads the " +
+        "whole page (Firecrawl-style cleaned text) and shapes it into a table with a " +
+        "fast model pass, instead of scrolling + reading screenshots row by row. Give " +
+        "`columns` (e.g. ['Item','Price','Status']) and/or freeform `instructions`. " +
+        "Set `to:'clipboard'` to drop the rows straight onto the clipboard as TSV " +
+        "(then click A1 and paste into a sheet), or `to:'csv'` to write a file — so " +
+        "'list/export/collect X into a sheet' becomes a single step. Without `to`, " +
+        "returns the rows as JSON to pass to copy_table / write_csv. This is the FAST " +
+        "path for data tasks — no per-row clicking, no vision loop." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        columns: z
+          .array(z.string())
+          .optional()
+          .describe("Desired columns, in order. Omit to let the model infer them."),
+        instructions: z
+          .string()
+          .optional()
+          .describe("Freeform guidance: what to pull, how to filter (e.g. 'only active listings')."),
+        ref: z
+          .string()
+          .optional()
+          .describe("Optional [eN] ref to read just one element instead of the whole page."),
+        to: z
+          .enum(["clipboard", "csv"])
+          .optional()
+          .describe("Optionally write the rows: 'clipboard' (TSV, paste into a sheet) or 'csv' (file)."),
+        path: z.string().optional().describe("CSV destination path when to='csv'."),
+      },
+    },
+    async ({ columns, instructions, ref, to, path }) => {
+      const not = await ensureAttached();
+      if (not) return fail(not);
+      try {
+        const pageText = await (await getBrowser()).readText(ref);
+        if (!pageText || !pageText.trim()) {
+          return fail("Page has no readable text to extract from (try browser_navigate first, or scroll to load content).");
+        }
+        const { headers, rows } = await extractRows({ pageText, columns, instructions });
+        if (!rows.length) {
+          return ok("No rows matched that request on this page. Try different columns/instructions, or scroll to load more items.");
+        }
+        if (to === "clipboard") {
+          copyTableToClipboard({ rows, headers });
+          return ok(
+            `Extracted ${rows.length} row(s) × ${headers.length} col(s) and copied as TSV. ` +
+              "Now click the destination cell (e.g. A1) and paste (Cmd/Ctrl+V) to fill the grid.",
+          );
+        }
+        if (to === "csv") {
+          const written = writeCsvFile({ rows, headers }, path);
+          return ok(`Extracted ${rows.length} row(s) → ${written}`);
+        }
+        const json = JSON.stringify({ headers, rows });
+        return ok(`Extracted ${rows.length} row(s) × ${headers.length} col(s):\n${json}`);
+      } catch (e) {
+        return fail(`extract failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "copy_table",
+    {
+      title: `${MCP_BRAND}: Copy rows to clipboard (TSV)`,
+      description:
+        "Put a whole table of rows onto the system clipboard as TSV in ONE call — " +
+        "the fast, no-auth way to fill a Google Sheet / Excel: call copy_table, then " +
+        "click the target cell (e.g. A1) and paste (Cmd/Ctrl+V); the sheet expands " +
+        "the TSV into a full grid instantly. Use this instead of typing cells one by " +
+        "one. Pass `rows` as an array of arrays (each inner array is one row); " +
+        "optional `headers` become the first row. Pairs with browser_read/extract " +
+        "(the read half) to do list-into-sheet tasks in seconds." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        rows: z
+          .array(z.array(z.union([z.string(), z.number()])))
+          .describe("Array of rows; each row is an array of cell values (strings or numbers)."),
+        headers: z
+          .array(z.string())
+          .optional()
+          .describe("Optional column headers, written as the first row."),
+      },
+    },
+    async ({ rows, headers }) => {
+      try {
+        const { rows: n, cols } = copyTableToClipboard({ rows, headers });
+        return ok(
+          `Copied ${n} row(s) × ${cols} col(s) to the clipboard as TSV. ` +
+            "Now click the destination cell (e.g. A1) and paste (Cmd/Ctrl+V) to fill the grid.",
+        );
+      } catch (e) {
+        return fail(`copy_table failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "write_csv",
+    {
+      title: `${MCP_BRAND}: Write rows to a CSV file`,
+      description:
+        "Write a whole table of rows to a .csv file on disk in ONE call (defaults to " +
+        "~/Downloads). Pass `rows` as an array of arrays; optional `headers` become " +
+        "the first row; optional `path` overrides the destination. Returns the file " +
+        "path. Use for bulk export when the user wants a file rather than a sheet." +
+        BRAND_TAG_SUFFIX,
+      inputSchema: {
+        rows: z
+          .array(z.array(z.union([z.string(), z.number()])))
+          .describe("Array of rows; each row is an array of cell values (strings or numbers)."),
+        headers: z
+          .array(z.string())
+          .optional()
+          .describe("Optional column headers, written as the first row."),
+        path: z
+          .string()
+          .optional()
+          .describe("Absolute path to write. Defaults to ~/Downloads/holo3-export-<timestamp>.csv"),
+      },
+    },
+    async ({ rows, headers, path }) => {
+      try {
+        const written = writeCsvFile({ rows, headers }, path);
+        return ok(`Wrote ${rows.length} row(s) to ${written}`);
+      } catch (e) {
+        return fail(`write_csv failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   );
@@ -1994,6 +2619,18 @@ export function registerTools(server: McpServer): void {
               "Screenshot file in the Today section'. Avoid 'the button' / 'it' / " +
               "ambiguous references.",
           ),
+        targetApp: z
+          .string()
+          .optional()
+          .describe(
+            "macOS-only speedup + accuracy aid: crop the screenshot to this " +
+              "app's front window before grounding (System Events process " +
+              "name: 'Calculator', 'Finder', 'Google Chrome'). 6-20× fewer " +
+              "image tokens → ~2-4× faster grounding, and deletes screen " +
+              "clutter that pulls the vision model off-target. Use whenever " +
+              "the click target lives in ONE known app window. Falls back to " +
+              "full-frame silently if the app isn't running.",
+          ),
         mode: z
           .enum(["single", "double", "right", "triple"])
           .optional()
@@ -2003,7 +2640,7 @@ export function registerTools(server: McpServer): void {
           ),
       },
     },
-    async ({ target, mode }) => {
+    async ({ target, mode, targetApp }) => {
       const t0 = Date.now();
       // 1. Capture screenshot — bridge first for perms.
       const bridgeShot = await tryBridgeScreenCall<{
@@ -2039,6 +2676,19 @@ export function registerTools(server: McpServer): void {
               "Recording perms granted.",
           );
         }
+      }
+      // 1b. Optional window crop — the same image-token reduction the
+      // agent_do loop gets; direct (occlusion-proof) capture preferred
+      // when the frame came from local capture.
+      let cropNote: string | undefined;
+      if (targetApp) {
+        const croppedFrame = await cropFrameToApp(
+          { png, width, height, offsetX, offsetY },
+          targetApp,
+          !bridgeShot,
+        );
+        ({ png, width, height, offsetX, offsetY } = croppedFrame);
+        cropNote = croppedFrame.cropNote;
       }
 
       // 2. Ground via the vision model.
@@ -2137,7 +2787,9 @@ export function registerTools(server: McpServer): void {
       const summary =
         `Clicked "${target}" with mode=${clickMode} at (${screenX}, ${screenY}). ` +
         `Ground ${tGround}ms, exec ${tExec}ms, total ${totalMs}ms. ` +
+        (targetApp ? `(cropped to ${targetApp} ${width}×${height}) ` : "") +
         (bridgedClick?.ok ? "(via Electron bridge) " : "") +
+        (cropNote ? `\n${cropNote}\n` : "") +
         "Post-click screenshot attached — verify the click landed.";
       const responseContent: Array<
         | { type: "text"; text: string }
@@ -3458,10 +4110,26 @@ export function registerTools(server: McpServer): void {
           .min(0)
           .max(10_000)
           .optional()
-          .describe("Pause between steps in ms. Default 400."),
+          .describe(
+            "Fixed pause between steps in ms. When omitted, replay paces from " +
+              "the RECORDED step timestamps (clamped 150-2000ms; up to 8000ms " +
+              "after navigations/app launches). Pass a value only to force " +
+              "uniform pacing.",
+          ),
+        params: z
+          .record(z.string(), z.any())
+          .optional()
+          .describe(
+            "Per-run values substituted into {{token}} placeholders — in typed " +
+              "text, navigated urls, file-input paths (a path of {{photoPaths}} " +
+              "expands to the array), AND parameterized click targets (a refLabel " +
+              "name like '{{category}}' resolves the matching option/button at " +
+              "replay). Turns one recorded flow into a data-driven automation: " +
+              "{title, price, category, condition, description, photoPaths}.",
+          ),
       },
     },
-    async ({ id, reground, stepDelayMs }) => {
+    async ({ id, reground, stepDelayMs, params }) => {
       const recipe = await loadRecipe(id);
       if (!recipe) {
         return fail(
@@ -3488,6 +4156,16 @@ export function registerTools(server: McpServer): void {
             }`,
           );
         }
+      } else {
+        // Deterministic replay, but inject a provider (if one is configured)
+        // so the per-step vision SELF-HEAL tier can fire on a deterministic
+        // miss. Best-effort: an unconfigured/failed provider just means the
+        // heal tier is unavailable and missing steps fail-stop as before.
+        try {
+          ({ provider } = await getProviderWarmed());
+        } catch {
+          provider = null;
+        }
       }
 
       const lines: string[] = [];
@@ -3495,8 +4173,12 @@ export function registerTools(server: McpServer): void {
       const result = await replaySession(recipe, {
         reground: !!reground,
         ...(stepDelayMs !== undefined ? { stepDelayMs } : {}),
+        ...(params ? { params: params as Record<string, unknown> } : {}),
         browser,
         provider,
+        // Self-improve: persist a vision-healed step's durable locator (and
+        // refLabel drift) so the NEXT replay resolves deterministically.
+        persist: (r) => saveRecipe(r),
         onStep: ({ index, step, status, error, ms }) => {
           const label = step.intent
             ? `"${step.intent.slice(0, 60)}"`
@@ -3678,9 +4360,17 @@ export function registerTools(server: McpServer): void {
           .string()
           .min(1)
           .describe("Plain-English description of the element to locate."),
+        targetApp: z
+          .string()
+          .optional()
+          .describe(
+            "macOS-only speedup: crop to this app's front window before " +
+              "grounding (same semantics as agent_click's targetApp). Use " +
+              "whenever the target lives in ONE known app window.",
+          ),
       },
     },
-    async ({ target }) => {
+    async ({ target, targetApp }) => {
       const t0 = Date.now();
       const bridgeShot = await tryBridgeScreenCall<{
         pngBase64: string;
@@ -3713,6 +4403,14 @@ export function registerTools(server: McpServer): void {
             `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
           );
         }
+      }
+      if (targetApp) {
+        const croppedFrame = await cropFrameToApp(
+          { png, width, height, offsetX, offsetY },
+          targetApp,
+          !bridgeShot,
+        );
+        ({ png, width, height, offsetX, offsetY } = croppedFrame);
       }
 
       let provider: ProviderClient;
@@ -4059,6 +4757,10 @@ export function registerTools(server: McpServer): void {
 export const TOOL_NAMES = [
   // High-level: hand off a focused subtask to the inner Holo3 loop
   "agent_do",
+  // Whole-task on H-company's server-side AGP brain (thin-driver fast path)
+  "agp_do",
+  // Long multi-step task: decompose → route(replay>coarse>agent) → checkpoint/resume
+  "long_task",
   // Cold-start one-shot: ensure Chrome + extension + tab are ready
   "ponder_browser_ensure",
   // Ponder session management (lightweight names over Playwriter sessions)
@@ -4069,6 +4771,7 @@ export const TOOL_NAMES = [
   "browser_status",
   "browser_list_tabs",
   "browser_switch_tab",
+  "browser_new_tab",
   "browser_navigate",
   "browser_snapshot",
   "browser_click",
@@ -4076,6 +4779,11 @@ export const TOOL_NAMES = [
   "browser_type",
   "browser_scroll",
   "browser_read",
+  // Read half: page → structured rows (one fast model pass).
+  "extract",
+  // Bulk data output — the "write" half of a data task (no-auth).
+  "copy_table",
+  "write_csv",
   // OS-level vision-grounded primitives (Stagehand-style act/observe split)
   "agent_click",
   "agent_click_sequence",

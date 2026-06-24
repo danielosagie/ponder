@@ -35,18 +35,31 @@ import {
 } from "../src/screen";
 import { createOllamaNarrator } from "../src/agent/narrator";
 import { createExtractor } from "../src/agent/extractor";
+import { extractRows } from "../src/agent/extract";
+import { scrollToLoadAll } from "../src/agent/scroll-load";
 import type { RouterClient } from "../src/agent/router";
 import type { AgentEvents, ProviderName } from "../src/agent/types";
 import type { BrowserClient, BrowserSnapshot } from "../src/agent/browser/types";
 import { createPlaywriterClient } from "../src/agent/browser/playwriter";
 import {
   computeDefaultProvider,
+  executorNameFor,
   isProviderConfigured,
   makeProvider,
   makeRouter,
   humanProviderLabel,
 } from "../src/agent/factory";
-import { setProviderPreference } from "../src/agent/preferences";
+import { plannerConfigFromEnv } from "../src/agent/providers/planner";
+import {
+  setProviderPreference,
+  getEnginePreference,
+  setEnginePreference,
+  getAutoReplayPreference,
+  setAutoReplayPreference,
+  type AgentEngine,
+} from "../src/agent/preferences";
+import { runAgpTask } from "../src/agent/agp/loop";
+import { AgpClient } from "../src/agent/agp/client";
 import { WarmupQueue } from "../src/agent/warmup";
 import {
   probe as probePerms,
@@ -59,16 +72,35 @@ import {
   touchKeySync,
   audit,
   readKeysSync,
+  isMagicMode,
 } from "../src/bridge/auth";
 import {
   loadRecipe,
   listRecipes,
+  findRecipeByTask,
   pathsFor as recipePathsFor,
   saveRecipe,
+  recipeFromConvexSteps,
   buildRecipeFromTrace,
   recordAction,
+  createRecipeRecorder,
+  type RecipeRecorder,
 } from "../src/agent/recorder";
 import { PonderError } from "../src/errors";
+
+// The Playwriter relay binds :19988. When the MCP server (Claude Code) is also
+// running it already owns that port — the reuse probe normally catches this,
+// but server.listen()'s EADDRINUSE surfaces as an 'error' EVENT, not a promise
+// rejection, so it escapes the relay-start .catch() and would crash the app.
+// Swallow exactly that case (a relay is already up → we reuse it) instead of
+// dying on launch. Anything else re-throws.
+process.on("uncaughtException", (err: NodeJS.ErrnoException) => {
+  if (err?.code === "EADDRINUSE" && /19988/.test(err.message ?? "")) {
+    console.warn("[browser] :19988 already in use — reusing the existing Playwriter relay");
+    return;
+  }
+  throw err;
+});
 
 /** Shared JSON body reader used by the new /browser/* + /recipe/*
  *  endpoints. Caps payload at 64KB so a misbehaving client can't OOM
@@ -117,6 +149,9 @@ let buddyWin: BrowserWindow | null = null;
 // computeDefault() runs after dotenv has loaded so env vars are visible.
 let providerName: ProviderName = computeDefaultProvider();
 let cancelFlag = false;
+// AGP runs cancel by aborting this signal (the composite loop polls cancelFlag
+// instead). The agent:cancel handler trips both so one Stop button covers both.
+let agpAbort: AbortController | null = null;
 let activeSessionId: string | null = null;
 
 /**
@@ -261,6 +296,11 @@ const narrator = createOllamaNarrator();
 // bubble telling the user what to click. Once they click, the next probe
 // connects automatically.
 let browserClient: BrowserClient | null = null;
+
+// The most recent app-initiated run, captured as a recipe recorder so the user
+// can "Save as automation" after the fact (the tray records every run; saving
+// just freezes the last one to ~/.ponder/recipes/). Reset at each run start.
+let lastRunRecorder: RecipeRecorder | null = null;
 void (async () => {
   try {
     browserClient = await createPlaywriterClient({
@@ -315,7 +355,7 @@ warmup.onChange((state, detail) => {
   broadcastState({ warmup: state, errorMessage: detail });
   if (state === "ready") {
     new Notification({
-      title: "Holo3 ready",
+      title: "Anorha ready",
       body: `${humanProviderLabel(providerName)} ready.`,
     }).show();
   }
@@ -324,7 +364,7 @@ warmup.onChange((state, detail) => {
 function broadcastState(extra: Partial<AgentStateMsg> = {}): void {
   const msg: AgentStateMsg = {
     warmup: warmup.getState(),
-    provider: providerName,
+    provider: executorNameFor(providerName),
     activeSessionId,
     ...extra,
   };
@@ -349,9 +389,10 @@ async function buildEvents(sessionId: string): Promise<AgentEvents> {
   //   onThought    → the model's reasoning  (thought, with spinner until next)
   //   onAction     → "click {…}"            (action, brief)
   //   onError      → red bubble             (error)
-  if (!convex) {
-    // Convex unavailable — still pipe everything to the buddy so the UI
-    // doesn't go silent.
+  if (!convex || !sessionId) {
+    // Convex unavailable (or no session id — e.g. session create failed) —
+    // still pipe everything to the buddy so the UI doesn't go silent, and
+    // never write steps against an empty session id.
     return {
       onThought: (t) => buddySay("thought", t),
       onGround: (c) => {
@@ -515,13 +556,23 @@ function chainBridge<T>(fn: () => Promise<T>): Promise<T> {
 
 async function runAgentTaskForBridge(
   opts:
-    | { prompt: string; targetApp?: string; maxSteps?: number }
+    | {
+        prompt: string;
+        targetApp?: string;
+        maxSteps?: number;
+        decompose?: boolean;
+      }
     | string,
 ): Promise<BridgeResult> {
   // Backwards-compat: prior callers passed a bare prompt string.
-  const { prompt, targetApp, maxSteps } =
+  const { prompt, targetApp, maxSteps, decompose } =
     typeof opts === "string"
-      ? { prompt: opts, targetApp: undefined, maxSteps: undefined }
+      ? {
+          prompt: opts,
+          targetApp: undefined,
+          maxSteps: undefined,
+          decompose: undefined,
+        }
       : opts;
   // Mirror the perms gate from the IPC handler — better to fail fast
   // with an actionable message than 50 silent no-op steps.
@@ -546,7 +597,7 @@ async function runAgentTaskForBridge(
     try {
       sessionId = (await convex.mutation(convexApi.sessions.create, {
         prompt,
-        provider: providerName,
+        provider: executorNameFor(providerName),
       })) as unknown as string;
       activeSessionId = sessionId;
       broadcastState();
@@ -623,9 +674,15 @@ async function runAgentTaskForBridge(
     },
     onAction: async (action) => {
       stepCount += 1;
+      // 2000-char cap (was 120): the MCP side reconstructs recipe steps
+      // by JSON.parsing this payload back out of the transcript line
+      // (recordFromBridgeTranscript). At 120 chars any long type/text
+      // payload became {_truncated:true} and the recipe lost the step's
+      // data. 2000 covers realistic typed text while keeping a runaway
+      // payload from flooding the transcript.
       const payload =
         action.payload && Object.keys(action.payload).length > 0
-          ? ` ${JSON.stringify(action.payload).slice(0, 120)}`
+          ? ` ${JSON.stringify(action.payload).slice(0, 2000)}`
           : "";
       transcript.push(`${elapsed()} action: ${action.type}${payload}`);
       await baseEvents.onAction(action);
@@ -683,6 +740,10 @@ async function runAgentTaskForBridge(
       ...(typeof maxSteps === "number" && maxSteps > 0
         ? { maxSteps }
         : {}),
+      // Declared-multi-step decomposition (NEXT-WORK Item 2). Only
+      // takes effect when PONDER_DECOMPOSE is also on — see
+      // loop.ts RunOptions.decompose.
+      ...(decompose === true ? { decompose: true } : {}),
       onBrowserSnapshot: (snap) => {
         lastSnapshot = snap;
       },
@@ -814,15 +875,16 @@ function startBridgeServer(): void {
     }
 
     if (method === "GET" && url === "/health") {
-      // isMagicMode reads PONDER_AUTO / PONDER_MAGIC env at request
-      // time so a user can `export PONDER_AUTO=1` after the tray
-      // launched and have it take effect immediately.
-      const { isMagicMode } = require("../src/bridge/auth") as typeof import("../src/bridge/auth");
+      // isMagicMode() reads PONDER_AUTO / PONDER_MAGIC env at call time, so a
+      // user can `export PONDER_AUTO=1` after the tray launched and have it
+      // take effect immediately — no runtime require needed (that broke the
+      // bundle: a relative require() stays literal in out/main/index.js and
+      // resolves to the non-existent out/src/bridge/auth).
       res.writeHead(200);
       res.end(
         JSON.stringify({
           ok: true,
-          provider: providerName,
+          provider: executorNameFor(providerName),
           warmup: warmup.getState(),
           activeSessionId,
           magicMode: isMagicMode(),
@@ -839,12 +901,15 @@ function startBridgeServer(): void {
     // bind stays — auth adds revocability + auditability ON TOP of
     // localhost trust.
     //
-    // The /agent_do, /screen/*, /browser/url, /window/* endpoints
-    // pre-date the auth model. They are CONSIDERED localhost-trusted
-    // for backwards compatibility with the existing MCP forwarder
-    // until consumers migrate. New endpoints (/browser/*, /recipe/*,
-    // /attach) require auth from day one.
-    const REQUIRES_AUTH = /^\/(browser\/(?:attach|snapshot|click|type|navigate|set_input_files|scroll|read)|recipe\/.*)/;
+    // The /agent_do, /screen/*, /browser/url, /window/*, /extract, and
+    // /recipe/run endpoints are localhost-trusted (same model as the MCP
+    // forwarder + the in-app browser-jobs consumer, which runs on this
+    // machine). /recipe/run is strictly LESS capable than the already-exempt
+    // /agent_do (it replays a saved recipe vs. open-ended vision), so the
+    // desktop consumer can drive deterministic replay without minting a
+    // bridge key. Mutating/management endpoints (/browser/*, /recipe/save,
+    // /recipe/list, /attach) still require a Bearer token from `ponder grant`.
+    const REQUIRES_AUTH = /^\/(browser\/(?:attach|snapshot|click|type|navigate|set_input_files|scroll|read)|recipe\/(?:save|list))/;
     let authState: ReturnType<typeof verifyToken> | null = null;
     if (REQUIRES_AUTH.test(url)) {
       const keyCount = readKeysSync().length;
@@ -1248,6 +1313,138 @@ function startBridgeServer(): void {
       return;
     }
 
+    // ── /extract (deterministic bulk READ: navigate + load-all + rows) ──
+    // The coarse read path for browser-jobs: turns a page into structured
+    // rows in one call (no vision loop). Used by the consumer for read-type
+    // jobs (scrape_inventory / sync_listing_state / check_messages) — the
+    // same extract that powers the `extract` MCP tool, exposed to the bridge.
+    if (method === "POST" && url === "/extract") {
+      readJsonBodyEarly(req, res, (parsed) => {
+        const p = (parsed as {
+          url?: unknown;
+          columns?: unknown;
+          instructions?: unknown;
+          ref?: unknown;
+          scroll?: unknown;
+          deep?: unknown;
+        }) ?? {};
+        void (async () => {
+          const T0 = Date.now();
+          const timings: Record<string, number> = {};
+          // Hard ceiling on the whole read so a wedged browser/model can never
+          // hang the handler forever (the HTTP server runs requestTimeout=0).
+          const ac = new AbortController();
+          const killT = setTimeout(() => ac.abort(), 60_000);
+          const withTimeout = <T>(pr: Promise<T>, ms: number, what: string): Promise<T> =>
+            Promise.race([
+              pr,
+              new Promise<T>((_, rej) =>
+                setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms),
+              ),
+            ]);
+          try {
+            if (!browserClient) throw new Error("browser client missing");
+            if (typeof p.url === "string" && p.url.trim()) {
+              const t = Date.now();
+              // Navigation failure is non-fatal — the tab may already be on the
+              // page; readText below still works (or returns empty → 0 rows).
+              await browserClient
+                .navigate(p.url)
+                .catch((err) =>
+                  console.warn("[extract] navigate failed:", err instanceof Error ? err.message : err),
+                );
+              await new Promise((r) => setTimeout(r, 300));
+              timings.navigate = Date.now() - t;
+              // No extra snapshot() here — navigate already settled the tab and a
+              // snapshot adds ~1-2s on the latency-critical path. Record the
+              // requested url (good enough for the trace).
+              recordAction({
+                type: "browser_navigate",
+                payload: { url: p.url },
+                consumer: authState?.ok ? authState.consumer : undefined,
+              });
+            }
+            // Lazy lists (Marketplace "Your listings", inbox) only render rows
+            // as you scroll — load everything before reading, unless told not to.
+            // settle=550ms: FB renders lazy rows slower than 350ms, which made
+            // the early-stop fire before all rows loaded (missed ~8 of 33).
+            if (p.scroll !== false) {
+              const t = Date.now();
+              // Patient enough to load every lazy row (settle 800 + 3 stable
+              // passes got all 33 FB listings vs 25 at settle 550); still well
+              // inside the 30s bulk budget thanks to the fast extract model.
+              await scrollToLoadAll(browserClient, {
+                maxScrolls: 18,
+                settleMs: 800,
+                stableRounds: 3,
+              }).catch(() => {});
+              timings.scroll = Date.now() - t;
+            }
+            let t = Date.now();
+            let pageText = await withTimeout(
+              browserClient.readText(typeof p.ref === "string" ? p.ref : undefined),
+              30_000,
+              "readText",
+            );
+            // DEEP mode: readText (Firecrawl-style) captures text content +
+            // dropdown display values, but NOT <input value> attrs (title, price,
+            // location on an edit form). The AX snapshot DOES expose those as the
+            // control's accessible name — append the form-control lines so the
+            // model sees every field. This is what "get everything you'd see when
+            // editing" needs (the index/detail pages omit it).
+            if (p.deep === true) {
+              const snap = await browserClient.snapshot().catch(() => null);
+              if (snap?.ax) {
+                const controls = snap.ax
+                  .split("\n")
+                  .filter((l) =>
+                    /\b(textbox|combobox|switch|checkbox|spinbutton|radio|slider|listbox|searchbox)\b/i.test(l),
+                  )
+                  .join("\n");
+                if (controls) pageText += "\n\n=== FORM FIELD VALUES (control: current value) ===\n" + controls;
+              }
+            }
+            timings.read = Date.now() - t;
+            timings.textLen = pageText.length;
+            if (!pageText || !pageText.trim()) {
+              res.writeHead(200);
+              res.end(JSON.stringify({ ok: true, headers: [], rows: [], count: 0, timings }));
+              return;
+            }
+            const columns = Array.isArray(p.columns)
+              ? (p.columns as unknown[]).filter((c): c is string => typeof c === "string")
+              : undefined;
+            const instructions =
+              typeof p.instructions === "string" ? p.instructions : undefined;
+            t = Date.now();
+            // Pass the abort signal so a hung/rate-limited model fetch is bounded
+            // by the 60s ceiling instead of hanging the handler.
+            const { headers, rows } = await extractRows({
+              pageText,
+              signal: ac.signal,
+              ...(columns && columns.length ? { columns } : {}),
+              ...(instructions ? { instructions } : {}),
+            });
+            timings.extract = Date.now() - t;
+            timings.total = Date.now() - T0;
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, headers, rows, count: rows.length, timings }));
+          } catch (e) {
+            res.writeHead(500);
+            res.end(
+              JSON.stringify({
+                code: "INTERNAL_ERROR",
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            );
+          } finally {
+            clearTimeout(killT);
+          }
+        })();
+      });
+      return;
+    }
+
     // ── /recipe/save ─────────────────────────────────────────────────
     if (method === "POST" && url === "/recipe/save") {
       readJsonBodyEarly(req, res, (parsed) => {
@@ -1371,7 +1568,7 @@ function startBridgeServer(): void {
     // ── /recipe/run ──────────────────────────────────────────────────
     if (method === "POST" && url === "/recipe/run") {
       readJsonBodyEarly(req, res, (parsed) => {
-        const p = (parsed as { id?: unknown; reground?: unknown }) ?? {};
+        const p = (parsed as { id?: unknown; reground?: unknown; params?: unknown }) ?? {};
         if (typeof p.id !== "string") {
           res.writeHead(400);
           res.end(
@@ -1382,6 +1579,10 @@ function startBridgeServer(): void {
           );
           return;
         }
+        const runParams =
+          p.params && typeof p.params === "object" && !Array.isArray(p.params)
+            ? (p.params as Record<string, unknown>)
+            : undefined;
         void (async () => {
           try {
             const recipe = await loadRecipe(p.id as string);
@@ -1402,6 +1603,16 @@ function startBridgeServer(): void {
             const result = await replayRecipe(recipe, {
               reground: p.reground === true,
               browser: browserClient ?? null,
+              // Inject the warmed provider so the per-step vision SELF-HEAL
+              // tier can fire on a deterministic miss (not just on reground).
+              provider: warmup.getProvider(),
+              // Per-run data for {{token}} substitution (browser-job payload):
+              // turns one recorded create/update flow into a data-driven recipe.
+              ...(runParams ? { params: runParams } : {}),
+              // Self-heal write-back: if a step's refLabel drifted (a renamed
+              // element) OR a step was vision-healed, persist the corrected
+              // recipe (same id is re-derived) so the next run is deterministic.
+              persist: (r) => saveRecipe(r),
             });
             res.writeHead(200);
             res.end(JSON.stringify(result));
@@ -1437,6 +1648,7 @@ function startBridgeServer(): void {
               task?: unknown;
               targetApp?: unknown;
               maxSteps?: unknown;
+              decompose?: unknown;
             };
             const task = typeof parsed.task === "string" ? parsed.task : "";
             // targetApp tri-state:
@@ -1467,8 +1679,16 @@ function startBridgeServer(): void {
               res.end(JSON.stringify({ error: "empty task" }));
               return;
             }
+            // Declared-multi-step gate for one-shot decomposition
+            // (NEXT-WORK Item 2); inert unless PONDER_DECOMPOSE is on.
+            const decompose = parsed.decompose === true;
             const result = await chainBridge(() =>
-              runAgentTaskForBridge({ prompt: task, targetApp, maxSteps }),
+              runAgentTaskForBridge({
+                prompt: task,
+                targetApp,
+                maxSteps,
+                decompose,
+              }),
             );
             res.writeHead(200);
             res.end(JSON.stringify(result));
@@ -2134,9 +2354,225 @@ function startBridgeServer(): void {
   });
 }
 
+/**
+ * AGP engine Run path (server-side Holo 3.1 brain). Mirrors the composite
+ * agent:run lifecycle — Convex session, live narration into the buddy bubble +
+ * History, cancel — but drives Chrome via the AGP thin-driver instead of the
+ * local plan/ground loop. No OS-permission gate and no provider warmup: the
+ * brain runs on H-company's servers and acts on the page through Playwriter
+ * (CDP), not the macOS mouse.
+ */
+async function runAgpAppTask(prompt: string): Promise<{ ok: boolean; error?: string }> {
+  const client = new AgpClient();
+  if (!client.configured) {
+    const msg =
+      "The server brain (AGP) needs HAI_API_KEY set. Switch to the Local engine in " +
+      "Settings, or add the key, then try again.";
+    buddySay("error", msg);
+    return { ok: false, error: msg };
+  }
+  if (!browserClient) {
+    const msg = "Browser engine not ready yet — give it a second and try again.";
+    buddySay("error", msg);
+    return { ok: false, error: msg };
+  }
+  // Zero-touch: if no tab is attached, the agent vision-clicks the Playwriter
+  // icon ITSELF (no debug port, no human gesture). Only error if that fails.
+  let page = await browserClient.rawPage?.().catch(() => null);
+  if (!page) {
+    buddySay("status", "Connecting to Chrome…");
+    try {
+      const { autoAttachPlaywriter } = await import("../src/agent/auto-attach");
+      await autoAttachPlaywriter(browserClient);
+    } catch {
+      /* fall through to the error below */
+    }
+    page = await browserClient.rawPage?.().catch(() => null);
+  }
+  if (!page) {
+    const msg = "Couldn't attach to Chrome automatically — make sure Chrome is open, then try again.";
+    buddySay("error", msg);
+    return { ok: false, error: msg };
+  }
+
+  cancelFlag = false;
+  dismissInputPill();
+  setBuddyMode("active");
+  buddySay("status", "Got it…");
+
+  let sessionId: string | null = null;
+  if (convex) {
+    try {
+      sessionId = (await convex.mutation(convexApi.sessions.create, {
+        prompt,
+        // AGP runs are H-company's server-side brain — label them "hcompany"
+        // in History until the Convex sessions schema gains a distinct "agp".
+        provider: "hcompany",
+      })) as unknown as string;
+      activeSessionId = sessionId;
+      broadcastState();
+      await convex.mutation(convexApi.sessions.setStatus, {
+        sessionId: sessionId as never,
+        status: "running",
+      });
+    } catch (e) {
+      console.warn(`[agp:run] convex session create failed (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+
+  const events = await buildEvents(sessionId ?? "");
+  buddySay("status", "Thinking on the server brain…");
+
+  const ac = new AbortController();
+  agpAbort = ac;
+  try {
+    const result = await runAgpTask({
+      task: prompt,
+      client,
+      browser: browserClient,
+      signal: ac.signal,
+      onEvent: (ev) => {
+        if (ev.kind === "policy_event" && ev.text) void events.onThought?.(ev.text);
+        else if (ev.kind === "error_event" && ev.error) void events.onError?.(ev.error);
+        else if (ev.kind === "observation_event") void events.onStatus?.("Reading the page…");
+      },
+      onCommand: (name, args) => {
+        void events.onAction?.({ type: name, payload: args });
+      },
+    });
+
+    const failed =
+      result.status === "failed" || result.status === "error" || result.status === "timed_out";
+    const answer =
+      result.answer?.trim() ||
+      (failed
+        ? `Couldn't finish: ${result.error ?? result.status}.`
+        : `Done (${result.commandCount} steps).`);
+    buddySay("answer", answer);
+
+    if (sessionId && convex) {
+      try {
+        await convex.mutation(convexApi.steps.append, {
+          sessionId: sessionId as never,
+          kind: "result",
+          text: answer,
+        });
+      } catch (e) {
+        console.warn(`[agp:run] convex result persist failed (${e instanceof Error ? e.message : String(e)})`);
+      }
+      await convex
+        .mutation(convexApi.sessions.setStatus, {
+          sessionId: sessionId as never,
+          status: failed ? "error" : result.status === "interrupted" ? "cancelled" : "done",
+          ...(result.error ? { error: result.error } : {}),
+        })
+        .catch(() => {});
+    }
+    return failed ? { ok: false, error: result.error ?? "AGP run failed" } : { ok: true };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    buddySay("error", message);
+    console.error("[agp:run]", message);
+    if (sessionId && convex) {
+      await convex
+        .mutation(convexApi.sessions.setStatus, {
+          sessionId: sessionId as never,
+          status: "error",
+          error: message,
+        })
+        .catch(() => {});
+    }
+    return { ok: false, error: message };
+  } finally {
+    agpAbort = null;
+    activeSessionId = null;
+    broadcastState();
+    setBuddyMode("hidden");
+    buddyAgentCursor(null);
+  }
+}
+
+/**
+ * Recipe-first routing: if a saved automation EXACTLY matches the task, replay
+ * it (deterministic + self-healing) instead of running the agent. Returns a
+ * result when it handled the run, or null to fall through to the agent (no
+ * match, auto-replay disabled, or the replay failed). A "fresh …" prefix is
+ * stripped by the caller and never reaches here.
+ */
+async function maybeAutoReplay(
+  prompt: string,
+): Promise<{ ok: boolean; error?: string } | null> {
+  if (!getAutoReplayPreference()) return null;
+  if (!browserClient) return null; // replay drives Chrome
+  const match = await findRecipeByTask(prompt).catch(() => null);
+  if (!match || match.recipe.steps.length === 0) return null;
+  // Zero-touch: auto-attach (vision-click the Playwriter icon) before replay.
+  if (!(await browserClient.available().catch(() => false))) {
+    try {
+      const { autoAttachPlaywriter } = await import("../src/agent/auto-attach");
+      await autoAttachPlaywriter(browserClient);
+    } catch {
+      /* replay will surface its own not-attached error */
+    }
+  }
+
+  cancelFlag = false;
+  dismissInputPill();
+  setBuddyMode("active");
+  buddySay(
+    "status",
+    `Replaying saved automation "${match.recipe.task}" — type "fresh ${prompt}" to run from scratch.`,
+  );
+  try {
+    const { replayRecipe } = await import("../src/cli/sdk");
+    const res = await replayRecipe(match.recipe, {
+      reground: true,
+      browser: browserClient,
+      provider: warmup.getProvider(),
+      // Self-heal write-back: persist any drift (renamed elements) under the same id.
+      persist: (r) => saveRecipe(r),
+      shouldCancel: () => cancelFlag,
+      onStep: ({ index, step, status, error }) =>
+        buddySay(
+          status === "error" ? "error" : "action",
+          `${index + 1}. ${step.executed?.type ?? "step"}${error ? ` — ${error}` : ""}`,
+        ),
+    });
+    if (res.failed > 0) {
+      // A step broke beyond self-heal — fall back to a fresh agent run.
+      buddySay("status", "Saved automation hit a snag — running it fresh instead…");
+      return null;
+    }
+    const healedNote = res.healed ? ` · adapted ${res.healed} changed step(s)` : "";
+    buddySay("answer", `Done — replayed saved automation (${res.ok} step(s)${healedNote}).`);
+    setBuddyMode("hidden");
+    return { ok: true };
+  } catch (e) {
+    buddySay("status", "Saved automation couldn't run — running fresh…");
+    console.warn(`[auto-replay] ${e instanceof Error ? e.message : String(e)}`);
+    return null; // fall through to the agent
+  }
+}
+
 function setupIpc(): void {
-  ipcMain.handle("agent:run", async (_e, prompt: string) => {
-    if (!prompt?.trim()) return { ok: false, error: "empty prompt" };
+  ipcMain.handle("agent:run", async (_e, rawPrompt: string) => {
+    if (!rawPrompt?.trim()) return { ok: false, error: "empty prompt" };
+    // "fresh …" / "redo …" forces a fresh run, skipping any saved automation.
+    const freshMatch = /^\s*(?:fresh|redo)\b[:\s]+/i.exec(rawPrompt);
+    const prompt = (freshMatch ? rawPrompt.slice(freshMatch[0].length) : rawPrompt).trim();
+    if (!prompt) return { ok: false, error: "empty prompt" };
+
+    // Recipe-first: replay a saved automation that exactly matches, unless the
+    // user asked for a fresh run. Falls through to the agent on miss/failure.
+    if (!freshMatch) {
+      const replayed = await maybeAutoReplay(prompt);
+      if (replayed) return replayed;
+    }
+
+    // Server-side AGP brain: separate lifecycle (no OS-perms gate, no warmup).
+    if (getEnginePreference() === "agp") {
+      return runAgpAppTask(prompt);
+    }
 
     // Bail early if macOS hasn't granted Accessibility/Screen-Recording —
     // otherwise the loop fires for 30 steps and nothing moves on screen.
@@ -2164,15 +2600,20 @@ function setupIpc(): void {
     // status first to never leave the user staring at silence.
     buddySay("status", "Got it…");
     void (async () => {
-      const line = await narrator.intro({ task: prompt });
-      buddySay("thought", line);
+      // Composite mode: don't pay an Ollama round-trip (or its multi-
+      // second timeout) for a cosmetic intro line — the planner is the
+      // brain now and the run starts immediately.
+      if (!plannerConfigFromEnv()) {
+        const line = await narrator.intro({ task: prompt });
+        buddySay("thought", line);
+      }
     })();
 
     let sessionId: string | null = null;
     if (convex) {
       sessionId = (await convex.mutation(convexApi.sessions.create, {
         prompt,
-        provider: providerName,
+        provider: executorNameFor(providerName),
       })) as unknown as string;
       activeSessionId = sessionId;
       broadcastState();
@@ -2218,9 +2659,22 @@ function setupIpc(): void {
     }
     buddySay("status", "Reading the screen…");
 
-    const events = sessionId
+    const baseEvents = sessionId
       ? await buildEvents(sessionId)
       : await buildEvents("");
+
+    // Record this run into a recipe recorder so the user can "Save as
+    // automation" afterward. We tap the same onAction the Convex logger uses
+    // (history line annotates the next action). Empty until the first action.
+    const recorder = createRecipeRecorder({ task: prompt, provider: String(providerName) });
+    lastRunRecorder = null; // cleared until this run produces a saveable recipe
+    const events: typeof baseEvents = {
+      ...baseEvents,
+      onAction: async (a) => {
+        try { recorder.onAction(a); } catch { /* recording best-effort */ }
+        await baseEvents.onAction?.(a);
+      },
+    };
 
     // Per-run state retained for the extractor:
     //   • runHistory — every action string the planner emitted, in order
@@ -2248,6 +2702,7 @@ function setupIpc(): void {
         },
         onHistory: (action) => {
           runHistory.push(action);
+          try { recorder.onHistory(action); } catch { /* recording best-effort */ }
         },
         onScreenshotBuffer: (png) => {
           lastShot = png;
@@ -2260,6 +2715,13 @@ function setupIpc(): void {
           : result === "cancelled"
             ? "cancelled"
             : "exhausted";
+
+      // Freeze the recording so "Save as automation" can persist it. Only keep
+      // it if the run actually did something (≥1 recorded action).
+      try {
+        recorder.setOutcome(summaryOutcome);
+        lastRunRecorder = recorder.getRecipe().steps.length > 0 ? recorder : null;
+      } catch { lastRunRecorder = null; }
 
       // Extractor — the conversational answer. ALWAYS runs (except on
       // cancel) and ALWAYS returns a string thanks to the templated
@@ -2401,7 +2863,22 @@ function setupIpc(): void {
 
   ipcMain.handle("agent:cancel", () => {
     cancelFlag = true;
+    agpAbort?.abort();
     return { ok: true };
+  });
+
+  ipcMain.handle("agent:getEngine", () => getEnginePreference());
+
+  ipcMain.handle("agent:setEngine", (_e, engine: AgentEngine) => {
+    setEnginePreference(engine === "agp" ? "agp" : "composite");
+    return { ok: true, engine: getEnginePreference() };
+  });
+
+  ipcMain.handle("agent:getAutoReplay", () => getAutoReplayPreference());
+
+  ipcMain.handle("agent:setAutoReplay", (_e, on: boolean) => {
+    setAutoReplayPreference(!!on);
+    return { ok: true, autoReplay: getAutoReplayPreference() };
   });
 
   ipcMain.handle("agent:setProvider", async (_e, name: ProviderName) => {
@@ -2426,7 +2903,7 @@ function setupIpc(): void {
 
   ipcMain.handle("agent:state", () => ({
     warmup: warmup.getState(),
-    provider: providerName,
+    provider: executorNameFor(providerName),
     activeSessionId,
   }));
 
@@ -2479,7 +2956,7 @@ function setupIpc(): void {
 
   ipcMain.handle("env:public", () => ({
     convexUrl: convexUrl ?? null,
-    provider: providerName,
+    provider: executorNameFor(providerName),
     backgroundMode: BACKGROUND_MODE,
   }));
 
@@ -2510,7 +2987,106 @@ function setupIpc(): void {
   ipcMain.handle("recipes:reveal", async (_e, id: string) => {
     try {
       const paths = recipePathsFor(id);
-      await shell.openPath(paths.recipePath);
+      // showItemInFolder (Finder reveal) — NOT openPath: macOS hands a bare
+      // .recipe.ts to whatever owns the .ts extension (VLC on this machine),
+      // which is never what the user wants. Finder lets them open it in their
+      // editor of choice; the in-app Automation detail already shows the steps.
+      shell.showItemInFolder(paths.recipePath);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  // Deterministic replay — re-grounds each step via the warmed provider, drives
+  // the real browser, and narrates through the same buddySay pump as a live run
+  // (so the floating cursor + the tray's working panel light up identically).
+  ipcMain.handle(
+    "recipes:replay",
+    async (_e, id: string, opts?: { reground?: boolean; stepDelayMs?: number }) => {
+      try {
+        const recipe = await loadRecipe(id);
+        if (!recipe) return { ok: false, error: "recipe not found" };
+        // Dynamic import — main.ts already dynamically imports sdk.ts elsewhere;
+        // a second STATIC import collides in the bundler and breaks bridge/auth
+        // resolution at runtime. Keep it dynamic to match.
+        const { replaySession } = await import("../src/cli/sdk");
+        buddySay("status", `Replaying: ${recipe.task ?? id}`);
+        const res = await replaySession(recipe, {
+          reground: opts?.reground ?? true,
+          stepDelayMs: opts?.stepDelayMs,
+          browser: browserClient,
+          provider: warmup.getProvider(),
+          // Self-heal write-back: persist a drifted recipe (same id re-derived).
+          persist: (r) => saveRecipe(r),
+          onStep: ({ index, step, status, error }) => {
+            buddySay(
+              status === "error" ? "error" : "action",
+              `${index + 1}. ${step.executed?.type ?? "step"}${error ? ` — ${error}` : ""}`,
+            );
+          },
+        });
+        const healedNote = res.healed ? ` · adapted ${res.healed} changed step(s)` : "";
+        buddySay(
+          "answer",
+          (res.failed
+            ? `Replay finished — ${res.failed} step(s) failed`
+            : "Replay finished cleanly") + healedNote,
+        );
+        return { ok: true, failed: res.failed, healed: res.healed };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  );
+  // Save the most recent run as a reusable automation (recipe).
+  ipcMain.handle("recipes:saveLast", async (_e, task?: string) => {
+    try {
+      if (!lastRunRecorder) {
+        return { ok: false, error: "Nothing to save — run a task first." };
+      }
+      const recipe = lastRunRecorder.getRecipe();
+      if (task && task.trim()) recipe.task = task.trim();
+      if (!recipe.steps.length) return { ok: false, error: "That run had no recorded actions." };
+      const saved = await saveRecipe(recipe);
+      if (!saved) return { ok: false, error: "save failed" };
+      return { ok: true, id: saved.id };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  // Save a PAST run (from History) as an automation. Reads the session's steps
+  // from Convex and maps the action steps into a recipe. Lower fidelity than
+  // saveLast (no refLabels — see recipeFromConvexSteps), but lets any logged run
+  // become a replayable automation.
+  ipcMain.handle("recipes:saveFromSession", async (_e, sessionId: string, task?: string) => {
+    try {
+      if (!convex) return { ok: false, error: "History store unavailable." };
+      const [steps, session] = await Promise.all([
+        convex.query(convexApi.steps.listBySession, { sessionId: sessionId as never }),
+        convex.query(convexApi.sessions.get, { sessionId: sessionId as never }),
+      ]);
+      if (!steps || steps.length === 0) return { ok: false, error: "That run has no recorded steps." };
+      const sess = session as { prompt?: string; provider?: string } | null;
+      const recipe = recipeFromConvexSteps(
+        (task && task.trim()) || sess?.prompt || "Saved run",
+        steps as Array<{ kind: string; text?: string; action?: { type: string; payload?: unknown }; coords?: { x: number; y: number }; createdAt?: number }>,
+        sess?.provider ? { provider: sess.provider } : {},
+      );
+      if (!recipe.steps.length) return { ok: false, error: "That run had no replayable actions to save." };
+      const saved = await saveRecipe(recipe);
+      if (!saved) return { ok: false, error: "save failed" };
+      return { ok: true, id: saved.id };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  // Open a selling channel (or any URL) in the user's default browser so they
+  // can sign in. Channel auth lives in the user's real browser session, which
+  // the Playwriter-driven agent then reuses.
+  ipcMain.handle("channels:open", async (_e, url: string) => {
+    try {
+      if (!/^https?:\/\//i.test(url)) return { ok: false, error: "bad url" };
+      await shell.openExternal(url);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -2526,11 +3102,11 @@ function buildTray(): void {
     // No icon file — use an empty image but set a title so the user can see it
     // in the menu bar. macOS will render the title text instead of an icon.
     tray = new Tray(nativeImage.createEmpty());
-    if (process.platform === "darwin") tray.setTitle("◐ Ponder"); //Tray title
+    if (process.platform === "darwin") tray.setTitle("Anorha"); //Tray title
   } else {
     tray = new Tray(icon);
   }
-  tray.setToolTip("Holo3 Agent · ⌘E to summon");
+  tray.setToolTip("Anorha · ⌘E to summon");
   // Click-to-toggle the overlay on left-click for the Clicky-style UX.
   tray.on("click", () => toggleInputPill());
   rebuildTrayMenu();
@@ -2556,7 +3132,7 @@ function switchProvider(name: ProviderName): void {
     broadcastState({ warmup: state, errorMessage: detail });
     if (state === "ready") {
       new Notification({
-        title: "Holo3 ready",
+        title: "Anorha ready",
         body: `${humanProviderLabel(name)} ready.`,
       }).show();
     }
@@ -2660,6 +3236,24 @@ function toggleInputPill(): void {
   }
 }
 
+// ── Keep-warm-while-open ──────────────────────────────────────────────────────
+// Hit Modal's /warm every 4 min WHILE the Anorha panel is open, so the GPU never
+// scales to zero during a work session → every run is the warm ~1.5s/step with no
+// 22s cold-start. When the panel is closed the pinger goes silent and Modal scales
+// the GPU down (~10min) → $0 idle. Only for the "remote" (Modal) brain, which is the
+// one that cold-starts. Uses provider.warm() DIRECTLY because the WarmupQueue's
+// warm() no-ops once "ready" and wouldn't reset Modal's scaledown timer.
+let keepWarmTimer: ReturnType<typeof setInterval> | null = null;
+function pingWarmIfOpen(): void {
+  if (providerName !== "remote") return;
+  if (!appWin || appWin.isDestroyed() || !appWin.isVisible()) return;
+  void warmup.getProvider().warm().catch(() => {});
+}
+function startKeepWarm(): void {
+  if (keepWarmTimer) return;
+  keepWarmTimer = setInterval(pingWarmIfOpen, 240_000); // 4 min < Modal's 600s scaledown
+}
+
 app.whenReady().then(() => {
   // Keep dock visible during dev so the user has a visual anchor; can hide
   // later via tray menu or remove this check entirely once tray icon ships.
@@ -2669,11 +3263,22 @@ app.whenReady().then(() => {
   setupIpc();
   startBridgeServer();
 
+  // Pre-warm the brain at launch so the FIRST task hits a warm container
+  // instead of paying a cold start. With Modal min_containers=0 the GPU
+  // scales to zero when idle; warming on app open covers the common
+  // open → type → run flow so it feels instant like the engine should.
+  void warmup.warmInBackground();
+
   // Auto-open the AppWindow on launch so the user sees the history view
   // immediately. They can close it; tray icon stays for re-summon.
   if (!appWin || appWin.isDestroyed()) appWin = createAppWindow();
   appWin.show();
   appWin.focus();
+  // Keep the GPU hot while the panel is open (no cold-start mid-session); warm
+  // immediately whenever the panel is shown/focused so opening → running is fast.
+  appWin.on("focus", pingWarmIfOpen);
+  appWin.on("show", pingWarmIfOpen);
+  startKeepWarm();
 
   // Boot the Buddy overlay once at startup. It stays open for the whole
   // session — click-through, transparent, just hosts the cursor-following

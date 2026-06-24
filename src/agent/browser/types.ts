@@ -96,8 +96,43 @@ export interface BrowserClient {
    */
   readText(ref?: string): Promise<string>;
 
+  /**
+   * Run a JS expression string in the active page's context and return its
+   * JSON-serializable result. Direct DOM access — the escape hatch for what the
+   * AX snapshot / readText can't do: pull every `<input value>` + photo url in
+   * one pass (fast deep read), or locate the field nearest a visible label
+   * (robust selectors on forms with empty/duplicate accessible names). Optional
+   * — drivers that can't eval omit it; callers must feature-detect.
+   */
+  evaluate?(expression: string): Promise<unknown>;
+
+  /**
+   * Capture a PNG screenshot of the CONTROLLED tab's CSS viewport (not
+   * the OS screen). Returned base64 + DEVICE-pixel dims feed the vision
+   * model when a step's deterministic resolver ladder all misses
+   * (per-step vision self-heal). Browser-local capture is the whole point
+   * — an OS-screen grab is unreliable here because other app windows
+   * (Dia / Claude / Grammarly) overlap Chrome and steal coordinate clicks.
+   *
+   * Proven through the Playwriter relay: Playwright `page.screenshot` is
+   * forwarded by the relay (unlike `page.accessibility`, which is dropped
+   * — that's why snapshot() uses a DOM walker). width/height are the PNG's
+   * raw pixel dims, i.e. DEVICE pixels (Retina = 2× CSS); callers scale by
+   * `imgW / window.innerWidth` to convert grounded coords back to CSS px.
+   *
+   * Optional — only the Playwriter client implements it. AGP/managed
+   * drivers that lack a live Page omit it; vision-heal then falls through
+   * to the existing fail-stop throw. Returns null when no tab is attached.
+   */
+  screenshot?(): Promise<{ pngB64: string; width: number; height: number } | null>;
+
   /** Navigate the active tab. */
   navigate(url: string): Promise<void>;
+
+  /** Open a NEW tab and make it the agent's current page (optionally navigating
+   *  it). Lets the agent work in its OWN tab instead of clobbering whatever the
+   *  user has open. Optional — not all backends implement it. */
+  newTab?(url?: string): Promise<void>;
 
   /**
    * Enumerate every Chrome tab the user has attached the Playwriter
@@ -123,6 +158,60 @@ export interface BrowserClient {
    * `listTabs()` first to see what's available.
    */
   switchTab(opts: SwitchTabOptions): Promise<TabInfo>;
+
+  /**
+   * Is the CONTROLLED tab the one actually visible on screen?
+   * (document.visibilityState === "visible"). When false, the loop's
+   * screenshots show a DIFFERENT tab than browser_* actions operate on
+   * — a verifier/planner trap unless surfaced. Optional: only the
+   * Playwriter client implements it.
+   */
+  isActive?(): Promise<boolean>;
+
+  /**
+   * Bring the CONTROLLED tab's window+tab to the foreground, so the
+   * screenshot/vision stack sees the same page browser_* operates on.
+   * Used to recover from the "controlled tab is a hidden background tab
+   * (often in another Chrome window)" trap. Best-effort, optional.
+   */
+  bringToFront?(): Promise<void>;
+
+  /**
+   * Report the active tab's window geometry in OS screen space —
+   * the coordinate bridge between the DOM stack (Playwriter) and the
+   * vision stack (Holo3 screen clicks). Derived in-page from
+   * window.screenX/screenY + outer/inner deltas, so it needs no CDP
+   * Browser-domain support (which the Playwriter relay can't serve).
+   *
+   * viewport = the top-left of the page's CSS viewport in LOGICAL
+   * screen coordinates (the same space cliclick/nut-js click in), so
+   * `screenX = viewport.x + cssX` maps a DOM point to a click point.
+   * The estimate assumes symmetric left/right window borders (true on
+   * macOS Chrome; the title-bar/toolbar height is derived exactly from
+   * the outer-inner delta). Returns null when no page is attached.
+   */
+  geometry(): Promise<{
+    window: { x: number; y: number; width: number; height: number };
+    viewport: { x: number; y: number; width: number; height: number };
+    devicePixelRatio: number;
+  } | null>;
+
+  /**
+   * AGP thin-driver hook: the live Playwright `Page` for the controlled
+   * tab, returned as an opaque handle (the AGP driver casts it to its own
+   * richer Playwright type). Ensures the relay/connection is up first.
+   * null when no tab is attached. Optional — only the Playwriter client
+   * implements it; the vision-only loop never calls it.
+   */
+  rawPage?(): Promise<unknown>;
+
+  /**
+   * AGP thin-driver hook: the live Playwright `BrowserContext` (opaque).
+   * The AGP driver uses it to enumerate / create / switch tabs directly,
+   * tracking its own active-page pointer instead of fighting the vision
+   * path's `state.page`. null when not connected.
+   */
+  rawContext?(): Promise<unknown>;
 
   /** Tear down the relay + Playwright connection on app shutdown. */
   close(): Promise<void>;

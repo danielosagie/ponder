@@ -860,6 +860,271 @@ async function resolveByFieldLabel(
   }
 }
 
+/** Temp aria-ref the vision-heal resolver tags its located element with. */
+const VISION_REF = "__holo_vision";
+
+/**
+ * Build a natural-language INTENT for the vision model from a step's type +
+ * durable hints (refLabel / fieldLabel / substituted value). This is what
+ * gets grounded against the browser screenshot when every deterministic
+ * resolver has missed. `nameOverride` lets the parameterized branch pass the
+ * substituted run-time name (e.g. "Used - Good") instead of the {{token}}.
+ *
+ * Exported for the bench (intent-string builder is unit-testable without
+ * live vision).
+ */
+export function buildVisionIntent(
+  step: RecordedStep,
+  params?: Record<string, unknown>,
+  nameOverride?: string,
+): string {
+  const p = step.executed.payload as Record<string, unknown>;
+  const role = step.refLabel?.role ?? "";
+  const name = (nameOverride ?? step.refLabel?.name ?? "").trim();
+  const fieldLabel = typeof p.fieldLabel === "string" ? p.fieldLabel.trim() : "";
+  const sub = (s: string): string => applyParams(s, params);
+  const named = name ? sub(name) : "";
+  switch (step.executed.type) {
+    case "browser_type": {
+      const anchor = fieldLabel || named;
+      return anchor
+        ? `the ${anchor} input field`
+        : `the text input field`;
+    }
+    case "browser_click": {
+      // role gives the control kind (button / link / combobox / option…),
+      // name gives the visible label. Either may be absent.
+      const kind = role && role !== "button" ? role : "button";
+      if (named && role) return `the ${named} ${kind}`;
+      if (named) return `the ${named} ${kind}`;
+      if (fieldLabel) return `the ${fieldLabel} ${kind}`;
+      return `the ${kind}`;
+    }
+    case "browser_scroll_element":
+      return named ? `the ${named} area` : `the scrollable area`;
+    default:
+      return named || fieldLabel || `the ${role || "element"}`;
+  }
+}
+
+/**
+ * Convert grounded DEVICE-pixel coords to CSS px (the space elementFromPoint
+ * + Playwright mouse use). Mirrors browser-driver.ts toCss(): scale =
+ * imgW / window.innerWidth (≈2 on Retina, 1 on 1×). Returns null when dims
+ * or scale are non-finite/zero (grounding-failed → caller fail-stops; never
+ * click at 0,0). Exported for the bench (coord math is unit-testable).
+ */
+export function visionCoordsToCss(
+  groundX: number,
+  groundY: number,
+  imgW: number,
+  innerW: number,
+): { cssX: number; cssY: number } | null {
+  if (!Number.isFinite(imgW) || imgW <= 0) return null;
+  if (!Number.isFinite(innerW) || innerW <= 0) return null;
+  if (!Number.isFinite(groundX) || !Number.isFinite(groundY)) return null;
+  const scale = imgW / innerW;
+  if (!Number.isFinite(scale) || scale <= 0) return null;
+  return {
+    cssX: Math.round(groundX / scale),
+    cssY: Math.round(groundY / scale),
+  };
+}
+
+/** Shape returned by the in-page elementFromPoint tag+probe. */
+interface VisionLocator {
+  ok: boolean;
+  role?: string;
+  name?: string;
+  fieldText?: string;
+}
+
+/**
+ * Page-context script: given CSS-px coords, find document.elementFromPoint,
+ * walk up to the nearest ACTIONABLE ancestor (button/link/input/etc.), tag it
+ * with data-holo-ref=__holo_vision, and return a durable locator (role + name
+ * + nearest field label). Returns { ok:false } when the point hits nothing
+ * actionable (body / a non-control wrapper) so the caller fail-stops instead
+ * of clicking a random container. Mirrors playwriter SNAPSHOT_SCRIPT roleOf/
+ * nameOf so the persisted refLabel matches what a fresh snapshot would emit.
+ */
+function visionTagScript(cssX: number, cssY: number): string {
+  const tag = JSON.stringify(VISION_REF);
+  return `(() => {
+    const TAG = ${tag}, X = ${cssX}, Y = ${cssY};
+    document.querySelectorAll('[data-holo-ref="'+TAG+'"]').forEach(e => e.removeAttribute('data-holo-ref'));
+    let el = document.elementFromPoint(X, Y);
+    if (!el) return { ok: false };
+    const ACTIONABLE = 'button,a[href],input:not([type=hidden]),textarea,select,[role="button"],[role="link"],[role="textbox"],[role="searchbox"],[role="combobox"],[role="option"],[role="menuitem"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[contenteditable="true"]';
+    const ctrl = el.closest(ACTIONABLE);
+    if (!ctrl) return { ok: false };
+    function roleOf(e) {
+      const explicit = e.getAttribute('role');
+      if (explicit) return explicit;
+      const tg = e.tagName.toLowerCase();
+      if (tg === 'a') return 'link';
+      if (tg === 'button') return 'button';
+      if (tg === 'input') {
+        const t = (e.type || 'text').toLowerCase();
+        if (t === 'file') return 'file-input';
+        if (t === 'submit' || t === 'button') return 'button';
+        if (t === 'checkbox') return 'checkbox';
+        if (t === 'radio') return 'radio';
+        return 'textbox';
+      }
+      if (tg === 'select') return 'combobox';
+      if (tg === 'textarea') return 'textbox';
+      return tg;
+    }
+    function nameOf(e) {
+      const aria = e.getAttribute('aria-label');
+      if (aria) return aria.trim();
+      const lb = e.getAttribute('aria-labelledby');
+      if (lb) { const l = document.getElementById(lb); if (l && l.textContent) return l.textContent.trim(); }
+      if (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') {
+        return (e.placeholder || e.name || '').trim();
+      }
+      return ((e.innerText || e.textContent || '').trim()).slice(0, 80);
+    }
+    // Nearest visible field label (for type steps' durable fieldLabel anchor):
+    // a <label for=ctrl>, an ancestor <label>, or a preceding label-ish node.
+    function fieldTextFor(c) {
+      const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+      if (c.id) {
+        const fl = document.querySelector('label[for="'+CSS.escape(c.id)+'"]');
+        if (fl && fl.textContent) return norm(fl.textContent).slice(0, 80);
+      }
+      const wrap = c.closest('label');
+      if (wrap && wrap.textContent) return norm(wrap.textContent).slice(0, 80);
+      let scope = c.parentElement;
+      for (let up = 0; up < 3 && scope; up++, scope = scope.parentElement) {
+        const lab = scope.querySelector('label');
+        if (lab && lab.textContent) { const t = norm(lab.textContent); if (t) return t.slice(0, 80); }
+      }
+      return '';
+    }
+    ctrl.setAttribute('data-holo-ref', TAG);
+    return { ok: true, role: roleOf(ctrl), name: nameOf(ctrl), fieldText: fieldTextFor(ctrl) };
+  })()`;
+}
+
+/**
+ * FINAL self-heal tier — vision grounding against a BROWSER screenshot.
+ *
+ * Fires ONLY when every deterministic resolver (recorded ref → refLabel heal
+ * → {{param}} → fieldLabel) has missed (the recipe-is-the-cache contract:
+ * deterministic steps never pay for vision). One ground call per step, bounded
+ * to ~8s. On a hit it tags the located element, runs the action through it,
+ * then PERSISTS a durable locator (role+name, plus fieldLabel for type steps)
+ * back into the step + flips ctx.dirty — so the NEXT playback resolves
+ * deterministically with no vision. Returns true when it healed + acted, null
+ * otherwise (caller fall-stops via the existing throw).
+ *
+ * `nameOverride` is the substituted run-time name for the parameterized
+ * ({{token}}) branch, so a data-driven click target can still be vision-found.
+ */
+async function tryVisionHeal(
+  step: RecordedStep,
+  ctx: ReplayCtx,
+  run: (ref: string) => Promise<void>,
+  nameOverride?: string,
+): Promise<boolean> {
+  // (1) Gate: need a provider AND a browser that can screenshot + evaluate.
+  if (!ctx.provider) return false;
+  const browser = ctx.browser;
+  if (!browser || !browser.screenshot || !browser.evaluate) return false;
+  // (4) FILE-INPUT steps SKIP — the native OS picker can't be vision-driven;
+  // the document-order healRef fix already handles FB's two file-inputs.
+  if (
+    step.executed.type === "browser_set_input_files" ||
+    step.refLabel?.role === "file-input"
+  ) {
+    return false;
+  }
+
+  const intent = buildVisionIntent(step, ctx.params, nameOverride);
+
+  try {
+    const shot = await browser.screenshot();
+    if (!shot || !shot.pngB64 || shot.width <= 0 || shot.height <= 0) {
+      return false;
+    }
+    // (5) ONE ground call, bounded — api.hcompany.ai can stall 35-108s; a
+    // Promise.race timeout keeps a stalled ground inside the ≤10s/step budget.
+    const ac = new AbortController();
+    const GROUND_TIMEOUT_MS = 8000;
+    const timer = setTimeout(() => ac.abort(), GROUND_TIMEOUT_MS);
+    let r: { x: number; y: number; error?: string } | null = null;
+    try {
+      r = await Promise.race([
+        ctx.provider.ground({
+          instruction: intent,
+          screenshotB64: shot.pngB64,
+          screen: [shot.width, shot.height],
+          signal: ac.signal,
+        }),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), GROUND_TIMEOUT_MS + 200),
+        ),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!r || r.error) return false;
+
+    // (3) Scale grounded DEVICE-px coords → CSS px for elementFromPoint.
+    let innerW = shot.width;
+    try {
+      const iw = Number(await browser.evaluate("window.innerWidth"));
+      if (Number.isFinite(iw) && iw > 0) innerW = iw;
+    } catch {
+      /* keep device-dim fallback (scale=1) */
+    }
+    const css = visionCoordsToCss(r.x, r.y, shot.width, innerW);
+    if (!css) return false; // (guard) bad dims/scale → never click 0,0
+
+    // Tag the element at the grounded point + read back a durable locator.
+    let loc: VisionLocator;
+    try {
+      loc = (await browser.evaluate(
+        visionTagScript(css.cssX, css.cssY),
+      )) as VisionLocator;
+    } catch {
+      return false;
+    }
+    // (2)+(3) elementFromPoint must resolve to a REAL actionable control.
+    if (!loc || loc.ok !== true) return false;
+
+    // Act through the tagged element via the SAME run callback.
+    await run(VISION_REF);
+
+    // (persist) Write a durable locator back so the next replay is
+    // deterministic. Mirror persistDrift's dirty/driftCount machinery.
+    const role = (loc.role ?? "").trim();
+    const name = (loc.name ?? "").trim();
+    if (role && name) {
+      step.refLabel = { role, name };
+    }
+    if (step.executed.type === "browser_type") {
+      const fieldText = (loc.fieldText ?? "").trim();
+      if (fieldText) {
+        (step.executed.payload as Record<string, unknown>).fieldLabel = fieldText;
+      }
+    }
+    ctx.dirty = true;
+    ctx.driftCount = (ctx.driftCount ?? 0) + 1;
+    console.log(
+      `[replay] vision-healed step (${step.executed.type}) via "${intent}" → ` +
+        `${role || "?"} "${name || "?"}"; persisted durable locator`,
+    );
+    return true;
+  } catch {
+    // Any failure (screenshot, evaluate, run on the tagged ref) → fall
+    // through to the caller's existing throw. Never hang, never loop.
+    return false;
+  }
+}
+
 async function withHealedRef(
   step: RecordedStep,
   ctx: ReplayCtx,
@@ -880,6 +1145,8 @@ async function withHealedRef(
       await run(ref);
       return;
     }
+    // Vision last-resort for data-driven targets: ground the SUBSTITUTED name.
+    if (await tryVisionHeal(step, ctx, run, wantName)) return;
     throw new Error(
       `parameterized target not found: ${step.refLabel.role} "${wantName}" ` +
         `(template "${step.refLabel.name}"). Re-record or check the param value.`,
@@ -922,6 +1189,8 @@ async function withHealedRef(
       return;
     }
     if (await tryFieldLabel()) return;
+    // FINAL tier: vision self-heal against a browser screenshot.
+    if (await tryVisionHeal(step, ctx, run)) return;
     throw new Error(
       `ref ${recorded} unreliable: a prior heal renumbered the page's refs and ` +
         `this step has ${step.refLabel ? `no uniquely-matching refLabel (${step.refLabel.role} "${step.refLabel.name}")` : "no refLabel"}` +
@@ -947,6 +1216,8 @@ async function withHealedRef(
       return;
     }
     if (await tryFieldLabel()) return;
+    // FINAL tier: vision self-heal against a browser screenshot.
+    if (await tryVisionHeal(step, ctx, run)) return;
     throw e;
   }
 }

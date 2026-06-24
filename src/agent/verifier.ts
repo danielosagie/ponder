@@ -40,6 +40,22 @@ export interface VerifyArgs {
   currentUrl?: { url: string; title: string };
   /** Abort signal. */
   signal?: AbortSignal;
+  /**
+   * The CONTROLLED browser tab is not the visible one — the screenshot
+   * shows a DIFFERENT tab than browserSnapshot/currentUrl describe.
+   * When true, the verifier must judge browser state from the URL/AX
+   * snapshot and treat the screenshot pixels as unrelated.
+   */
+  tabHidden?: boolean;
+  /**
+   * What to return when the verifier call ERRORS or replies ambiguously.
+   * Default true (fail-open): for a brain-claimed DONE we'd rather accept
+   * than spin. The proactive completion probe passes false (fail-closed):
+   * the brain made NO done claim there, so a transient provider error
+   * must not terminate the run — under decompose it would falsely
+   * advance the plan past an incomplete step.
+   */
+  errorDefault?: boolean;
 }
 
 export interface VerifyResult {
@@ -48,8 +64,18 @@ export interface VerifyResult {
 }
 
 // Verifier is conservative on snapshot size — it only needs gist, not
-// every interactive ref. Bigger snapshot = slower verifier call.
+// every interactive ref. Bigger snapshot = slower verifier call. The
+// composite planner has ~1M ctx, and with tabHidden the snapshot is the
+// verifier's ONLY evidence — truncating it there hides exactly the
+// content being judged.
 const VERIFIER_SNAPSHOT_LIMIT = 8_000;
+const VERIFIER_SNAPSHOT_LIMIT_COMPOSITE = 20_000;
+
+function snapshotLimitFor(provider: ProviderClient): number {
+  return provider.name === "composite"
+    ? VERIFIER_SNAPSHOT_LIMIT_COMPOSITE
+    : VERIFIER_SNAPSHOT_LIMIT;
+}
 
 /**
  * Ask the brain whether the original goal actually landed.
@@ -71,8 +97,8 @@ export async function verify(
   const snapshotBlock = args.browserSnapshot
     ? `\n\nChrome accessibility snapshot (informational):\n` +
       `URL: ${args.browserSnapshot.url}\n` +
-      (args.browserSnapshot.ax.length > VERIFIER_SNAPSHOT_LIMIT
-        ? args.browserSnapshot.ax.slice(0, VERIFIER_SNAPSHOT_LIMIT) +
+      (args.browserSnapshot.ax.length > snapshotLimitFor(provider)
+        ? args.browserSnapshot.ax.slice(0, snapshotLimitFor(provider)) +
           "\n…(truncated for verifier)"
         : args.browserSnapshot.ax)
     : "";
@@ -85,10 +111,30 @@ export async function verify(
       `Current browser title: ${args.currentUrl.title}\n`
     : "";
 
+  // When the controlled tab is hidden, the screenshot shows an UNRELATED
+  // window — and instructing the model to ignore an image it can see does
+  // not work (live: "the URL matches the goal, HOWEVER the screenshot
+  // shows a file explorer" → RETRY). For providers that support text-only
+  // calls (composite), WITHHOLD the image entirely; the Modal /plan
+  // endpoint requires one, so there we keep the image + instruction.
+  const withholdScreenshot =
+    args.tabHidden === true && provider.name === "composite";
   const verificationTask =
     `VERIFICATION CHECK — DO NOT EMIT AN ACTION VERB.\n` +
     `\n` +
     `Original goal: ${args.task}\n` +
+    (withholdScreenshot
+      ? `\nNOTE: no screenshot is attached — the agent's controlled browser ` +
+        `tab is not currently visible on the physical screen (an unrelated ` +
+        `window covers it), so pixels would be misleading. Judge ENTIRELY ` +
+        `from the URL and accessibility snapshot below; they are live and ` +
+        `accurate for the controlled tab.\n`
+      : args.tabHidden
+        ? `\nIMPORTANT: the SCREENSHOT shows a DIFFERENT Chrome tab than the one ` +
+          `the agent controls. Judge browser state ONLY from the URL and the ` +
+          `accessibility snapshot below — the screenshot pixels are unrelated ` +
+          `to the controlled tab and must not count against verification.\n`
+        : ``) +
     `${urlBlock}${snapshotBlock}\n` +
     `\n` +
     `The agent has just claimed this goal is achieved. Default answer is RETRY.\n` +
@@ -103,6 +149,13 @@ export async function verify(
     `answer. Showing a partial expression or wrong number is NOT verified.\n` +
     `  • Goal "send a message" → the conversation/post must show the sent message ` +
     `appearing as a new entry. Just having the compose box focused is NOT verified.\n` +
+    `\n` +
+    `EQUIVALENCE RULE — system launchers are interchangeable: if the goal\n` +
+    `or expected result names one launcher (Spotlight, Raycast, Alfred) and\n` +
+    `the screen shows a DIFFERENT one, judge the FUNCTION, not the brand —\n` +
+    `any launcher overlay with a search field counts as "the launcher is\n` +
+    `open". Same for typed-ahead app names: the app name visible in ANY\n` +
+    `launcher's field/results satisfies "typed into Spotlight".\n` +
     `\n` +
     `Be SKEPTICAL. If the action LIKELY landed but you can't confirm it from\n` +
     `the screenshot or URL, RETRY is the safer answer — the orchestrator will\n` +
@@ -123,18 +176,21 @@ export async function verify(
     const out = await provider.plan({
       task: verificationTask,
       history: [], // verifier sees no prior actions — it's a fresh judgement
-      screenshotB64: args.screenshotB64,
+      screenshotB64: withholdScreenshot ? "" : args.screenshotB64,
       screen: args.screen,
       signal: args.signal,
     });
     raw = out.action.trim();
   } catch (e) {
+    const fallback = args.errorDefault ?? true;
     console.warn(
       `[verifier] ← error (${Date.now() - t0}ms): ${
         e instanceof Error ? e.message : String(e)
-      } — accepting DONE conservatively`,
+      } — ${fallback ? "accepting DONE conservatively" : "treating as NOT verified (probe fail-closed)"}`,
     );
-    return { verified: true };
+    return fallback
+      ? { verified: true }
+      : { verified: false, reason: "verifier call errored — no proof of completion" };
   }
   console.log(
     `[verifier] ← (${Date.now() - t0}ms) "${raw.slice(0, 120)}${raw.length > 120 ? "..." : ""}"`,
@@ -148,12 +204,16 @@ export async function verify(
   if (retryMatch && retryMatch[1]) {
     return { verified: false, reason: retryMatch[1].trim() };
   }
-  // Ambiguous output (verb echo, prose, empty). The brain claimed DONE; we
-  // accept rather than enter a Ralph→Sisyphus loop on a misformatted reply.
+  // Ambiguous output (verb echo, prose, empty). For a brain-claimed DONE we
+  // accept rather than enter a Ralph→Sisyphus loop on a misformatted reply;
+  // for a proactive probe (errorDefault:false) ambiguity is not proof.
+  const ambiguousFallback = args.errorDefault ?? true;
   console.warn(
-    `[verifier] ambiguous response, treating as VERIFIED: "${trimmed.slice(0, 80)}"`,
+    `[verifier] ambiguous response, treating as ${ambiguousFallback ? "VERIFIED" : "NOT verified (probe fail-closed)"}: "${trimmed.slice(0, 80)}"`,
   );
-  return { verified: true };
+  return ambiguousFallback
+    ? { verified: true }
+    : { verified: false, reason: "verifier reply was ambiguous — no proof" };
 }
 
 /** Whether the verifier should run. Default on; PONDER_VERIFIER=off disables. */
@@ -195,8 +255,8 @@ export async function verifyInfeasible(
   const snapshotBlock = args.browserSnapshot
     ? `\n\nChrome accessibility snapshot (informational):\n` +
       `URL: ${args.browserSnapshot.url}\n` +
-      (args.browserSnapshot.ax.length > VERIFIER_SNAPSHOT_LIMIT
-        ? args.browserSnapshot.ax.slice(0, VERIFIER_SNAPSHOT_LIMIT) +
+      (args.browserSnapshot.ax.length > snapshotLimitFor(provider)
+        ? args.browserSnapshot.ax.slice(0, snapshotLimitFor(provider)) +
           "\n…(truncated for verifier)"
         : args.browserSnapshot.ax)
     : "";

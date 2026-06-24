@@ -138,6 +138,14 @@ export interface TraceEntry {
   refLabel?: { role: string; name: string };
   url?: string;
   consumer?: string;
+  /**
+   * Absolute epoch ms at which the action ACTUALLY executed. Defaults
+   * to Date.now(). Pass it when recording after-the-fact (the bridge
+   * transcript mirror) so steps keep their real inter-step deltas —
+   * recorded-pacing replay reads them; a synchronous mirror loop would
+   * otherwise collapse every gap to ~0.
+   */
+  atEpochMs?: number;
 }
 
 /**
@@ -150,7 +158,7 @@ export interface TraceEntry {
  */
 export function recordAction(entry: TraceEntry): RecordedStep {
   const step: RecordedStep = {
-    t: Date.now() - traceStartedAt,
+    t: Math.max(0, (entry.atEpochMs ?? Date.now()) - traceStartedAt),
     executed: {
       type: entry.type,
       payload: { ...entry.payload },
@@ -434,6 +442,58 @@ export function recordFromBridgeTranscript(
   return recipe;
 }
 
+/**
+ * Build a recipe from a persisted Convex session's steps (History → "Save as
+ * automation"). Convex steps don't carry refLabels (only the live recorder
+ * captures role+name), so the resulting recipe replays by url + raw action;
+ * reground:true still re-grounds via vision. Lower fidelity than saving the
+ * last *live* run, but lets any past run become a replayable automation.
+ */
+export function recipeFromConvexSteps(
+  task: string,
+  steps: Array<{
+    kind: string;
+    text?: string;
+    action?: { type: string; payload?: unknown };
+    coords?: { x: number; y: number };
+    createdAt?: number;
+  }>,
+  opts: { provider?: string; outcome?: RecordedRecipe["outcome"]; durationMs?: number } = {},
+): RecordedRecipe {
+  const recipe: RecordedRecipe = {
+    task,
+    startedAt: new Date().toISOString(),
+    steps: [],
+    ...(opts.provider ? { provider: opts.provider } : {}),
+  };
+  const t0 = steps.length && steps[0]?.createdAt ? steps[0].createdAt! : 0;
+  let pendingIntent: string | undefined;
+  let pendingUrl: string | undefined;
+  for (const s of steps) {
+    if (s.kind === "thought") {
+      if (s.text) pendingIntent = s.text;
+      continue;
+    }
+    if (s.kind !== "action" || !s.action) continue;
+    const type = s.action.type;
+    const payload = (s.action.payload ?? {}) as Record<string, unknown>;
+    const t = s.createdAt && t0 ? Math.max(0, s.createdAt - t0) : 0;
+    const step: RecordedStep = { t, executed: { type, payload } };
+    if (pendingIntent) {
+      step.intent = pendingIntent;
+      pendingIntent = undefined;
+    }
+    if (pendingUrl) step.url = pendingUrl;
+    if (type === "browser_navigate" && typeof payload.url === "string") {
+      pendingUrl = payload.url;
+    }
+    recipe.steps.push(step);
+  }
+  if (opts.outcome) recipe.outcome = opts.outcome;
+  if (opts.durationMs !== undefined) recipe.durationMs = opts.durationMs;
+  return recipe;
+}
+
 // ── Recipe codegen (raw Playwright in run() body) ────────────────────
 //
 // The recipe file is just `defineRecipe({ task, run })` — a thin shell.
@@ -564,6 +624,13 @@ function renderStep(step: RecordedStep): string {
     }
     case "wait":
       return `${lead}\nawait page.waitForTimeout(${Number(p.ms ?? 1000)});`;
+    case "open_app":
+      return `${lead}\nawait screen.openApp(${json(p.app)});`;
+    case "note":
+      // Planner working memory — replay no-op, kept for readability.
+      return `${lead}\n// note: ${oneLine(String(p.text ?? ""))}`;
+    case "hover":
+      return `${lead}\nawait screen.hover(${Number(p.x ?? 0)}, ${Number(p.y ?? 0)});`;
     case "type":
       return (
         `${lead}\nawait screen.type(${json(p.text)}${
@@ -678,7 +745,12 @@ function mapAxRoleToPlaywright(role: string): string | null {
 
 // ── AX parsing helpers ───────────────────────────────────────────────
 
-function parseAxRefs(ax: string): Map<string, { role: string; name: string }> {
+/** Exported for replay-time self-healing ref resolution (cli/sdk.ts):
+ *  a stale [eN] ref is re-resolved against a fresh snapshot by matching
+ *  the recorded role+name label. */
+export function parseAxRefs(
+  ax: string,
+): Map<string, { role: string; name: string }> {
   const out = new Map<string, { role: string; name: string }>();
   for (const line of ax.split("\n")) {
     const m = line.match(/^\[(e\d+)\]\s+(\S+)(?:\s+"([^"]*)")?/);
@@ -899,6 +971,30 @@ export async function loadRecipe(id: string): Promise<RecordedRecipe | null> {
 
 /** Backwards-compatible alias. */
 export const loadSession = loadRecipe;
+
+/**
+ * Find a saved recipe whose task EXACTLY matches (normalized: trimmed,
+ * lowercased, whitespace-collapsed) the given task. The Run flow uses this to
+ * auto-replay a recorded automation instead of re-running the agent. Returns
+ * the most recent matching recipe that has steps and didn't end in error, or
+ * null. EXACT match keeps it predictable — a fuzzy match could replay the
+ * wrong flow for a slightly different request.
+ */
+export async function findRecipeByTask(
+  task: string,
+): Promise<{ id: string; recipe: RecordedRecipe } | null> {
+  const norm = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const want = norm(task);
+  if (!want) return null;
+  const entries = await listRecipes(); // sorted most-recent-first
+  for (const e of entries) {
+    if (e.steps <= 0 || e.outcome === "error") continue;
+    if (norm(e.task) !== want) continue;
+    const recipe = await loadRecipe(e.id);
+    if (recipe && recipe.steps.length > 0) return { id: e.id, recipe };
+  }
+  return null;
+}
 
 /**
  * Resolve a possibly-partial id to a full id. Same rules as before:

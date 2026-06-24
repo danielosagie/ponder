@@ -57,6 +57,12 @@ import {
   AUDIT_LOG_PATH,
   type Scope,
 } from "../bridge/auth.js";
+import {
+  startBrowserJobsConsumer,
+  readBrowserJobsConfig,
+  bootstrapConfig,
+  isConfigured,
+} from "../agent/browser-jobs/index.js";
 
 // ── Pretty output ────────────────────────────────────────────────────
 
@@ -116,6 +122,11 @@ ${C.bold}BROWSER${C.reset}
   ${C.cyan}attach${C.reset}              Attach a Chrome tab (vision-assisted)
   ${C.cyan}setup${C.reset}               Guided setup wizard
   ${C.cyan}doctor${C.reset}              Health check
+
+${C.bold}DISPATCH${C.reset}
+  ${C.cyan}consume${C.reset}             Run jobs dispatched from the phone (subscribes to the
+                      browser-jobs queue, executes each via Ponder)
+  ${C.cyan}breaker-reset${C.reset}       How to clear a tripped FB account-safety breaker
 
 ${C.bold}BRIDGE AUTH${C.reset}
   ${C.cyan}grant${C.reset} <name>        Mint an API key for a consumer
@@ -657,6 +668,91 @@ async function cmdGrants(args: ParsedArgs): Promise<number> {
 
 // ── Dispatcher ───────────────────────────────────────────────────────
 
+// ── consume: run the browser-jobs dispatch consumer ─────────────────
+// Subscribes to the sssync-bknd Convex `browserJobs` queue and executes each
+// job through the Ponder engine (local Electron bridge). Long-running: stays
+// up until Ctrl-C. This is the desktop side of "send a job from the phone".
+async function cmdConsume(): Promise<number> {
+  let config = readBrowserJobsConfig();
+  if (!isConfigured(config)) config = await bootstrapConfig(config);
+  if (!isConfigured(config)) {
+    err(`${C.red}browser-jobs consumer is not configured.${C.reset}`);
+    err(
+      `${C.dim}Set PONDER_BROWSER_JOBS_CONVEX_URL + PONDER_BROWSER_JOBS_USER_ID,\n` +
+        `or PONDER_BROWSER_JOBS_SYNC_BASE_URL + PONDER_BROWSER_JOBS_SYNC_TOKEN to bootstrap from the backend.${C.reset}`,
+    );
+    return 2;
+  }
+
+  out(`${C.bold}ponder consume${C.reset} ${C.dim}— waiting for dispatched jobs (Ctrl-C to stop)${C.reset}`);
+  const consumer = await startBrowserJobsConsumer({
+    config,
+    events: { log: (msg) => out(`${C.dim}[browser-jobs]${C.reset} ${msg}`) },
+  });
+  const s = consumer.status();
+  out(
+    `${C.cyan}worker=${s.workerId}${C.reset} user=${s.userId} ` +
+      `bridge=:${config.bridgePort} reconcile=${s.backendSyncConfigured ? "on" : "off"}`,
+  );
+  // FB account-safety (writes only): pacing + caps + breaker threshold.
+  out(
+    `${C.dim}safety: write-jitter ${config.writeMinGapMs}–${config.writeMaxGapMs}ms · ` +
+      `caps ${config.writeHourlyCap}/h ${config.writeDailyCap}/24h · ` +
+      `breaker after ${config.frictionBreakConsecutiveFails} consecutive write fails · ` +
+      `read-jitter ${config.readJitterMaxMs}ms${C.reset}`,
+  );
+  out(
+    `${C.dim}breaker: ${s.breakerTripped ? `${C.red}TRIPPED${C.reset}${C.dim}` : "ok"}` +
+      `${s.breakerReason ? ` (${s.breakerReason})` : ""} · ` +
+      `writes ${s.writesLastHour}/h ${s.writesLastDay}/24h${C.reset}`,
+  );
+  out(
+    `${C.dim}(reset a tripped breaker: Ctrl-C + restart, or relaunch with ` +
+      `PONDER_FRICTION_BREAKER_RESET=1)${C.reset}`,
+  );
+  if (!s.backendSyncConfigured) {
+    err(
+      `${C.dim}(no sync token — jobs run + complete in Convex but won't reconcile back to the agent thread)${C.reset}`,
+    );
+  }
+
+  // Keep the process alive until interrupted.
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      out(`\n${C.dim}stopping consumer…${C.reset}`);
+      try {
+        consumer.stop();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+  return 0;
+}
+
+// ── breaker-reset: explain how to clear the FB account-safety breaker ───
+// The circuit breaker lives IN-MEMORY on the long-lived `consume` process, so
+// a separate CLI invocation can't reach it. The realistic resets are (a) Ctrl-C
+// the consumer and restart (clears in-memory state), or (b) relaunch it with
+// PONDER_FRICTION_BREAKER_RESET=1 for one run. In-process callers (Electron)
+// can call consumer.resetBreaker() directly.
+function cmdBreakerReset(): number {
+  out(`${C.bold}reset the FB account-safety circuit breaker${C.reset}`);
+  out("");
+  out(`${C.dim}The breaker pauses Facebook WRITE jobs after repeated failures or a`);
+  out(`friction signal (checkpoint/captcha/restriction). Reads keep running.${C.reset}`);
+  out("");
+  out(`${C.cyan}1.${C.reset} Check Facebook manually first — confirm the account is healthy.`);
+  out(`${C.cyan}2.${C.reset} Reset by EITHER:`);
+  out(`     ${C.dim}• Ctrl-C the running ${C.reset}${C.cyan}ponder consume${C.reset}${C.dim} and start it again, OR${C.reset}`);
+  out(`     ${C.dim}• relaunch it once with ${C.reset}PONDER_FRICTION_BREAKER_RESET=1 ponder consume`);
+  out(`${C.dim}(In-app/Electron: call consumer.resetBreaker().)${C.reset}`);
+  return 0;
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -711,6 +807,12 @@ async function main(): Promise<void> {
       case "where":
         out(RECIPES_DIR);
         process.exit(0);
+        return;
+      case "consume":
+        process.exit(await cmdConsume());
+        return;
+      case "breaker-reset":
+        process.exit(cmdBreakerReset());
         return;
       default:
         err(`${C.red}unknown command: ${cmd}${C.reset}`);

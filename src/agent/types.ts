@@ -1,4 +1,14 @@
-export type ProviderName = "remote" | "local" | "hcompany";
+// "composite" = a hosted smart planner wrapping one of the three
+// executors (Surfer-2 split): plan() → planner, ground() → executor.
+// Not user-selectable in preferences — it activates via env
+// (GEMINI_API_KEY / PLANNER_API_KEY) on top of whichever executor the
+// preference resolves to.
+export type ProviderName = "remote" | "local" | "hcompany" | "composite";
+
+/** The concrete executor backends — what Convex persistence and the
+ *  preferences file accept. "composite" maps to its underlying executor
+ *  via factory.executorNameFor(). */
+export type ExecutorProviderName = Exclude<ProviderName, "composite">;
 
 export interface PlanResult {
   action: string;
@@ -34,6 +44,29 @@ export interface ProviderClient {
     screen: [number, number];
     signal?: AbortSignal;
   }): Promise<GroundResult>;
+  /**
+   * OPTIONAL combined plan+ground: ONE model call returns the next
+   * action AND, for mouse-aimed verbs, the click point — halving
+   * per-step model time vs the sequential plan→ground pair (each of
+   * which re-uploads the screenshot and re-runs the vision tower on
+   * it). x/y are SCREEN-space ints (rescaled server-side like ground)
+   * or null for keyboard/scroll/wait/DONE verbs and for drag (two
+   * points — drag stays on the split path). Callers MUST treat null
+   * coords on a mouse-aimed action as "ground separately".
+   */
+  step?(args: {
+    task: string;
+    history: string[];
+    screenshotB64: string;
+    screen: [number, number];
+    signal?: AbortSignal;
+  }): Promise<{
+    action: string;
+    x: number | null;
+    y: number | null;
+    raw?: [number, number];
+    usage?: Record<string, number>;
+  }>;
   /**
    * OPTIONAL batch-grounding: ONE screenshot, N instructions, N coords.
    *

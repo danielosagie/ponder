@@ -1,0 +1,49 @@
+{
+  "id": "calculator-mouse-math-2026-05-18T22:30:04.062Z",
+  "case": "calculator-mouse-math",
+  "tier": null,
+  "axes": [],
+  "started_at": "2026-05-18T22:30:04.062Z",
+  "ended_at": "2026-05-18T22:30:57.760Z",
+  "elapsed_ms": 53698,
+  "repo_head_short": "803e774c6553",
+  "bridge_version": {
+    "commit": "803e774c6553d918aef39f7a891b0b9535213e14",
+    "commitShort": "803e774c6553",
+    "dirty": true,
+    "builtAt": "2026-05-18T22:29:45.333Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": null,
+  "task_prompt": "Compute 47 × 8 in macOS Calculator by clicking each digit and operator with the mouse, then read the answer from the display.",
+  "setup": null,
+  "agent": {
+    "called": true,
+    "outcome": "cancelled",
+    "duration_ms": 53618,
+    "steps": 4,
+    "response": {
+      "outcome": "cancelled",
+      "sessionId": "j57enb199gchv590mj190dbajx86z00y",
+      "steps": 4,
+      "transcript": [
+        "[t=9.5s] thought: click the number \"4\" button",
+        "[t=15.7s] action: click {\"x\":1396,\"y\":918}",
+        "[t=21.0s] thought: click the number \"7\" button",
+        "[t=23.2s] action: click {\"x\":1305,\"y\":548}",
+        "[t=31.0s] thought: click the multiplication (×) button",
+        "[t=33.1s] action: click {\"x\":1507,\"y\":926}",
+        "[t=40.6s] thought: click the number \"8\" button",
+        "[t=42.6s] action: click {\"x\":1397,\"y\":922}"
+      ],
+      "finalScreenshotSidecarPath": "calculator-mouse-math-2026-05-18T22-30-57-760Z-final.png",
+      "finalScreenshotSidecarSha256": "5efaceabb1a2dcd4"
+    }
+  },
+  "scoring": null,
+  "deterministic_score": "UNKNOWN",
+  "agent_self_reported_outcome": "cancelled",
+  "disagreement": false
+}

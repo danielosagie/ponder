@@ -30,6 +30,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { pngDimensions } from "../imageops";
 import type {
   BrowserClient,
   BrowserSnapshot,
@@ -159,6 +160,10 @@ interface PWPage {
   };
   bringToFront(): Promise<void>;
   isClosed(): boolean;
+  screenshot(opts?: {
+    type?: "png" | "jpeg";
+    fullPage?: boolean;
+  }): Promise<Buffer>;
 }
 
 interface PWBrowser {
@@ -502,6 +507,16 @@ export interface PlaywriterClientConfig {
    *  callers without UI can omit. We dedupe identical status messages
    *  internally so a polling caller doesn't spam the bubble. */
   onStatus?: (text: string) => void;
+  /**
+   * NO-EXTENSION mode (2026-06-17): a CDP endpoint URL of a Chrome the
+   * caller launched itself with `--remote-debugging-port` (+ a dedicated
+   * user-data-dir). When set, the client skips the Playwriter relay +
+   * extension entirely and `connectOverCDP(cdpUrl)` directly — everything
+   * downstream (data-holo-ref snapshot, click/type by ref) is identical.
+   * This is the "Granola/Notion" path: drive the user's own Chrome with no
+   * extension to install and no green-icon gesture.
+   */
+  cdpUrl?: string;
 }
 
 export async function createPlaywriterClient(
@@ -603,6 +618,36 @@ export async function createPlaywriterClient(
     if (state.browser && state.page && !state.page.isClosed()) {
       return true;
     }
+    // No-extension path: connect straight to a self-launched Chrome's CDP
+    // endpoint. No relay, no extension, no green-icon gesture.
+    if (cfg.cdpUrl) {
+      try {
+        const browser = (await state.modules.core.chromium.connectOverCDP(
+          cfg.cdpUrl,
+        )) as PWBrowser;
+        const ctx = browser.contexts()[0];
+        if (!ctx) {
+          await browser.close().catch(() => {});
+          emitStatus("no-tab", "CDP endpoint has no browser context yet.");
+          return false;
+        }
+        const pages = ctx.pages();
+        const real = pages.filter((p) => !isWelcomeTab(p) && !p.isClosed());
+        const page = real[0] ?? pages[0] ?? (await ctx.newPage());
+        state.browser = browser;
+        state.page = page;
+        emitStatus("connected", `Connected (no-ext) — ${page.url() || "ready"}.`);
+        return true;
+      } catch (e) {
+        emitStatus(
+          "connect-failed",
+          `Direct CDP connect failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+        state.browser = null;
+        state.page = null;
+        return false;
+      }
+    }
     try {
       // When the user has multiple Playwriter extensions installed (very
       // common on dev machines: Web Store production + the unpacked dev
@@ -685,6 +730,13 @@ export async function createPlaywriterClient(
   }
 
   async function ensureChrome(): Promise<boolean> {
+    // No-extension mode skips the relay; just make sure modules are loaded
+    // before connectIfPossible() reaches for state.modules.core.chromium.
+    if (cfg.cdpUrl) {
+      if (!state.modules) state.modules = await tryLoadModules();
+      if (!state.modules) return false;
+      return await connectIfPossible();
+    }
     if (!(await startRelay())) return false;
     return await connectIfPossible();
   }
@@ -819,6 +871,61 @@ export async function createPlaywriterClient(
     return state.page;
   }
 
+  /**
+   * Tandem-mode tab sync (2026-06-10): re-point state.page at whichever
+   * tab is VISUALLY active in Chrome before snapshotting.
+   *
+   * Previously snapshot() called page.bringToFront() unconditionally,
+   * which silently reverted any tab switch performed by the vision path
+   * or the user mid-run — the agent would vision-click a tab, and the
+   * very next snapshot yanked the OLD tab back to front, so the two
+   * stacks fought each other every step (the "playwriter & vlm out of
+   * sync" failure). Now Playwriter FOLLOWS the visible tab instead of
+   * fighting it: if state.page is hidden but a sibling tab is visible,
+   * adopt the visible one. bringToFront only fires when NOTHING is
+   * visible (window minimized / only the welcome tab) — the one case
+   * where forcing is correct.
+   *
+   * visibilityState probes are capped (Promise.race not needed — they
+   * resolve in <5ms on attached tabs; a closed page rejects and is
+   * skipped).
+   */
+  async function syncToVisibleTab(page: PWPage): Promise<PWPage> {
+    const isVisible = async (p: PWPage): Promise<boolean> => {
+      try {
+        return (
+          (await p.evaluate<unknown>("document.visibilityState")) === "visible"
+        );
+      } catch {
+        return false;
+      }
+    };
+    try {
+      if (await isVisible(page)) return page;
+      const ctx = state.browser?.contexts()[0];
+      const siblings = ctx
+        ? ctx.pages().filter((p) => !p.isClosed() && !isWelcomeTab(p))
+        : [];
+      for (const p of siblings) {
+        if (p === page) continue;
+        if (await isVisible(p)) {
+          emitStatus(
+            "tab-follow",
+            `Following the visible Chrome tab: ${p.url()}`,
+          );
+          state.page = p;
+          return p;
+        }
+      }
+      // Nothing visible — Chrome minimized or covered. Forcing the
+      // current page front is the legacy behavior and correct here.
+      await page.bringToFront();
+    } catch {
+      // best-effort — snapshot still works on a hidden page
+    }
+    return page;
+  }
+
   return {
     async available(): Promise<boolean> {
       if (!state.bootPromise) {
@@ -832,13 +939,11 @@ export async function createPlaywriterClient(
     },
 
     async snapshot(): Promise<BrowserSnapshot> {
-      const page = await activePage();
+      let page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
-      try {
-        await page.bringToFront();
-      } catch {
-        // best-effort
-      }
+      // Follow (don't fight) tab switches made by the vision path or the
+      // user — see syncToVisibleTab above.
+      page = await syncToVisibleTab(page);
       // Run the DOM walker IN-PAGE. Returns { url, title, ax } directly so
       // we don't have to call page.url()/title() afterward.
       const result = (await page.evaluate<unknown>(SNAPSHOT_SCRIPT)) as {
@@ -853,6 +958,100 @@ export async function createPlaywriterClient(
         state.refSet.add(m[1]!);
       }
       return result;
+    },
+
+    async isActive(): Promise<boolean> {
+      const page = await activePage();
+      if (!page) return false;
+      try {
+        return (
+          (await page.evaluate<unknown>("document.visibilityState")) ===
+          "visible"
+        );
+      } catch {
+        return false;
+      }
+    },
+
+    // Bring the CONTROLLED tab's window+tab to the foreground. Used when
+    // the screenshot shows a DIFFERENT tab than browser_* controls (the
+    // controlled tab is a background tab, often in another Chrome window).
+    // page.bringToFront() activates the tab AND raises its window, so
+    // vision actions then hit the real page. Best-effort.
+    async bringToFront(): Promise<void> {
+      const page = await activePage();
+      if (!page) return;
+      try {
+        await page.bringToFront();
+      } catch {
+        /* best-effort — caller falls back to browser.* only */
+      }
+    },
+
+    async geometry(): Promise<{
+      window: { x: number; y: number; width: number; height: number };
+      viewport: { x: number; y: number; width: number; height: number };
+      devicePixelRatio: number;
+    } | null> {
+      const page = await activePage();
+      if (!page) return null;
+      try {
+        const g = (await page.evaluate<unknown>(
+          `({ sx: window.screenX, sy: window.screenY, ow: window.outerWidth,
+              oh: window.outerHeight, iw: window.innerWidth,
+              ih: window.innerHeight, dpr: window.devicePixelRatio })`,
+        )) as {
+          sx: number;
+          sy: number;
+          ow: number;
+          oh: number;
+          iw: number;
+          ih: number;
+          dpr: number;
+        };
+        // Viewport top-left in screen space: horizontal borders are
+        // symmetric on macOS Chrome; everything above the viewport
+        // (title bar, toolbar, bookmarks) is the remaining outer-inner
+        // height delta.
+        const borderX = Math.max(0, (g.ow - g.iw) / 2);
+        return {
+          window: { x: g.sx, y: g.sy, width: g.ow, height: g.oh },
+          viewport: {
+            x: g.sx + borderX,
+            y: g.sy + (g.oh - g.ih) - borderX,
+            width: g.iw,
+            height: g.ih,
+          },
+          devicePixelRatio: g.dpr,
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    async screenshot(): Promise<{
+      pngB64: string;
+      width: number;
+      height: number;
+    } | null> {
+      const page = await activePage();
+      if (!page) return null;
+      try {
+        // page.screenshot IS forwarded by the Playwriter relay (unlike
+        // page.accessibility); browser-driver.ts has used it in prod since
+        // 2026-06-18. fullPage:false captures just the CSS viewport.
+        const buf = await page.screenshot({ type: "png", fullPage: false });
+        const dims = pngDimensions(buf);
+        return {
+          pngB64: buf.toString("base64"),
+          // DEVICE-pixel dims (Retina = 2× CSS). The caller scales by
+          // imgW / window.innerWidth to recover CSS px for elementFromPoint.
+          width: dims?.width ?? 0,
+          height: dims?.height ?? 0,
+        };
+      } catch {
+        return null;
+      }
     },
 
     async click(ref: string): Promise<void> {
@@ -982,6 +1181,15 @@ export async function createPlaywriterClient(
       );
     },
 
+    async evaluate(expression: string): Promise<unknown> {
+      const page = await activePage();
+      if (!page) throw new Error("[browser] no active Chrome tab");
+      // Pass the expression as a STRING (not a closure) so it serializes over
+      // the Playwriter relay/CDP unchanged. Caller supplies a self-contained,
+      // JSON-returning expression.
+      return await page.evaluate(expression);
+    },
+
     async readText(ref?: string): Promise<string> {
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
@@ -1073,6 +1281,16 @@ export async function createPlaywriterClient(
       const page = await activePage();
       if (!page) throw new Error("[browser] no active Chrome tab");
       await page.goto(url);
+    },
+
+    async newTab(url?: string): Promise<void> {
+      const ensured = await activePage();
+      if (!ensured || !state.browser) throw new Error("[browser] not connected to Chrome");
+      const ctx = state.browser.contexts()[0];
+      if (!ctx) throw new Error("[browser] no active Chrome context");
+      const page = await ctx.newPage();
+      state.page = page; // agent works in its OWN tab — the user's tabs stay put
+      if (url) await page.goto(url);
     },
 
     async listTabs(): Promise<TabInfo[]> {
@@ -1223,6 +1441,19 @@ export async function createPlaywriterClient(
         title,
         isCurrent: true,
       };
+    },
+
+    // AGP thin-driver hooks. Return the LIVE Playwright objects (full API,
+    // not the minimal PWPage/PWBrowser shape-types) so the AGP CommandExecutor
+    // can drive mouse/keyboard/screenshot/locators directly. ensureChrome()
+    // reuses all the relay + connection + extension-disambiguation logic.
+    async rawPage(): Promise<unknown> {
+      return await activePage();
+    },
+
+    async rawContext(): Promise<unknown> {
+      if (!(await ensureChrome())) return null;
+      return state.browser?.contexts()[0] ?? null;
     },
 
     async close(): Promise<void> {

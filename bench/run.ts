@@ -111,6 +111,10 @@ interface CaseFrontmatter {
   // bridge clamps to [5, 200]. Use sparingly — bigger budgets mean
   // longer wall times when the agent loops.
   max_steps?: number;
+  // Declared-multi-step case (NEXT-WORK Item 2): the harness passes
+  // decompose:true so the loop one-shot-decomposes and verify-advances.
+  // Inert unless the bridge process has PONDER_DECOMPOSE on.
+  multistep?: boolean;
 }
 
 interface ParsedCase {
@@ -272,6 +276,7 @@ async function callAgentDo(
   targetApp: string | undefined,
   maxSteps: number | undefined,
   timeoutMs: number,
+  decompose?: boolean,
 ): Promise<{ ok: boolean; body: AgentDoResult; httpStatus: number }> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -279,7 +284,12 @@ async function callAgentDo(
     const res = await fetch(`${BRIDGE_BASE}/agent_do`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task, targetApp, maxSteps }),
+      body: JSON.stringify({
+        task,
+        targetApp,
+        maxSteps,
+        ...(decompose ? { decompose: true } : {}),
+      }),
       signal: ctrl.signal,
     });
     const body = (await res.json()) as AgentDoResult;
@@ -473,6 +483,7 @@ async function main(): Promise<void> {
         targetApp,
         maxSteps,
         httpTimeoutMs,
+        c.frontmatter.multistep === true,
       );
       agentDurationMs = Date.now() - t0;
       agentResult = body;

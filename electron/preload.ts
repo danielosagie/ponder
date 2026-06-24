@@ -6,6 +6,20 @@ const api = {
   runTask: (prompt: string) => ipcRenderer.invoke("agent:run", prompt),
   cancel: () => ipcRenderer.invoke("agent:cancel"),
   setProvider: (name: ProviderName) => ipcRenderer.invoke("agent:setProvider", name),
+  // Brain engine: local composite loop vs server-side AGP (Holo 3.1) brain.
+  getEngine: () => ipcRenderer.invoke("agent:getEngine") as Promise<"composite" | "agp">,
+  setEngine: (engine: "composite" | "agp") =>
+    ipcRenderer.invoke("agent:setEngine", engine) as Promise<{
+      ok: boolean;
+      engine: "composite" | "agp";
+    }>,
+  // Recipe-first auto-replay: replay a saved automation that exactly matches.
+  getAutoReplay: () => ipcRenderer.invoke("agent:getAutoReplay") as Promise<boolean>,
+  setAutoReplay: (on: boolean) =>
+    ipcRenderer.invoke("agent:setAutoReplay", on) as Promise<{
+      ok: boolean;
+      autoReplay: boolean;
+    }>,
   warm: () => ipcRenderer.invoke("agent:warm"),
   getState: () => ipcRenderer.invoke("agent:state"),
   hideOverlay: () => ipcRenderer.invoke("overlay:hide"),
@@ -83,6 +97,32 @@ const api = {
       ok: boolean;
       error?: string;
     }>,
+  // Deterministic replay of a saved recipe (reground:true re-grounds each step
+  // via vision → survives DOM drift; far faster than a fresh agent loop).
+  replayRecipe: (id: string, opts?: { reground?: boolean; stepDelayMs?: number }) =>
+    ipcRenderer.invoke("recipes:replay", id, opts) as Promise<{
+      ok: boolean;
+      failed?: number;
+      healed?: number;
+      error?: string;
+    }>,
+  // Freeze the most recent run into a saved automation (recipe).
+  saveLastAsRecipe: (task?: string) =>
+    ipcRenderer.invoke("recipes:saveLast", task) as Promise<{
+      ok: boolean;
+      id?: string;
+      error?: string;
+    }>,
+  // Freeze a PAST run (from History) into a saved automation.
+  saveSessionAsRecipe: (sessionId: string, task?: string) =>
+    ipcRenderer.invoke("recipes:saveFromSession", sessionId, task) as Promise<{
+      ok: boolean;
+      id?: string;
+      error?: string;
+    }>,
+  // Open a selling channel (or any URL) in the default browser to sign in.
+  openChannel: (url: string) =>
+    ipcRenderer.invoke("channels:open", url) as Promise<{ ok: boolean; error?: string }>,
 };
 
 export interface AgentStateMsg {

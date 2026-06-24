@@ -1,0 +1,36 @@
+{
+  "id": "calculator-mouse-math-2026-05-18T20:19:56.429Z",
+  "case": "calculator-mouse-math",
+  "tier": null,
+  "axes": [],
+  "started_at": "2026-05-18T20:19:56.429Z",
+  "ended_at": "2026-05-18T20:24:57.830Z",
+  "elapsed_ms": 301401,
+  "repo_head_short": "803e774c6553",
+  "bridge_version": {
+    "commit": "803e774c6553d918aef39f7a891b0b9535213e14",
+    "commitShort": "803e774c6553",
+    "dirty": true,
+    "builtAt": "2026-05-18T20:19:34.958Z"
+  },
+  "stale_bridge_warning": false,
+  "dry_run": false,
+  "targetApp": null,
+  "max_steps": null,
+  "task_prompt": "Compute 47 × 8 in macOS Calculator by clicking each digit and operator with the mouse, then read the answer from the display.",
+  "setup": null,
+  "agent": {
+    "called": true,
+    "outcome": "error",
+    "duration_ms": 301318,
+    "steps": null,
+    "response": {
+      "outcome": "error",
+      "error": "fetch failed"
+    }
+  },
+  "scoring": null,
+  "deterministic_score": "UNKNOWN",
+  "agent_self_reported_outcome": "error",
+  "disagreement": false
+}

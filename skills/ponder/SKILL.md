@@ -147,3 +147,8 @@ Past tense, lead with the answer. Informational request → answer + bulleted li
 ## Need more?
 
 Worked examples (Bulbasaur upload, search listings, Calculator), search/location form patterns, troubleshooting (perms, bridge mode, provider config), and cost notes are in `REFERENCE.md` next to this file.
+
+**Marketplace CRUD (create/read/update/delete, single + bulk)** — the full
+playbook for driving any seller marketplace (post/edit/export/mark-sold one item
+or in bulk via `extract` + the recipe-replay flywheel + `long_task`) is in
+[`docs/PONDER-MARKETPLACE-CRUD.md`](../../docs/PONDER-MARKETPLACE-CRUD.md).

@@ -18,8 +18,16 @@ import { getProviderPreference } from "./preferences";
 import { createHCompanyProvider } from "./providers/hcompany";
 import { createLocalProvider } from "./providers/local";
 import { createRemoteProvider } from "./providers/remote";
+import {
+  createCompositeProvider,
+  plannerConfigFromEnv,
+} from "./providers/planner";
 import { createOllamaRouter, type RouterClient } from "./router";
-import type { ProviderClient, ProviderName } from "./types";
+import type {
+  ExecutorProviderName,
+  ProviderClient,
+  ProviderName,
+} from "./types";
 
 /**
  * Pick the default provider.
@@ -40,12 +48,26 @@ import type { ProviderClient, ProviderName } from "./types";
  * Set the preference by clicking a provider in the tray menu, OR clear
  * `~/.holo3-agent/preferences.json` to fall back to env-var priority.
  */
-export function computeDefaultProvider(): ProviderName {
+export function computeDefaultProvider(): ExecutorProviderName {
+  const hasApi = !!(process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY);
   const pref = getProviderPreference();
-  if (pref && isProviderConfigured(pref)) return pref;
-  if (process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY) return "hcompany";
+  // Honor an explicit pick — EXCEPT a stale "remote" (Modal) pin when the fast
+  // H-company API is configured. Modal cold-starts are slow and the self-host
+  // has been flaky, so the API is the default whenever it's available (user
+  // directive 2026-06-21: "use the api by default not modal"). Modal still
+  // wins if it's the explicit pick AND no API key exists.
+  if (pref && pref !== "remote" && isProviderConfigured(pref)) return pref;
+  if (pref === "remote" && !hasApi && isProviderConfigured("remote")) return "remote";
+  if (hasApi) return "hcompany";
   if (process.env.MODAL_BASE_URL && process.env.MODAL_BEARER_TOKEN) return "remote";
   return "local";
+}
+
+/** Map a runtime provider name to the concrete executor backend —
+ *  Convex's sessions schema (and the preferences file) only know the
+ *  three executors; "composite" persists as whatever it wraps. */
+export function executorNameFor(name: ProviderName): ExecutorProviderName {
+  return name === "composite" ? computeDefaultProvider() : name;
 }
 
 /**
@@ -60,6 +82,34 @@ export function computeDefaultProvider(): ProviderName {
  * the client; that's the cheap fast-fail path.
  */
 export function makeProvider(name: ProviderName): ProviderClient {
+  return maybeWrapWithPlanner(makeExecutorProvider(name));
+}
+
+/**
+ * Surfer-2 split (2026-06-10): when a hosted planner is configured
+ * (GEMINI_API_KEY, or PLANNER_API_KEY + PLANNER_API_BASE), wrap the
+ * executor so plan() goes to the smart cheap model and ground() stays
+ * on Holo3. Everything that calls provider.plan — brain, verifier,
+ * completion probe, decompose — upgrades automatically. The loop
+ * detects name === "composite" and skips the local Ollama router and
+ * hierarchical planner (subsumed by the smart planner).
+ * PONDER_PLANNER=off disables wrapping.
+ */
+let plannerAnnounced = false;
+function maybeWrapWithPlanner(executor: ProviderClient): ProviderClient {
+  const cfg = plannerConfigFromEnv();
+  if (!cfg) return executor;
+  if (!plannerAnnounced) {
+    plannerAnnounced = true;
+    // console.error: stays off stdout (MCP JSON-RPC) — informational only.
+    console.error(
+      `[boot] planner configured: ${cfg.text.model} (text) / ${cfg.vision.model} (vision) plan, ${executor.name} grounds (composite mode — local router/planner bypassed)`,
+    );
+  }
+  return createCompositeProvider(executor, cfg);
+}
+
+function makeExecutorProvider(name: ProviderName): ProviderClient {
   if (name === "local") return createLocalProvider();
 
   if (name === "hcompany") {
@@ -67,7 +117,9 @@ export function makeProvider(name: ProviderName): ProviderClient {
       process.env.HAI_API_KEY ?? process.env.HCOMPANY_API_KEY ?? "";
     return createHCompanyProvider({
       apiKey,
-      model: process.env.HCOMPANY_MODEL ?? "holo3-35b-a3b",
+      // holo3-35b-a3b is deprecated 2026-06-15 — holo3-1-35b-a3b is the
+      // drop-in successor. See createHCompanyProvider.
+      model: process.env.HCOMPANY_MODEL ?? "holo3-1-35b-a3b",
     });
   }
 
@@ -122,5 +174,11 @@ export function makeRouter(): RouterClient | null {
 export function humanProviderLabel(name: ProviderName): string {
   if (name === "hcompany") return "H Company API";
   if (name === "remote") return "Modal · Holo3";
+  if (name === "composite") {
+    const cfg = plannerConfigFromEnv();
+    // Short label: strip the OpenRouter "vendor/" prefix for readability.
+    const shortText = cfg?.text.model.split("/").pop() ?? "planner";
+    return `${shortText} + Holo3`;
+  }
   return "Local (Ollama)";
 }

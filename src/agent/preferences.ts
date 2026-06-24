@@ -21,13 +21,28 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ProviderName } from "./types";
+import type { ExecutorProviderName, ProviderName } from "./types";
 
 const PREF_DIR = path.join(os.homedir(), ".holo3-agent");
 const PREF_FILE = path.join(PREF_DIR, "preferences.json");
 
+/**
+ * Which brain runs a task:
+ *   "composite" — the LOCAL client-side loop (plan/ground/verify in-process;
+ *                 src/agent/loop.ts). Handles OS-level + Chrome work; the
+ *                 only engine that can drive the macOS desktop.
+ *   "agp"       — H-company's SERVER-SIDE Holo 3.1 brain (thin-driver; the
+ *                 same brain the HoloTab extension uses). Chrome-only, fast,
+ *                 no per-step screenshots. Needs HAI_API_KEY + an attached tab.
+ */
+export type AgentEngine = "composite" | "agp";
+
 interface Preferences {
   provider?: ProviderName;
+  /** Local composite loop vs server-side AGP brain. Default "composite". */
+  engine?: AgentEngine;
+  /** Auto-replay a saved automation that exactly matches the task. Default on. */
+  autoReplay?: boolean;
   /** Reserved for future settings (max steps, narrator on/off, etc.). */
   [key: string]: unknown;
 }
@@ -60,7 +75,7 @@ function writeAll(prefs: Preferences): void {
  *  Returns null when no preference is set — callers should fall back to
  *  env-var priority. Validates the stored value is a known
  *  ProviderName so a corrupted file can't crash the factory. */
-export function getProviderPreference(): ProviderName | null {
+export function getProviderPreference(): ExecutorProviderName | null {
   const prefs = readAll();
   const v = prefs.provider;
   if (v === "hcompany" || v === "remote" || v === "local") return v;
@@ -82,6 +97,35 @@ export function setProviderPreference(name: ProviderName): void {
 export function clearProviderPreference(): void {
   const prefs = readAll();
   delete prefs.provider;
+  writeAll(prefs);
+}
+
+/** Read the user's preferred engine (set via the app's Settings toggle).
+ *  Defaults to "composite" (the local loop) when unset or corrupted so the
+ *  app behaves exactly as before until the user opts into the AGP brain. */
+export function getEnginePreference(): AgentEngine {
+  const prefs = readAll();
+  return prefs.engine === "agp" ? "agp" : "composite";
+}
+
+/** Persist the user's engine choice. Read by the Electron Run flow on the
+ *  next task; last-writer-wins like the provider preference. */
+export function setEnginePreference(engine: AgentEngine): void {
+  const prefs = readAll();
+  prefs.engine = engine;
+  writeAll(prefs);
+}
+
+/** Whether to auto-replay a saved automation that exactly matches the task
+ *  (default true). The Run flow consults this before running the agent; a
+ *  "fresh …" / "redo …" prefix overrides it per-run. */
+export function getAutoReplayPreference(): boolean {
+  return readAll().autoReplay !== false; // default ON
+}
+
+export function setAutoReplayPreference(on: boolean): void {
+  const prefs = readAll();
+  prefs.autoReplay = on;
   writeAll(prefs);
 }
 

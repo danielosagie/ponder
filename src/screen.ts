@@ -87,29 +87,33 @@ export interface Screenshot {
   /** Logical height of the captured display. PNG is `height * scaleFactor`
    *  pixels tall on Retina. */
   height: number;
-  /** Display-bounds X in screen-space. 0 for primary / single-display setups.
-   *  On multi-monitor setups where the focused display is to the RIGHT of the
-   *  primary, this is the primary's width; loop.ts adds it to grounded click
-   *  coords before firing cliclick so the click lands on the right monitor. */
+  /** Capture-region X origin in screen-space LOGICAL coords. 0 for a
+   *  full-frame capture of the primary display; the display origin on
+   *  multi-monitor captures; the WINDOW origin (any value, including
+   *  negative) for captureWindowDirect / cropped shots. loop.ts adds it
+   *  to grounded click coords before firing cliclick so the click lands
+   *  at the right screen position. */
   offsetX: number;
-  /** Display-bounds Y in screen-space. Non-zero when the focused display is
-   *  ABOVE the primary in the macOS arrangement (rare). */
+  /** Capture-region Y origin in screen-space logical coords — see
+   *  offsetX. */
   offsetY: number;
   /**
-   * Ratio of PNG physical pixels to logical pixels. 1 on non-Retina or
-   * nut-js (which always returns logical). 2 (or 3 on some external 5K
-   * displays) on Retina via desktopCapturer — Electron's NativeImage
-   * encodes `.toPNG()` at native resolution regardless of resize, so the
-   * PNG bytes are always at `width * scaleFactor` × `height * scaleFactor`.
+   * Ratio of PNG physical pixels to logical pixels — derived from the
+   * PNG's IHDR dims on EVERY capture path (2026-06-10). 2 on Retina, 1
+   * on non-HiDPI displays. Historical trap: nut-js was long documented
+   * as "always returns logical" and this field was hardcoded 1 on that
+   * path; measured reality is nut-js returns NATIVE pixels, and the
+   * mislabel made maybeCropToTargetApp slice the wrong region (the
+   * misclick complex fixed 2026-06-10). Do not assume any path is
+   * logical-resolution — trust this field, it is measured.
    *
-   * Crop-callers (maybeCropToTargetApp) MUST multiply logical bounds by
-   * this scale factor when slicing the PNG, otherwise they get the
-   * top-left ¼ of the intended region (the vision-quality regression we
-   * fixed 2026-05-13).
+   * Crop-callers MUST multiply logical bounds by this scale factor when
+   * slicing the PNG, otherwise they get the top-left ¼ of the intended
+   * region (the 2026-05-13 regression).
    *
    * Vision-grounding callers don't have to worry about this — they pass
    * `screen: [width, height]` (logical) to provider.ground; the model
-   * normalizes 0-1000 → logical, returns logical click coords.
+   * answers on a 0-1000 grid which is rescaled to logical coords.
    */
   scaleFactor: number;
 }
@@ -654,6 +658,38 @@ export async function captureViaDesktopCapturer(
   }
 }
 
+// Logical size of the MAIN display, with a 10s cache. Sourced from the
+// out-of-process winlist helper first (CGDisplayBounds, no libnut), then
+// nut-js size(), then a 2x-Retina assumption against the PNG dims. Used
+// by the screencapture-first capture path below.
+let _mainDisplayLogical: { w: number; h: number; at: number } | null = null;
+async function mainDisplayLogicalSize(
+  pngW: number,
+  pngH: number,
+): Promise<{ w: number; h: number }> {
+  if (_mainDisplayLogical && Date.now() - _mainDisplayLogical.at < 10_000) {
+    return { w: _mainDisplayLogical.w, h: _mainDisplayLogical.h };
+  }
+  try {
+    const snap = await winlistSnapshot();
+    const main = snap?.displays.find((d) => d.x === 0 && d.y === 0);
+    if (main && main.width > 0 && main.height > 0) {
+      _mainDisplayLogical = { w: main.width, h: main.height, at: Date.now() };
+      return { w: main.width, h: main.height };
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const { width, height } = await size();
+    _mainDisplayLogical = { w: width, h: height, at: Date.now() };
+    return { w: width, h: height };
+  } catch {
+    // Last resort: assume 2x Retina (every supported Mac since 2016).
+    return { w: Math.round(pngW / 2), h: Math.round(pngH / 2) };
+  }
+}
+
 export async function screenshot(): Promise<Screenshot> {
   // Multi-monitor path: figure out which display the cursor is on. On a
   // single-display Mac, `display.bounds.x` and `.y` are both 0, so we
@@ -665,19 +701,78 @@ export async function screenshot(): Promise<Screenshot> {
     if (shot) {
       return shot;
     }
-    // captureViaDesktopCapturer logged the reason; fall through to nut-js
-    // which will at least give us SOMETHING (the primary display) instead
-    // of crashing the whole step.
+    // captureViaDesktopCapturer logged the reason; fall through to the
+    // primary-display paths below.
   }
 
-  // Fast path: primary display via nut-js. No multi-monitor offset.
-  // nut-js always returns at logical pixels — no Retina double-up — so
-  // scaleFactor is 1 here.
+  // ── screencapture-first (2026-06-10) ──────────────────────────────
+  // libnut's _captureScreen SIGBUS-crashed the Electron app twice today
+  // (memmove overrun in copyMMBitmapFromDisplayInRect — crash reports
+  // Electron-2026-06-10-{143712,145058}.ips). A native fault inside the
+  // process is uncatchable and killed the whole agent mid-run with no
+  // stack trace. /usr/sbin/screencapture runs OUT of process — the
+  // worst case is a failed exec we catch and fall back from, never a
+  // crash. Output is native-Retina PNG; scaleFactor measured from IHDR
+  // like every other capture path. ~150-250ms, comparable to libnut.
+  if (process.platform === "darwin") {
+    try {
+      const os = await import("node:os");
+      const path = await import("node:path");
+      const fsp = await import("node:fs/promises");
+      const tmp = path.join(
+        os.tmpdir(),
+        `ponder-frame-${process.pid}-${Date.now()}.png`,
+      );
+      try {
+        await execFileAsync("/usr/sbin/screencapture", ["-x", tmp], {
+          timeout: 10_000,
+        });
+        const png = await fsp.readFile(tmp);
+        if (png.length >= 24 && png.readUInt32BE(0) === 0x89504e47) {
+          const pngW = png.readUInt32BE(16);
+          const pngH = png.readUInt32BE(20);
+          const { w, h } = await mainDisplayLogicalSize(pngW, pngH);
+          const scaleFactor = (pngW / w + pngH / h) / 2;
+          return {
+            png,
+            width: w,
+            height: h,
+            offsetX: 0,
+            offsetY: 0,
+            scaleFactor,
+          };
+        }
+      } finally {
+        await fsp.unlink(tmp).catch(() => {});
+      }
+    } catch (e) {
+      console.error(
+        `[screen] screencapture-first failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)}) — falling back to nut-js capture (in-process, crash-prone).`,
+      );
+    }
+  }
+
+  // Fallback: primary display via nut-js. No multi-monitor offset.
+  //
+  // Retina/HiDPI (2026-06-10): nut-js was long assumed to return logical
+  // pixels ("no Retina double-up, scaleFactor is 1"). Measured reality on
+  // macOS: grabRegion returns NATIVE pixels — a 1512×982 logical display
+  // yields a 3024×1964 PNG — while `size()` reports logical. Hardcoding
+  // scaleFactor:1 here made maybeCropToTargetApp slice logical-coord
+  // rects out of a native PNG (wrong region, half size → ~100% mis-
+  // grounding on cropped steps). Derive the true factor from the PNG's
+  // IHDR dims, same as captureViaDesktopCapturer above.
   const { width, height } = await size();
   const region = new Region(0, 0, width, height);
   const img = await nutScreen.grabRegion(region);
   const png = await imageToPng(img);
-  return { png, width, height, offsetX: 0, offsetY: 0, scaleFactor: 1 };
+  let scaleFactor = 1;
+  if (png.length >= 24 && png.readUInt32BE(0) === 0x89504e47) {
+    const pngWidth = png.readUInt32BE(16);
+    const pngHeight = png.readUInt32BE(20);
+    scaleFactor = (pngWidth / width + pngHeight / height) / 2;
+  }
+  return { png, width, height, offsetX: 0, offsetY: 0, scaleFactor };
 }
 
 async function imageToPng(img: unknown): Promise<Buffer> {
@@ -803,33 +898,86 @@ function crc32(buf: Buffer): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 
+/**
+ * Move the pointer to (x, y) WITHOUT clicking — hover menus, tooltips,
+ * and reveal-on-hover controls (macOS traffic lights, row action
+ * buttons). Also used by scroll-at-target to aim the wheel.
+ */
+export async function hover(x: number, y: number): Promise<void> {
+  const ix = Math.round(x);
+  const iy = Math.round(y);
+  if (cliclickPath) {
+    await cliclickRun(`m:${ix},${iy}`);
+    return;
+  }
+  await mouse.move(straightTo(new Point(ix, iy)));
+}
+
 export async function click(
   x: number,
   y: number,
-  opts: { button?: "left" | "right"; double?: boolean; triple?: boolean } = {},
+  opts: {
+    button?: "left" | "right";
+    double?: boolean;
+    triple?: boolean;
+    /** Modifier keys HELD during the click — shift+click multi-select,
+     *  cmd+click open-in-new-tab / add-to-selection, alt/ctrl variants.
+     *  cliclick names: cmd, shift, alt, ctrl. */
+    modifiers?: Array<"cmd" | "shift" | "alt" | "ctrl">;
+  } = {},
 ): Promise<void> {
   const ix = Math.round(x);
   const iy = Math.round(y);
 
   if (cliclickPath) {
-    // Background mode: post the click via cliclick. The user's cursor stays
-    // exactly where it was — only our buddy's blue agent-cursor visualizes
-    // the click. cmd codes:
-    //   c:x,y  → left click (no cursor move)
-    //   dc:x,y → double click
-    //   rc:x,y → right click
+    // cliclick mode — WITH a pointer-move + dwell BEFORE the click.
+    //
+    // Measured 2026-06-10 (deterministic 5-button probe on the SwiftUI
+    // Calculator, no model in the loop): a bare `c:x,y` teleport-click
+    // registered only 2/5 — SwiftUI controls drop synthetic clicks that
+    // arrive without a preceding pointer-move (the control never saw a
+    // hover/enter event, so the down/up at a "teleported" location is
+    // ignored). `m:x,y w:200 c:x,y` registered 5/5 across rounds. This
+    // was the LAST cause of the loop's intermittent "click changed
+    // nothing" failures after coordinates and Z-order were proven right.
+    //
+    // Tradeoff: the user's cursor now physically moves to the target
+    // (the original cliclick promise was a parked cursor). A click that
+    // doesn't click is worth less than a still cursor. Set
+    // PONDER_CLICK_DWELL_MS=0 to restore the legacy no-move teleport
+    // click for surfaces that tolerate it.
+    const dwell = Math.max(
+      0,
+      Number(process.env.PONDER_CLICK_DWELL_MS ?? 200),
+    );
+    const pre = dwell > 0 ? [`m:${ix},${iy}`, `w:${dwell}`] : [];
+    // Modifier-held clicks: wrap the click in kd:/ku: pairs so the
+    // modifier is physically down during the press (shift+click range
+    // select, cmd+click multi-select / open-in-new-tab).
+    if (opts.modifiers && opts.modifiers.length > 0) {
+      const mods = opts.modifiers.join(",");
+      const cmd =
+        opts.button === "right" ? "rc" : opts.double ? "dc" : "c";
+      await cliclickRun(...pre, `kd:${mods}`, `${cmd}:${ix},${iy}`, `ku:${mods}`);
+      return;
+    }
     if (opts.triple) {
       // No `tc:` shortcut in cliclick — chain three c: commands. macOS
       // aggregates consecutive same-pixel clicks within ~500ms into a real
       // multi-click event, so this lands as a triple-click (selects all in a
       // single-line field, the paragraph in a multi-line text area). Paired
       // with a follow-up `type X`, the type replaces the field's contents.
-      await cliclickRun(`c:${ix},${iy}`, `c:${ix},${iy}`, `c:${ix},${iy}`);
+      await cliclickRun(
+        ...pre,
+        `c:${ix},${iy}`,
+        `c:${ix},${iy}`,
+        `c:${ix},${iy}`,
+      );
       return;
     }
     const cmd =
       opts.button === "right" ? "rc" : opts.double ? "dc" : "c";
-    await cliclickRun(`${cmd}:${ix},${iy}`);
+    await cliclickRun(...pre, `${cmd}:${ix},${iy}`);
     return;
   }
 
@@ -837,6 +985,26 @@ export async function click(
   // target, hover briefly so the click is obviously visible, then fire.
   await mouse.move(straightTo(new Point(ix, iy)));
   await sleep(POST_MOVE_HOVER_MS);
+  const NUT_MOD: Record<string, Key> = {
+    cmd: Key.LeftCmd,
+    shift: Key.LeftShift,
+    alt: Key.LeftAlt,
+    ctrl: Key.LeftControl,
+  };
+  const heldMods = (opts.modifiers ?? [])
+    .map((m) => NUT_MOD[m])
+    .filter((k): k is Key => k !== undefined);
+  for (const k of heldMods) await keyboard.pressKey(k);
+  try {
+    if (heldMods.length > 0) {
+      if (opts.button === "right") await mouse.rightClick();
+      else if (opts.double) await mouse.doubleClick(Button.LEFT);
+      else await mouse.leftClick();
+      return;
+    }
+  } finally {
+    for (const k of heldMods.reverse()) await keyboard.releaseKey(k);
+  }
   if (opts.triple) {
     // nut-js has no triple-click API; three quick leftClicks at the same
     // point produce the same OS-level multi-click event. 40ms gap is well
@@ -1008,4 +1176,357 @@ function mapKey(name: string): Key | null {
     if (k != null) return k;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Direct window capture (occlusion-proof) — 2026-06-10.
+//
+// The crop path (loop.ts maybeCropToTargetApp) slices the target's rect out
+// of a full-screen capture, which means it captures whatever is RENDERED
+// there. raiseMacApp + recapture defends against ordinary Z-order burial,
+// but is helpless against floating windows (e.g. the iOS Simulator pins
+// itself at CGWindowLevel 8 — above every layer-0 window). Observed live:
+// the crop returned the Simulator's pixels at Calculator's coords and the
+// model grounded "the 7 button" onto the Simulator — the May-11 incident
+// class, recurring.
+//
+// `screencapture -l<windowId>` captures the WINDOW'S OWN backing store:
+// native-resolution, pixel-exact, and immune to occlusion entirely. The
+// window id comes from CGWindowListCopyWindowInfo via a tiny Swift helper
+// (JXA's ObjC bridge segfaults on this call), compiled once to
+// ~/.ponder/bin/ponder-winlist (~50ms/exec thereafter; the one-time
+// swiftc compile is ~5-15s and logged).
+//
+// The same window list also gives DETERMINISTIC occlusion detection: any
+// window earlier in the list (CGWindowList is front-to-back) that
+// intersects the target and sits below the system-chrome layers (<20) is
+// an occluder. Grounding is safe regardless (we capture the window's own
+// pixels), but CLICKS land on whatever is physically on top — so callers
+// surface the occluder list to the log/history instead of misclicking
+// silently.
+// ---------------------------------------------------------------------------
+
+export interface MacWindowInfo {
+  id: number;
+  owner: string;
+  name: string;
+  layer: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const WINLIST_SWIFT = `import CoreGraphics
+import Foundation
+var windows: [[String: Any]] = []
+let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+if let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+  for w in list {
+    guard let b = w[kCGWindowBounds as String] as? [String: Any] else { continue }
+    windows.append([
+      "id": w[kCGWindowNumber as String] as? Int ?? 0,
+      "owner": w[kCGWindowOwnerName as String] as? String ?? "",
+      "name": w[kCGWindowName as String] as? String ?? "",
+      "layer": w[kCGWindowLayer as String] as? Int ?? -1,
+      "x": b["X"] as? Double ?? 0,
+      "y": b["Y"] as? Double ?? 0,
+      "w": b["Width"] as? Double ?? 0,
+      "h": b["Height"] as? Double ?? 0,
+    ])
+  }
+}
+// Display bounds — lets the caller refuse partially off-screen windows
+// (screencapture -l happily returns the full backing store, including
+// pixels the user cannot see or click).
+var displays: [[String: Any]] = []
+var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+var count: UInt32 = 0
+if CGGetActiveDisplayList(16, &ids, &count) == .success {
+  for i in 0..<Int(count) {
+    let b = CGDisplayBounds(ids[i])
+    displays.append([
+      "x": b.origin.x, "y": b.origin.y,
+      "w": b.size.width, "h": b.size.height,
+    ])
+  }
+}
+let data = try JSONSerialization.data(withJSONObject: ["windows": windows, "displays": displays])
+print(String(data: data, encoding: .utf8)!)
+`;
+
+// undefined = not yet probed; null = unavailable on this machine (no
+// swiftc / compile failed) — probed once per process.
+let winlistBinPromise: Promise<string | null> | undefined;
+
+async function ensureWinlistBinary(): Promise<string | null> {
+  if (winlistBinPromise) return winlistBinPromise;
+  winlistBinPromise = (async () => {
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fsp = await import("node:fs/promises");
+    const { createHash } = await import("node:crypto");
+    try {
+      const dir = path.join(os.homedir(), ".ponder", "bin");
+      await fsp.mkdir(dir, { recursive: true });
+      const bin = path.join(dir, "ponder-winlist");
+      const hash = createHash("sha256")
+        .update(WINLIST_SWIFT)
+        .digest("hex")
+        .slice(0, 12);
+      const stamp = path.join(dir, `.ponder-winlist.${hash}`);
+      const haveStamp = await fsp
+        .access(stamp)
+        .then(() => true)
+        .catch(() => false);
+      const haveBin = await fsp
+        .access(bin)
+        .then(() => true)
+        .catch(() => false);
+      if (!haveStamp || !haveBin) {
+        const src = path.join(dir, "ponder-winlist.swift");
+        await fsp.writeFile(src, WINLIST_SWIFT);
+        console.error(
+          "[screen] compiling window-list helper (one-time, ~5-15s): swiftc → ~/.ponder/bin/ponder-winlist",
+        );
+        await execFileAsync("/usr/bin/swiftc", ["-O", src, "-o", bin], {
+          timeout: 120_000,
+        });
+        // Clear stale stamps from previous source versions, then stamp.
+        for (const f of await fsp.readdir(dir)) {
+          if (f.startsWith(".ponder-winlist.") && f !== path.basename(stamp)) {
+            await fsp.unlink(path.join(dir, f)).catch(() => {});
+          }
+        }
+        await fsp.writeFile(stamp, "");
+      }
+      return bin;
+    } catch (e) {
+      console.error(
+        `[screen] window-list helper unavailable (${e instanceof Error ? e.message.split("\n")[0] : String(e)}) — direct window capture disabled, falling back to screen-crop.`,
+      );
+      return null;
+    }
+  })();
+  return winlistBinPromise;
+}
+
+interface WinlistSnapshot {
+  windows: MacWindowInfo[];
+  displays: Array<{ x: number; y: number; width: number; height: number }>;
+}
+
+async function winlistSnapshot(): Promise<WinlistSnapshot | null> {
+  if (process.platform !== "darwin") return null;
+  const bin = await ensureWinlistBinary();
+  if (!bin) return null;
+  try {
+    const { stdout } = await execFileAsync(bin, [], { timeout: 3_000 });
+    const parsed = JSON.parse(stdout) as {
+      windows?: Array<Record<string, unknown>>;
+      displays?: Array<Record<string, unknown>>;
+    };
+    return {
+      windows: (parsed.windows ?? []).map((w) => ({
+        id: Number(w.id ?? 0),
+        owner: String(w.owner ?? ""),
+        name: String(w.name ?? ""),
+        layer: Number(w.layer ?? -1),
+        x: Number(w.x ?? 0),
+        y: Number(w.y ?? 0),
+        width: Number(w.w ?? 0),
+        height: Number(w.h ?? 0),
+      })),
+      displays: (parsed.displays ?? []).map((d) => ({
+        x: Number(d.x ?? 0),
+        y: Number(d.y ?? 0),
+        width: Number(d.w ?? 0),
+        height: Number(d.h ?? 0),
+      })),
+    };
+  } catch (e) {
+    console.error(
+      `[screen] winlistSnapshot failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)})`,
+    );
+    return null;
+  }
+}
+
+/** Enumerate on-screen windows front-to-back. Null when the helper is
+ *  unavailable (non-darwin, no Swift toolchain). */
+export async function listMacWindows(): Promise<MacWindowInfo[] | null> {
+  const snap = await winlistSnapshot();
+  return snap ? snap.windows : null;
+}
+
+/**
+ * Capture `targetApp`'s frontmost window directly via its window id —
+ * native resolution, immune to occlusion. Returns the standard Screenshot
+ * shape (offsetX/Y = window origin in global logical coords, so the
+ * existing click-translation math works unchanged) plus the window id and
+ * the list of windows currently overlapping it (front-to-back).
+ *
+ * Null on any failure (helper unavailable, app has no on-screen window,
+ * screencapture denied) — callers fall back to the screen-crop path.
+ */
+export async function captureWindowDirect(
+  targetApp: string,
+): Promise<(Screenshot & { windowId: number; occluders: string[] }) | null> {
+  if (process.platform !== "darwin") return null;
+  const snap = await winlistSnapshot();
+  if (!snap) return null;
+  const wins = snap.windows;
+  const target = wins.find(
+    (w) =>
+      w.layer === 0 &&
+      w.owner === targetApp &&
+      w.width >= 40 &&
+      w.height >= 40,
+  );
+  if (!target) return null;
+
+  // Refuse partially off-screen windows. screencapture -l happily
+  // returns the FULL backing store — including pixels the user can't
+  // see or click — so grounded coords could land outside any display.
+  // Bailing here drops the caller into the legacy crop path, whose fit
+  // checks restore the old safe bail-to-uncropped behavior. Corners
+  // (2px tolerance) must each land on some display.
+  if (snap.displays.length > 0) {
+    const onSomeDisplay = (px: number, py: number): boolean =>
+      snap.displays.some(
+        (d) =>
+          px >= d.x - 2 &&
+          px <= d.x + d.width + 2 &&
+          py >= d.y - 2 &&
+          py <= d.y + d.height + 2,
+      );
+    const fullyOnScreen =
+      onSomeDisplay(target.x, target.y) &&
+      onSomeDisplay(target.x + target.width, target.y) &&
+      onSomeDisplay(target.x, target.y + target.height) &&
+      onSomeDisplay(target.x + target.width, target.y + target.height);
+    if (!fullyOnScreen) {
+      console.error(
+        `[screen] captureWindowDirect("${targetApp}") skipped: window ${Math.round(target.width)}×${Math.round(target.height)}@(${Math.round(target.x)},${Math.round(target.y)}) is partially off-screen — falling back to screen-crop.`,
+      );
+      return null;
+    }
+  }
+
+  // Front-to-back: everything before `target` that overlaps it is on top
+  // of it. Layers >= 20 are system chrome (Dock 20, menu bar/status 24-25,
+  // Control Center) — not meaningful occluders for grounding purposes.
+  const idx = wins.indexOf(target);
+  const area = target.width * target.height;
+  const occluders = wins
+    .slice(0, idx)
+    .filter((w) => {
+      if (w.owner === targetApp || w.layer >= 20) return false;
+      const ix = Math.max(
+        0,
+        Math.min(w.x + w.width, target.x + target.width) -
+          Math.max(w.x, target.x),
+      );
+      const iy = Math.max(
+        0,
+        Math.min(w.y + w.height, target.y + target.height) -
+          Math.max(w.y, target.y),
+      );
+      return ix * iy >= area * 0.04; // ≥4% overlap — ignore edge grazes
+    })
+    .map(
+      (w) =>
+        `${w.owner}${w.name ? ` "${w.name}"` : ""} (layer ${w.layer}, ${Math.round(w.width)}×${Math.round(w.height)})`,
+    );
+
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const fsp = await import("node:fs/promises");
+  const tmp = path.join(
+    os.tmpdir(),
+    `ponder-windowshot-${process.pid}-${Date.now()}.png`,
+  );
+  try {
+    // -x no sound, -o no shadow (shadow would pad the PNG beyond the
+    // window bounds and break the scaleFactor math).
+    await execFileAsync(
+      "/usr/sbin/screencapture",
+      ["-x", "-o", "-l", String(target.id), tmp],
+      { timeout: 10_000 },
+    );
+    const png = await fsp.readFile(tmp);
+    if (png.length < 24 || png.readUInt32BE(0) !== 0x89504e47) return null;
+    const pngW = png.readUInt32BE(16);
+    const pngH = png.readUInt32BE(20);
+    const scaleFactor = (pngW / target.width + pngH / target.height) / 2;
+    return {
+      png,
+      width: Math.round(target.width),
+      height: Math.round(target.height),
+      offsetX: Math.round(target.x),
+      offsetY: Math.round(target.y),
+      scaleFactor,
+      windowId: target.id,
+      occluders,
+    };
+  } catch (e) {
+    console.error(
+      `[screen] captureWindowDirect("${targetApp}") failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)})`,
+    );
+    return null;
+  } finally {
+    await (await import("node:fs/promises")).unlink(tmp).catch(() => {});
+  }
+}
+
+/**
+ * Which window is frontmost at a screen point (logical coords)? Used by
+ * the loop's pre-click occlusion re-check: capture-time raising doesn't
+ * guarantee click-time Z-order — the user (or another app) can come
+ * back on top during the ~2s of model time between capture and click,
+ * and the CGEvent then lands on THEIR window. ~60-120ms via the
+ * compiled winlist helper. Null when the helper is unavailable or no
+ * window contains the point. Ignores system chrome (layer >= 20).
+ */
+export async function frontWindowAtPoint(
+  x: number,
+  y: number,
+): Promise<MacWindowInfo | null> {
+  const wins = await listMacWindows();
+  if (!wins) return null;
+  for (const w of wins) {
+    if (w.layer >= 20) continue;
+    if (x >= w.x && x <= w.x + w.width && y >= w.y && y <= w.y + w.height) {
+      return w; // front-to-back order — first hit is the top window
+    }
+  }
+  return null;
+}
+
+/**
+ * One-snapshot pre-click readiness check: what covers the click point,
+ * and which app is active (frontmost layer-0 window's owner). Both
+ * matter for CGEvent delivery: a covering window swallows the click
+ * outright, and an INACTIVE target can consume the first click as a
+ * window-activation click without pressing the control under it
+ * (classic macOS first-click behavior — observed live: clicks 4s apart
+ * at the same Calculator button, first no-op, retry registers).
+ */
+export async function clickObstruction(
+  targetApp: string,
+  x: number,
+  y: number,
+): Promise<{ coveredBy: string | null; activeApp: string | null } | null> {
+  const wins = await listMacWindows();
+  if (!wins) return null;
+  let coveredBy: string | null = null;
+  for (const w of wins) {
+    if (w.layer >= 20) continue;
+    if (x >= w.x && x <= w.x + w.width && y >= w.y && y <= w.y + w.height) {
+      coveredBy = w.owner === targetApp ? null : w.owner;
+      break; // front-to-back — first hit is the top window at the point
+    }
+  }
+  const front = wins.find((w) => w.layer === 0);
+  return { coveredBy, activeApp: front ? front.owner : null };
 }

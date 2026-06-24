@@ -1,34 +1,64 @@
 #!/usr/bin/env bash
-# Kill any stale `tsx src/mcp/server*.ts` PIDs from prior Claude Code /
-# Claude Desktop sessions. Run between sessions when `holo3_version`
-# reports a `commit` that doesn't match `git rev-parse HEAD` on disk —
-# the live MCP server child process predates your most recent deploy.
+# Restart the stale Ponder MCP server — SCOPED to this repo only.
 #
-# Safe to run multiple times. `pgrep -f` matches the full command line
-# (so we hit BOTH stdio `src/mcp/server.ts` and HTTP `src/mcp/server-http.ts`).
-# `xargs -r` is a no-op when pgrep finds nothing — never errors on a
-# clean machine.
+# ── YOU PROBABLY DON'T NEED THIS ──────────────────────────────────────
+# The agent loop (src/agent/**) does NOT run in the MCP server. It runs
+# in the Electron app: `agent_do` is FORWARDED from the MCP over the
+# localhost bridge (:7900) into Electron, where macOS perms + the
+# provider live (electron/main.ts imports runTask directly).
+#
+# So the restart matrix is:
+#   • Changed src/agent/** or a prompt?  → just restart `pnpm dev`
+#     (Electron rebuilds the main process and loads fresh agent code).
+#     DO NOT touch the MCP. Claude Code keeps running undisturbed.
+#   • Changed src/mcp/** (tool defs / the forwarder itself)?  → THEN
+#     run this script + restart Claude Code so it respawns its MCP child.
+#
+# This version is SCOPED to PIDs whose working directory is THIS repo,
+# so it never kills another project's MCP server (or another Claude Code
+# session pointed at a different checkout).
 #
 # Usage:
 #   bash scripts/kill-stale-mcp.sh
-#
-# After it returns, restart Claude Code (the IDE re-spawns its MCP
-# child) and re-call `holo3_version` to verify the new SHA.
 
 set -euo pipefail
 
-PIDS=$(pgrep -f 'tsx.*src/mcp/server' || true)
-if [[ -z "$PIDS" ]]; then
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Candidate PIDs: any `tsx src/mcp/server*` process (stdio + HTTP).
+ALL=$(pgrep -f 'tsx.*src/mcp/server' || true)
+if [[ -z "$ALL" ]]; then
   echo "[kill-stale-mcp] no tsx src/mcp/server* PIDs found — nothing to kill."
   exit 0
 fi
 
-echo "[kill-stale-mcp] killing PIDs: $PIDS"
+# Keep only those whose cwd is THIS repo (macOS: lsof -d cwd), so other
+# projects' / sessions' MCP servers are never touched.
+PIDS=""
+for pid in $ALL; do
+  cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)
+  if [[ "$cwd" == "$REPO_ROOT"* ]]; then
+    PIDS="$PIDS $pid"
+  fi
+done
+PIDS=$(echo "$PIDS" | xargs || true)
+
+if [[ -z "$PIDS" ]]; then
+  echo "[kill-stale-mcp] found MCP servers, but none rooted in $REPO_ROOT — leaving them alone."
+  echo "[kill-stale-mcp] (other Claude Code sessions / projects are untouched.)"
+  exit 0
+fi
+
+echo "[kill-stale-mcp] killing this repo's MCP PIDs: $PIDS"
 echo "$PIDS" | xargs -r kill -TERM
 sleep 0.5
 
-# Verify nothing survived TERM. Anything still alive after 500ms gets KILL.
-SURVIVORS=$(pgrep -f 'tsx.*src/mcp/server' || true)
+# Anything still alive after TERM gets KILL (scoped to the same PID set).
+SURVIVORS=""
+for pid in $PIDS; do
+  if kill -0 "$pid" 2>/dev/null; then SURVIVORS="$SURVIVORS $pid"; fi
+done
+SURVIVORS=$(echo "$SURVIVORS" | xargs || true)
 if [[ -n "$SURVIVORS" ]]; then
   echo "[kill-stale-mcp] survivors after TERM, sending KILL: $SURVIVORS"
   echo "$SURVIVORS" | xargs -r kill -KILL

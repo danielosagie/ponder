@@ -21,6 +21,10 @@ export interface BrowserJobsConfig {
   convexURL: string;
   /** The owning user id (Convex jobs are filtered by_user_status). */
   userId: string;
+  /** The owning org id (carried on the presence heartbeat; '' when unknown).
+   *  Optional in practice — jobs carry orgId, and the phone subscribes by
+   *  userId, so an empty org never breaks presence. */
+  orgId: string;
   /** Stable id for THIS worker (shows up on claimed jobs). */
   workerId: string;
   /** sssync-bknd base URL for the reconcile callback (optional). */
@@ -53,6 +57,11 @@ export interface BrowserJobsConfig {
    *  tick that re-polls deferred writes once the rolling window clears.
    *  0 disables the tick. */
   deferRecheckMs: number;
+  /** Presence heartbeat interval (ms). The consumer writes a workerPresence doc
+   *  to Convex on this cadence so the phone can derive "your computer is
+   *  online". Default 25000 (the phone's TTL is ~2.8× this). Clamped to a sane
+   *  minimum so a blank/garbage env can never hammer Convex. */
+  presenceHeartbeatMs: number;
 }
 
 function envStr(...keys: string[]): string {
@@ -112,6 +121,7 @@ export function readBrowserJobsConfig(): BrowserJobsConfig {
   return {
     convexURL: envStr("PONDER_BROWSER_JOBS_CONVEX_URL", "CONVEX_URL"),
     userId: envStr("PONDER_BROWSER_JOBS_USER_ID"),
+    orgId: envStr("PONDER_BROWSER_JOBS_ORG_ID"),
     workerId: envStr("PONDER_BROWSER_JOBS_WORKER_ID") || defaultWorkerId(),
     syncBaseURL: envStr(
       "PONDER_BROWSER_JOBS_SYNC_BASE_URL",
@@ -147,6 +157,9 @@ export function readBrowserJobsConfig(): BrowserJobsConfig {
     readJitterMaxMs: envNum("PONDER_READ_JITTER_MAX_MS", 0),
     // Cap-defer re-check tick: 60s default; 0 disables. Clamped non-negative.
     deferRecheckMs: envNum("PONDER_DEFER_RECHECK_MS", 60000),
+    // Presence heartbeat: 25s default. Clamped to a 1s minimum so a blank or
+    // garbage env value can never spin the heartbeat into a tight loop.
+    presenceHeartbeatMs: envNum("PONDER_PRESENCE_HEARTBEAT_MS", 25000, { min: 1000 }),
   };
 }
 
@@ -177,13 +190,21 @@ export async function bootstrapConfig(
     );
     if (!res.ok) return config;
     const json = (await res.json()) as {
-      bootstrap?: { convexURL?: string; userId?: string; syncBaseURL?: string };
+      bootstrap?: {
+        convexURL?: string;
+        userId?: string;
+        orgId?: string;
+        syncBaseURL?: string;
+      };
     };
     const b = json?.bootstrap || {};
     return {
       ...config,
       convexURL: config.convexURL || String(b.convexURL || "").trim(),
       userId: config.userId || String(b.userId || "").trim(),
+      // orgId is presence-only metadata; fill from bootstrap when the backend
+      // supplies it, otherwise leave whatever env set (defaults to '').
+      orgId: config.orgId || String(b.orgId || "").trim(),
       syncBaseURL: config.syncBaseURL || String(b.syncBaseURL || "").trim(),
     };
   } catch {

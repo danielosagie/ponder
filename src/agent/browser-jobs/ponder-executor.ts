@@ -27,6 +27,13 @@ export interface BrowserJob {
   agentSessionId?: string;
   threadId?: string;
   pendingActionId?: string;
+  // ── Phone-dispatch UX fields (written by the consumer via setJobProgress,
+  //    projected back by browserJobs:getForUser). Optional — the consumer only
+  //    WRITES them (by string), but they're typed here so any reader compiles. */
+  paused?: boolean;
+  pausedReason?: string;
+  queuePosition?: number;
+  nextEligibleAt?: number;
 }
 
 export interface BrowserJobExecutionResult {

@@ -25,6 +25,41 @@ const DAY_MS = 24 * HOUR_MS;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
+/**
+ * Map a verbose, internal friction sentence to a SHORT machine-mappable code
+ * the phone turns into human copy. NEVER pass the raw sentence to the job row:
+ *   (1) it would leak internal mechanism (memory rule: no internal-workings
+ *       leak), and (2) the phone can't map a free-form English string to copy.
+ * Pure substring routing over the lowercased reason; unknown → a safe generic
+ * code. The verbose sentence still lives in the local log only.
+ */
+function pausedReasonCode(reason: string | null | undefined): string {
+  const r = String(reason || "").toLowerCase();
+  if (
+    /checkpoint|confirm it'?s you|verify your identity|security check|re-?enter your password|go to facebook to confirm|suspicious login|suspicious attempt/.test(
+      r,
+    )
+  ) {
+    return "facebook_checkpoint";
+  }
+  if (
+    /restricted|disabled|unusual activity|suspicious activity|account has been/.test(r)
+  ) {
+    return "facebook_identity";
+  }
+  if (
+    /we limit how often|we'?ve limited|too fast|too quickly|too often|too much|going too fast|temporarily blocked/.test(
+      r,
+    )
+  ) {
+    return "facebook_rate_limit";
+  }
+  if (/consecutive .*write failures|write failures/.test(r)) {
+    return "facebook_write_failures";
+  }
+  return "facebook_checkpoint";
+}
+
 export interface JobExecutor {
   execute(job: BrowserJob): Promise<BrowserJobExecutionResult>;
 }
@@ -79,6 +114,18 @@ export class BrowserJobsConsumer {
   private cappedDeferPending = false;
   private deferRecheckTimer: ReturnType<typeof setInterval> | null = null;
 
+  // ── Phone-dispatch presence + per-job UX state (best-effort writes) ────────
+  // presenceTimer drives the "your computer is online" heartbeat (workerPresence
+  // doc every presenceHeartbeatMs). deferredOrder is the ordered list of write
+  // job ids currently parked on a velocity cap — its index+1 is the phone's
+  // "Nth in line". pausedWriteIds is the set of write jobs we've marked paused
+  // in Convex (so resetBreaker can clear exactly those). ALL of these feed
+  // best-effort setJobProgress/heartbeat writes that must NEVER throw into job
+  // execution (every call is try/catch-or-.catch wrapped).
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly deferredOrder: string[] = [];
+  private readonly pausedWriteIds = new Set<string>();
+
   constructor(config: BrowserJobsConfig, executor: JobExecutor, events?: ConsumerEvents) {
     this.config = config;
     this.executor = executor;
@@ -115,12 +162,75 @@ export class BrowserJobsConsumer {
         this.log(`subscription error: ${this.lastError}`);
       },
     );
+
+    // ── Presence heartbeat ────────────────────────────────────────────────
+    // Armed AFTER the client + subscription exist so a heartbeat never races
+    // client creation. Fire once immediately so the phone shows "online" within
+    // ~1s (not after the first 25s tick), then on an interval. The timer is
+    // unref'd (matches deferRecheckTimer) so it never keeps the process alive,
+    // and sendHeartbeat is fully .catch-guarded so a Convex blip can't throw.
+    this.sendHeartbeat();
+    this.presenceTimer = setInterval(
+      () => void this.sendHeartbeat(),
+      this.config.presenceHeartbeatMs,
+    );
+    (this.presenceTimer as { unref?: () => void })?.unref?.();
+  }
+
+  /** Best-effort presence write: one tiny patch to the isolated workerPresence
+   *  table so the phone derives online = now - lastSeenAt < TTL. NEVER throws —
+   *  a transient Convex error is swallowed (the next tick retries). Stopping the
+   *  consumer simply stops writing, and the phone derives offline after its TTL
+   *  (a crashed laptop self-heals the same way — no explicit "offline" write). */
+  private sendHeartbeat(): void {
+    try {
+      void this.client
+        ?.mutation("workerPresence:heartbeat", {
+          userId: this.config.userId,
+          orgId: this.config.orgId ?? "",
+          workerId: this.config.workerId,
+          platform: "facebook_marketplace",
+          lastSeenAt: Date.now(),
+        })
+        ?.catch(() => {
+          /* best-effort: never let a presence write break anything */
+        });
+    } catch {
+      /* defensive: client missing / sync throw — ignore */
+    }
+  }
+
+  /** Best-effort per-job UX write (queued/paused/eligible-at) to the job row so
+   *  the phone can render dispatch state. Addressed by string, fully guarded —
+   *  a failed progress write must NEVER affect job execution. */
+  private setJobProgress(
+    jobId: string,
+    patch: {
+      paused?: boolean;
+      pausedReason?: string;
+      queuePosition?: number;
+      nextEligibleAt?: number;
+    },
+  ): void {
+    try {
+      void this.client
+        ?.mutation("browserJobs:setJobProgress", { jobId, ...patch })
+        ?.catch(() => {
+          /* best-effort */
+        });
+    } catch {
+      /* defensive */
+    }
   }
 
   stop(): void {
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = null;
+    }
+    if (this.presenceTimer) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
     }
     this.stopDeferRecheck();
     try {
@@ -169,6 +279,14 @@ export class BrowserJobsConsumer {
     this.cappedAlerted = false;
     this.breakerAlerted = false;
     this.log("[safety] breaker reset — write jobs will resume");
+    // PHONE UX (B3): clear paused on exactly the write rows we marked paused
+    // while the breaker was up, so the phone drops the "paused — check Facebook"
+    // chip immediately (snappier than waiting for status to flip to processing).
+    // pausedReason "" so the phone has nothing to map. Best-effort per id.
+    for (const id of this.pausedWriteIds) {
+      this.setJobProgress(id, { paused: false, pausedReason: "" });
+    }
+    this.pausedWriteIds.clear();
     // GAP C: a RUNTIME reset while writes are cap-parked must re-arm the defer
     // tick — recheckDeferred() disarms whenever the breaker is tripped, so any
     // in-flight tick stopped when the breaker went up. If writes are still
@@ -231,6 +349,25 @@ export class BrowserJobsConsumer {
     }
   }
 
+  /** When the binding rolling window next frees a write slot (ms epoch). The
+   *  oldest write inside the binding window ages out at (its ts + window length);
+   *  that's the earliest a deferred write can run. When BOTH caps bind, take the
+   *  LATER of the two (the more restrictive). Falls back to now+60s if there are
+   *  no timestamps (shouldn't happen on a cap, but keeps the value sane). */
+  private nextEligibleWriteAt(overHour: boolean, overDay: boolean, now = Date.now()): number {
+    const candidates: number[] = [];
+    if (overHour) {
+      const inHour = this.writeTimestamps.filter((t) => now - t < HOUR_MS);
+      if (inHour.length) candidates.push(Math.min(...inHour) + HOUR_MS);
+    }
+    if (overDay) {
+      const inDay = this.writeTimestamps.filter((t) => now - t < DAY_MS);
+      if (inDay.length) candidates.push(Math.min(...inDay) + DAY_MS);
+    }
+    if (!candidates.length) return now + 60_000;
+    return Math.max(...candidates);
+  }
+
   /** Prune the rolling write log to the 24h window and return {hour, day}. */
   private writeCounts(now = Date.now()): { hour: number; day: number } {
     this.writeTimestamps = this.writeTimestamps.filter((t) => now - t < DAY_MS);
@@ -291,12 +428,33 @@ export class BrowserJobsConsumer {
     // here leaves the job UNTOUCHED in Convex 'pending' — attemptCount is not
     // incremented. DO NOT move startJob above this gate. Reads bypass entirely.
     if (isWrite) {
+      // RESTART SELF-HEAL (risk #6): in-memory breaker state clears on restart,
+      // but a job row paused by a now-gone session stays paused=true in Convex
+      // with no breaker to clear it → the phone would show a STUCK "paused". If
+      // the breaker is NOT tripped and this write row still carries a stale
+      // paused flag, clear it as the job flows through (best-effort). This makes
+      // a fresh consumer un-stick rows without needing PONDER_FRICTION_BREAKER_RESET.
+      if (!this.breakerTripped && job.paused === true) {
+        this.pausedWriteIds.delete(job._id);
+        this.setJobProgress(job._id, { paused: false, pausedReason: "" });
+      }
       // (1) Breaker open → block every future write, do not start/fail/execute.
       if (this.breakerTripped) {
         this.log(
           `[safety] defer ${job._id} (${job.type}) — breaker tripped` +
             `${this.breakerReason ? `: ${this.breakerReason}` : ""}. Left pending.`,
         );
+        // PHONE UX (B2): mark THIS pending write paused so the phone shows
+        // "paused — check Facebook". Mark-on-defer converges within one
+        // subscription tick (each pending write re-delivers and lands here)
+        // without enumerating a cached set. pausedReason is a SHORT machine
+        // code (NOT the verbose breaker sentence — no internal leak, phone-
+        // mappable). Track the id so resetBreaker can clear exactly these.
+        this.pausedWriteIds.add(job._id);
+        this.setJobProgress(job._id, {
+          paused: true,
+          pausedReason: pausedReasonCode(this.breakerReason),
+        });
         return;
       }
       // (2) Rolling velocity caps → defer (leave pending, do NOT block-sleep).
@@ -323,12 +481,30 @@ export class BrowserJobsConsumer {
         // periodic re-check so it resumes when the window rolls.
         this.cappedDeferPending = true;
         this.startDeferRecheck();
+        // PHONE UX (B1): surface "queued — posting shortly" with an order + ETA.
+        // queuePosition = index+1 in the deferredOrder list (FIFO of parked
+        // write ids → "Nth in line"); nextEligibleAt = when the binding rolling
+        // window next frees a slot (oldest in-window write + window length).
+        if (!this.deferredOrder.includes(job._id)) this.deferredOrder.push(job._id);
+        const queuePosition = this.deferredOrder.indexOf(job._id) + 1;
+        const nextEligibleAt = this.nextEligibleWriteAt(overHour, overDay);
+        this.setJobProgress(job._id, { queuePosition, nextEligibleAt });
         return;
       }
       // Back under the caps → allow the next cap alert to fire again later and
       // mark nothing parked (the re-check tick self-disarms on its next pass).
       this.cappedAlerted = false;
       this.cappedDeferPending = false;
+      // PHONE UX: this write is flowing past the cap now → clear its queued
+      // state so the phone stops showing "queued". Pass explicit 0s (patch only
+      // updates passed fields, so an omitted value would leave the stale
+      // number); the phone also treats nextEligibleAt<=now as "not queued", so
+      // this is belt-and-suspenders. Drop it from the FIFO order list.
+      if (this.deferredOrder.includes(job._id)) {
+        const idx = this.deferredOrder.indexOf(job._id);
+        if (idx >= 0) this.deferredOrder.splice(idx, 1);
+        this.setJobProgress(job._id, { queuePosition: 0, nextEligibleAt: 0 });
+      }
     }
 
     // ── Feature A: human-like jitter BEFORE the job runs ────────────────
